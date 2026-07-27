@@ -67,39 +67,119 @@ ChromaDB（本地 ./chroma_db）
 Redis（192.168.200.128:6379）
 ```
 
-## 环境准备
+## 环境搭建
 
-- Python 3.10（conda 环境 `pythonspace`）
-- 已安装并启动 Ollama，且已加载 `qwen2:7b` 模型
-- 已安装并启动 Redis（可选，未启动则缓存禁用）
-- 已构建 ChromaDB 向量库（首次运行自动构建）
+以下按顺序完成环境搭建，从头到尾约需 15-20 分钟。
 
-### 关键依赖
+### 1. Python 环境
+
+推荐使用 Python 3.10，可选用 conda 或 venv 创建虚拟环境：
 
 ```bash
+# 方式 A：conda（推荐）
+conda create -n pythonspace python=3.10
+conda activate pythonspace
+
+# 方式 B：venv
+python3.10 -m venv venv
+# Windows
+venv\Scripts\activate
+# Linux / macOS
+source venv/bin/activate
+```
+
+### 2. 安装 Python 依赖
+
+```bash
+# 核心依赖（LangChain + ChromaDB + Ollama + Redis）
 pip install langchain langchain-community langchain-ollama chromadb redis
+
+# Web 服务（Flask + CORS 跨域支持）
 pip install flask flask-cors
+
+# 文档处理 + Embedding 模型
 pip install pypdf sentence-transformers
 ```
 
-> 实际环境请根据 `conda env: pythonspace` 中的已安装包为准。
+### 3. 搭建 Ollama 服务
 
-## 配置说明
+Ollama 是一个本地大模型运行平台。安装后可直接在本地运行 `qwen2:7b` 等开源模型。
 
-核心配置位于 `advanced_rag_agent.py` 顶部：
+**安装 Ollama：**
+
+- Windows / macOS：从 [ollama.com](https://ollama.com) 下载安装包
+- Linux：`curl -fsSL https://ollama.com/install.sh | sh`
+
+> 本项目的 Ollama 运行在一台虚拟机上（`192.168.200.128`），所以你只需确保该虚拟机或本机的 Ollama 服务已启动即可。
+
+**拉取模型：**
+
+```bash
+# 拉取 qwen2:7b 模型（约 4GB，首次需下载）
+ollama pull qwen2:7b
+
+# 验证模型已加载
+ollama list
+```
+
+**启动 Ollama 并允许远程访问（如果 Ollama 不在本机）：**
+
+```bash
+# 在 Ollama 所在机器上设置监听地址
+# Linux / macOS
+OLLAMA_HOST=0.0.0.0:11434 ollama serve
+
+# Windows（PowerShell）
+$env:OLLAMA_HOST="0.0.0.0:11434"; ollama serve
+```
+
+### 4. 搭建 Redis 服务（可选）
+
+Redis 用于缓存问答结果，跳过可正常运行，但每次提问都会走完整推理流程。
+
+**安装 Redis：**
+
+- Windows：从 [github.com/tporadowski/redis/releases](https://github.com/tporadowski/redis/releases) 下载 `.msi` 安装包
+- Linux：`sudo apt install redis-server`
+- macOS：`brew install redis`
+
+**或使用 Docker（推荐）：**
+
+```bash
+docker run -d --name redis -p 6379:6379 \
+  redis --requirepass dev0619
+```
+
+**设置密码：** 编辑 `redis.conf` 或 `redis.windows.conf`，添加：
+```
+requirepass dev0619
+```
+
+**验证连接：**
+
+```bash
+redis-cli -h 192.168.200.128 -p 6379 -a dev0619 ping
+# 返回 PONG 即成功
+```
+
+### 5. 准备文档
+
+将企业 PDF 文档放入 `docs/` 目录下。首次运行时会自动读取并构建 ChromaDB 向量索引。
+
+### 6. 修改配置
+
+打开 `advanced_rag_agent.py`，按实际情况修改顶部配置：
 
 ```python
-OLLAMA_URL = "http://192.168.200.128:11434"   # Ollama 服务地址
-MODEL_NAME = "qwen2:7b"                        # 使用模型
-EMBED_MODEL = "BAAI/bge-small-zh-v1.5"         # Embedding 模型
+# 如果 Ollama 在本机，改为 127.0.0.1
+OLLAMA_URL = "http://192.168.200.128:11434"
+MODEL_NAME = "qwen2:7b"
 
+# 如果 Redis 在本机，改为 127.0.0.1
 REDIS_HOST = "192.168.200.128"
 REDIS_PORT = 6379
 REDIS_PASSWORD = "dev0619"
-REDIS_DB = 0
 ```
-
-如果 Ollama 或 Redis 运行在本机，请把对应地址改为 `127.0.0.1`。
 
 ## 使用方式
 
@@ -184,20 +264,48 @@ DOC_ACCESS_RULES = {
 
 ## 常见问题
 
-### 1. 启动 Web 服务后无法访问
+### 1. pip install 报错 / 依赖冲突
 
-- 确认 `rag_web_server.py` 在 PowerShell / CMD 中启动。
-- 确认端口未被占用：`netstat -ano | findstr :8080`。
+- 确保已激活正确的虚拟环境（`conda activate pythonspace` 或 `venv\Scripts\activate`）
+- 尝试逐个安装：先装 `langchain`，再装 `chromadb`，最后装 `langchain-ollama`
+- Windows 上若 `chromadb` 装不上，需先安装 Visual C++ Redistributable
 
-### 2. 连接 Ollama 失败
+### 2. 启动 Web 服务后无法访问
 
-- 检查 Ollama 是否已启动：`ollama list`
-- 检查 `OLLAMA_URL` 是否正确，若 Ollama 在本机则改为 `http://127.0.0.1:11434`
+- **在 Windows 上必须用 PowerShell 或 CMD 启动**，Git Bash 中 ChromaDB 底层依赖会异常退出
+- 确认端口未被占用：`netstat -ano | findstr :8080`
 
-### 3. 权限没有生效
+### 3. 连接 Ollama 失败
 
-- 确认文件名包含 `JM-S509` 才会被标记为受限。
-- Web 界面点击右上角角色 badge 切换到「特权用户」后再提问。
+- 检查 Ollama 是否已启动并加载模型：
+  ```bash
+  ollama list            # 查看已安装模型
+  curl http://192.168.200.128:11434/api/tags  # 测试 API 是否可达
+  ```
+- 如果 Ollama 在本机，把 `OLLAMA_URL` 改为 `http://127.0.0.1:11434`
+- 首次使用需先拉取模型：`ollama pull qwen2:7b`
+
+### 4. 连接 Redis 失败 / 缓存不生效
+
+- 检查 Redis 是否已启动：`redis-cli -h 192.168.200.128 -p 6379 -a dev0619 ping`
+- 如果返回 `PONG` 则正常，否则启动 Redis 服务
+- 缓存不可用不影响核心问答功能，系统会自动降级
+
+### 5. ChromaDB 向量库未构建
+
+- 首次运行会自动扫描 `docs/` 目录并构建索引，耐心等待即可
+- 如果 `docs/` 为空，系统会提示找不到文档
+
+### 6. 权限没有生效
+
+- 确认文件名包含 `JM-S509` 才会被标记为受限文档
+- Web 界面点击右上角角色 badge 切换到「特权用户」后再提问
+- 命令行加 `--admin` 参数启动
+
+### 7. 运行时 segfault / 闪退
+
+- 换用 PowerShell 或 CMD 启动，不要用 Git Bash
+- 确保 Python 3.10 环境，部分依赖不兼容 Python 3.12+
 
 ## 许可证
 
