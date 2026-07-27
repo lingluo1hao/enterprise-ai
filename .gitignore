@@ -17,7 +17,6 @@ build/
 
 # ====== 项目数据（本地构建产物 / 企业文档） ======
 chroma_db/
-docs/
 server_startup.log
 
 # ====== WorkBuddy ======
