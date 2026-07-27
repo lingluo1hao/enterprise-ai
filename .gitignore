@@ -1,0 +1,24 @@
+# ====== Python ======
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ====== 环境变量（含密钥，禁止提交） ======
+.env
+
+# ====== IDE ======
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ====== 项目数据（本地构建产物 / 企业文档） ======
+chroma_db/
+docs/
+server_startup.log
+
+# ====== WorkBuddy ======
+.workbuddy/
