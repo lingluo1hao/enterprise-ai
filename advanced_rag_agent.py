@@ -3,7 +3,7 @@
   高级 RAG Agent — 真实环境版（ChromaDB + Ollama）
 ================================================================================
 
-  本文件是 demo_advanced_rag.py 的真实环境版本：
+  本文件是advanced_rag.py 的真实环境版本：
     - 不使用任何 Mock 数据或 Mock LLM
     - 直接连接本地 ChromaDB 向量数据库
     - 直接调用本地 Ollama（qwen2:7b）进行推理
@@ -98,7 +98,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 
 # ============================================================================
-# 配置区（与你 enterprise_rag.py 保持一致）
+# 配置区
 # ============================================================================
 DOC_FOLDER = "./docs"
 DB_PATH = "./chroma_db"
@@ -470,7 +470,6 @@ class OllamaLLM(BaseLLM):
 # 第二部分：向量数据库管理
 # ============================================================================
 # 这部分封装了 ChromaDB 的初始化和检索操作。
-# 与 enterprise_rag.py 中的 init_vector_store 功能相同，
 # 但封装成类方便 Skill 调用。
 
 class VectorStoreManager:
@@ -516,7 +515,7 @@ class VectorStoreManager:
 
     @staticmethod
     def _build_vector_store(embedding):
-        """从 docs/ 目录构建向量数据库（复用 enterprise_rag.py 的逻辑）"""
+        """从 docs/ 目录构建向量数据库"""
         from langchain_community.document_loaders import PyPDFLoader, TextLoader
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         from langchain_chroma import Chroma
@@ -730,7 +729,7 @@ class DocSearchSkill(BaseSkill):
     """
     文档检索技能 — 智能 RAG 的入口
 
-    与 enterprise_rag.py 中的简单检索不同，这里实现了「智能 RAG」三步流程：
+    这里实现了「智能 RAG」三步流程：
 
     ┌─────────────────────────────────────────────────────────────┐
     │  第1步：查询重写（Query Rewriting）                           │
@@ -1156,8 +1155,7 @@ class SkillRegistry:
 #   2. Action（行动）：调用某个工具/技能
 #   3. Observation（观察）：查看工具返回的结果
 #   4. 重复 1-3，直到信息充足，给出 Final Answer
-#
-# 与 enterprise_rag.py 的区别：
+
 #   现有方式：问题 → 检索 → 生成答案（一步到位，无法应对复杂问题）
 #   ReAct方式：问题 → 思考 → 检索 → 观察 → 思考 → 答案
 #              （多步推理，可以处理需要组合多种信息源的复杂问题）
@@ -1401,7 +1399,6 @@ Final Answer: [你的回答]"""
 #   如果直接用一个 RAG 检索，可能只检索到其中一部分信息。
 #   但如果拆成 3 个子任务，每个子任务独立检索，就能各自找到精准答案。
 #
-# 对比 enterprise_rag.py：
 #   现有方式：一个问题 → 一次检索 → 一次生成（容易遗漏信息）
 #   Planning方式：一个问题 → 拆解 → 多个子任务各自检索 → 汇总（更完整）
 
