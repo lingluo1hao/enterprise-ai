@@ -57,6 +57,14 @@ class LangGraphEngine:
         role = user_role or self.user_role
         return self.app.query(question, role=role, session_id="web_session")
 
+    def check_unfinished_tasks(self, session_id="web_session"):
+        """查询指定会话的未完成任务（断点检测）"""
+        return self.app.check_unfinished_tasks(session_id)
+
+    def resume_task(self, task_id, session_id="web_session"):
+        """从断点恢复执行指定任务"""
+        return self.app.resume(task_id, session_id=session_id)
+
 
 # ====== Flask 应用 ======
 app = Flask(__name__)
@@ -231,6 +239,51 @@ def set_role():
         "role": new_role,
         "description": AccessControlFilter.get_role_description(new_role),
     })
+
+
+# ======================================================================
+# 断点重续 API — 多层记忆核心功能
+# ======================================================================
+
+@app.route("/api/tasks/unfinished")
+def get_unfinished_tasks():
+    """
+    查询当前会话的未完成任务。
+
+    用户登录/连接时调用。如果有 interrupted 状态的任务，
+    说明上次执行被中断（服务宕机或用户关闭客户端）。
+    前端收到后可弹窗提示用户："上次有未完成的任务，是否恢复？"
+    """
+    session_id = request.args.get("session_id", "web_session")
+    if not use_langgraph or not isinstance(orchestrator, LangGraphEngine):
+        return jsonify({"tasks": [], "message": "当前引擎不支持断点恢复"})
+    tasks = orchestrator.check_unfinished_tasks(session_id)
+    return jsonify({"tasks": tasks, "count": len(tasks)})
+
+
+@app.route("/api/tasks/resume", methods=["POST"])
+def resume_task():
+    """
+    从断点恢复执行指定任务。
+
+    前端用户点击"恢复"按钮后调用此接口。
+    后端读取 MySQL task_checkpoints 最后一条快照，恢复 state，重新执行图。
+    """
+    data = request.get_json(force=True)
+    task_id = data.get("task_id")
+    session_id = data.get("session_id", "web_session")
+
+    if not task_id:
+        return jsonify({"error": "缺少 task_id 参数"}), 400
+
+    if not use_langgraph or not isinstance(orchestrator, LangGraphEngine):
+        return jsonify({"error": "当前引擎不支持断点恢复"}), 400
+
+    try:
+        answer = orchestrator.resume_task(task_id, session_id)
+        return jsonify({"answer": answer, "task_id": task_id, "status": "completed"})
+    except Exception as e:
+        return jsonify({"error": str(e), "task_id": task_id, "status": "failed"}), 500
 
 
 # ======================================================================
@@ -452,6 +505,42 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     })
     .catch(() => console.warn('Health check failed'));
+
+  // ===== 断点重续：页面加载时检查未完成任务 =====
+  fetch('/api/tasks/unfinished?session_id=web_session')
+    .then(r => r.json())
+    .then(data => {
+      if (data.count && data.count > 0) {
+        const task = data.tasks[0];
+        const msg = '检测到上次有未完成的任务：\n"' + task.query + '"\n\n是否恢复执行？';
+        if (confirm(msg)) {
+          // 用户点击"确定"，恢复执行
+          addMessage('user', task.query);
+          isQuerying = true;
+          toggleUI(true);
+          addMessage('assistant', '正在从断点恢复执行...');
+          fetch('/api/tasks/resume', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({task_id: task.task_id, session_id: 'web_session'})
+          })
+          .then(r => r.json())
+          .then(result => {
+            if (result.answer) {
+              addMessage('assistant', result.answer);
+            } else if (result.error) {
+              addMessage('assistant', '恢复失败：' + result.error);
+            }
+          })
+          .catch(e => addMessage('assistant', '恢复请求失败：' + e))
+          .finally(() => {
+            isQuerying = false;
+            toggleUI(false);
+          });
+        }
+      }
+    })
+    .catch(() => console.warn('Unfinished tasks check failed'));
 });
 
 // ============================================================

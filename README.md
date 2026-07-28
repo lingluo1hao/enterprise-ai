@@ -1,6 +1,6 @@
 # enterprise-ai
 
-企业智能知识库问答系统 —— 基于 LangGraph RAG 的私有文档问答 Agent。
+企业智能知识库问答系统 —— 基于 LangGraph RAG 的私有文档问答 Agent，支持多层记忆与断点重续。
 
 ---
 
@@ -8,7 +8,7 @@
 
 本项目是一个面向企业文档的智能问答系统，能够对 PDF 文档进行向量化存储，并通过自然语言提问快速返回准确答案。核心已从 LangChain 迁移至 **LangGraph StateGraph**，实现了精细条件分支、多轮检索反馈循环、多智能体协作和多轮对话。
 
-后端使用本地部署的 **Ollama** 大模型进行推理，数据存储在 **ChromaDB** 向量数据库中，并支持 **Redis 两级智能缓存**加速重复问题。系统同时提供了命令行交互界面和 Web 图形界面。
+后端使用本地部署的 **Ollama** 大模型进行推理，数据存储在 **ChromaDB** 向量数据库中，支持 **Redis 两级智能缓存**加速重复问题，并通过 **MySQL 多层记忆**实现对话历史持久化和任务断点重续。系统同时提供了命令行交互界面和 Web 图形界面。
 
 ## 核心特性
 
@@ -18,10 +18,12 @@
 - **多轮检索反馈循环**：query_rewrite → retrieve → grade_docs，不相关自动换角度重新检索（最多 3 轮）。
 - **多智能体协作**：Planner 拆解子任务 → Researcher 并行检索 → Reviewer 审查把关 → Writer 汇总成稿。
 - **多轮对话**：session_id 隔离上下文，追问自动消解（"那它的续航呢？" → 完整问题），超窗摘要压缩。
+- **三层记忆架构**：内存加速层 + MySQL 持久化层 + Redis 缓存层，服务重启后对话历史不丢失。
+- **断点重续**：LangGraph 每个节点执行后自动保存 state 快照到 MySQL，服务宕机或用户关闭客户端后，下次登录可检测并恢复未完成的任务。
 - **MMR 重排序 & 多样性补搜**：最大边际相关性去冗余，避免信息遗漏。
 - **Redis 两级缓存**：精确匹配（SHA256 <1ms）+ 语义匹配（BGE embedding 余弦相似度 > 0.80）。
 - **文档级访问控制**：支持普通用户与特权用户，敏感文档按权限隔离，缓存也按角色隔离。
-- **Web 图形界面**：基于 Flask + SSE 实时推送推理进度，友好易用。
+- **Web 图形界面**：基于 Flask + SSE 实时推送推理进度，自动检测未完成任务并弹窗提示恢复。
 
 ## 界面预览
 
@@ -33,9 +35,10 @@
 
 ```
 enterprise-ai/
-├── langgraph_rag_agent.py  # 【核心】LangGraph 引擎：StateGraph + 多轮检索 + 多智能体 + 多轮对话
+├── langgraph_rag_agent.py  # 【核心】LangGraph 引擎：StateGraph + 多轮检索 + 多智能体 + 多轮对话 + 断点重续
 ├── advanced_rag_agent.py   # 基础模块（OllamaLLM / VectorStoreManager / CacheManager / AccessControlFilter）
-├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 前端聊天界面（支持 --langgraph 切换引擎）
+├── memory_store.py         # MySQL 多层记忆持久化（对话历史 + 断点快照 + 任务队列）
+├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 前端聊天界面 + 断点恢复 API
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
 ├── docs/                   # 企业 PDF 文档目录
 ├── chroma_db/              # ChromaDB 向量数据库持久化目录
@@ -48,9 +51,10 @@ enterprise-ai/
 
 | 文件 | 作用 |
 |------|------|
-| `langgraph_rag_agent.py` | **核心引擎**，含 LangGraphRAGApp 类、AgentState 状态定义、14 个图节点、3 条条件分支。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。 |
+| `langgraph_rag_agent.py` | **核心引擎**，含 LangGraphRAGApp 类、AgentState 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。 |
 | `advanced_rag_agent.py` | 基础组件库，提供 OllamaLLM、VectorStoreManager、CacheManager、AccessControlFilter、DocSearchSkill 等可复用类。同时保留原 LangChain 版 RAGOrchestrator 实现（兼容旧模式）。 |
-| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。 |
+| `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 3 张表：`chat_messages`（对话历史）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）。支持连接池、线程安全、自动降级。 |
+| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供 `/api/tasks/unfinished` 和 `/api/tasks/resume` 断点恢复 API。 |
 | `docs/` | 存放企业 PDF 文档，首次运行时会自动构建向量索引到 `chroma_db/`。 |
 | `chroma_db/` | ChromaDB 持久化目录，保存文档切片与向量。 |
 
@@ -93,14 +97,18 @@ langgraph_rag_agent.py — StateGraph 状态图引擎
     │      └──────┼─────────┘
     │             ▼
     │          respond ──► save_history ──► END
+    │                          │
+    │             每个节点执行后自动保存 state 快照
     │
     ├─ CacheManager（Redis 两级智能缓存）
     ├─ AccessControlFilter（文档级权限过滤）
+    ├─ MySQLMemoryStore（三层记忆 + 断点重续）
     │
     ▼
 Ollama（192.168.200.128:11434 / qwen2:7b）
 ChromaDB（本地 ./chroma_db）
 Redis（192.168.200.128:6379）
+MySQL（192.168.200.128:3306 / rag_agent）
 ```
 
 ### LangGraph 图节点一览（共 14 个节点）
@@ -145,8 +153,8 @@ source venv/bin/activate
 ### 2. 安装 Python 依赖
 
 ```bash
-# 核心依赖（LangChain + LangGraph + ChromaDB + Ollama + Redis）
-pip install langchain langchain-community langgraph chromadb redis
+# 核心依赖（LangChain + LangGraph + ChromaDB + Ollama + Redis + MySQL）
+pip install langchain langchain-community langgraph chromadb redis pymysql dbutils
 
 # Web 服务（Flask + CORS 跨域支持）
 pip install flask flask-cors
@@ -216,11 +224,38 @@ redis-cli -h 192.168.200.128 -p 6379 -a dev0619 ping
 # 返回 PONG 即成功
 ```
 
-### 5. 准备文档
+### 5. 搭建 MySQL 服务（断点重续功能依赖）
+
+MySQL 用于实现三层记忆架构的持久化层，包括对话历史存储和任务断点快照。跳过可正常运行，但服务重启后对话历史会丢失且无法恢复未完成的任务。
+
+**或使用 Docker（推荐）：**
+
+```bash
+docker run -d --name mysql8 \
+  -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=Root@2026 \
+  -e TZ=Asia/Shanghai \
+  mysql:8.0.36 \
+  --character-set-server=utf8mb4 \
+  --collation-server=utf8mb4_unicode_ci
+```
+
+系统首次连接时会自动创建 `rag_agent` 数据库和 3 张表（`chat_messages`、`task_checkpoints`、`task_queue`），无需手动建表。
+
+**验证连接：**
+
+```bash
+mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"
+# 看到 rag_agent 数据库即成功
+```
+
+> 如果 MySQL 不可用，系统会自动降级为内存模式（与旧版行为一致），不影响核心问答功能。
+
+### 6. 准备文档
 
 将企业 PDF 文档放入 `docs/` 目录下。首次运行时会自动读取并构建 ChromaDB 向量索引。
 
-### 6. 修改配置
+### 7. 修改配置
 
 打开 `advanced_rag_agent.py`（基础配置均在此文件中），按实际情况修改顶部配置：
 
@@ -233,6 +268,16 @@ MODEL_NAME = "qwen2:7b"
 REDIS_HOST = "192.168.200.128"
 REDIS_PORT = 6379
 REDIS_PASSWORD = "dev0619"
+```
+
+打开 `memory_store.py`，按实际情况修改 MySQL 连接配置：
+
+```python
+MYSQL_HOST = "192.168.200.128"
+MYSQL_PORT = 3306
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "Root@2026"
+MYSQL_DATABASE = "rag_agent"  # 专用数据库（不复用 nacos）
 ```
 
 ## 使用方式
@@ -300,6 +345,7 @@ Web 界面功能：
 - 实时显示推理进度（SSE 流式推送）
 - 快捷示例问题
 - LangGraph 模式：支持多轮对话追问
+- 断点恢复：登录时自动检测未完成任务，弹窗提示恢复
 
 ## LangGraph 设计详解
 
@@ -347,11 +393,62 @@ DOC_ACCESS_RULES = {
 
 语义命中时会自动补写一条精确匹配键，方便下次更快命中。缓存键包含角色标识，确保权限隔离。
 
+## 三层记忆架构
+
+系统采用三层记忆架构，解决服务重启后对话丢失和任务中断无法恢复的问题：
+
+| 层级 | 存储介质 | 速度 | 持久性 | 用途 |
+|------|----------|------|--------|------|
+| **Layer 1** | 内存 `_active_context` | <0.1ms | 重启丢失 | 加速同会话读写 |
+| **Layer 2** | MySQL `192.168.200.128:3306` | ~1-5ms | **重启不丢** | 对话历史 + 断点快照 + 任务队列 |
+| **Layer 3** | Redis `192.168.200.128:6379` | <1ms | 重启不丢 | Q&A 缓存（精确 + 语义） |
+
+### MySQL 三张表说明
+
+| 表名 | 作用 |
+|------|------|
+| `chat_messages` | 对话历史持久化，每条 user/assistant 消息一行，按 `session_id` 隔离不同会话 |
+| `task_checkpoints` | 断点快照，每个 LangGraph 节点执行后自动保存 `state` 的 JSON 序列化 |
+| `task_queue` | 任务队列，记录任务生命周期：`pending → running → completed/failed/interrupted` |
+
+### 断点重续流程
+
+```
+用户提问
+  │
+  ├─ MySQL task_queue 创建 status=running 记录
+  │
+  ├─ LangGraph 每个节点执行后
+  │    └─ MySQL task_checkpoints 保存 state 快照（含 query、retrieved_docs 等）
+  │
+  ├─ 服务宕机 / 用户关闭客户端
+  │    └─ task_queue 中 status 仍为 running
+  │
+  ├─ 服务重启
+  │    └─ 自动调用 mark_interrupted_tasks() → running 批量改为 interrupted
+  │
+  ├─ 用户下次登录
+  │    └─ 前端调用 /api/tasks/unfinished → 检测到未完成任务 → 弹窗提示
+  │
+  └─ 用户点击「确定恢复」
+       └─ 调用 /api/tasks/resume → 读取最后一条快照 → 恢复 state → 重新执行图
+```
+
+### 断点恢复 API
+
+| 接口 | 方法 | 作用 |
+|------|------|------|
+| `/api/tasks/unfinished?session_id=web_session` | GET | 查询指定会话的未完成任务列表 |
+| `/api/tasks/resume` | POST | 从断点恢复执行（body: `{"task_id": "xxx"}`） |
+
+> **容错策略**：如果 MySQL 不可用，系统自动降级为内存模式（与旧版行为一致），打印警告但不阻断服务。所有数据库操作都有 try-except 兜底。
+
 ## 性能提示
 
 - 首次提问需加载 embedding 模型和连接向量库，耗时较长；之后重复问题可走缓存。
 - 简单问题在 LangGraph 模式下约 1-2 分钟，复杂多智能体问题约 5-10 分钟（受限于 qwen2:7b 的推理速度）。
 - 使用 `--fast` 模式可跳过 LLM 查询重写，减少一次 LLM 调用。
+- 断点快照保存在 MySQL 中，每个节点执行后写入一次 JSON（~1-5ms），对整体性能影响可忽略。
 - 文档切片策略、top_k、检索轮次上限等参数可在 `langgraph_rag_agent.py` 顶部配置区调整。
 
 ## 常见问题
@@ -383,23 +480,30 @@ DOC_ACCESS_RULES = {
 - 如果返回 `PONG` 则正常，否则启动 Redis 服务
 - 缓存不可用不影响核心问答功能，系统会自动降级
 
-### 5. ChromaDB 向量库未构建
+### 5. 连接 MySQL 失败 / 断点恢复不生效
+
+- 检查 MySQL 是否已启动：`mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"`
+- 确认 `rag_agent` 数据库已自动创建（首次启动时会自动建库建表）
+- MySQL 不可用不影响核心问答功能，系统会自动降级为内存模式
+- 断点恢复仅在 LangGraph 引擎模式下可用（`python rag_web_server.py` 默认即为 LangGraph）
+
+### 6. ChromaDB 向量库未构建
 
 - 首次运行会自动扫描 `docs/` 目录并构建索引，耐心等待即可
 - 如果 `docs/` 为空，系统会提示找不到文档
 
-### 6. 权限没有生效
+### 7. 权限没有生效
 
 - 确认文件名包含 `JM-S509` 才会被标记为受限文档
 - Web 界面点击右上角角色 badge 切换到「特权用户」后再提问
 - 命令行加 `--admin` 参数启动
 
-### 7. 运行时 segfault / 闪退
+### 8. 运行时 segfault / 闪退
 
 - 换用 PowerShell 或 CMD 启动，不要用 Git Bash
 - 确保 Python 3.10 环境，部分依赖不兼容 Python 3.12+
 
-### 8. LangGraph 模式 vs 旧版模式如何选择？
+### 9. LangGraph 模式 vs 旧版模式如何选择？
 
 - **LangGraph（`--langgraph` 或直接 `langgraph_rag_agent.py`）**：支持多轮检索、多智能体协作、多轮对话，回答更全面但耗时更长。
 - **旧版（`advanced_rag_agent.py` / 不带 `--langgraph` 的 Web 服务）**：单次检索 + 一次生成，速度快但可能遗漏信息。

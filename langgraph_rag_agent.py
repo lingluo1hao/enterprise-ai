@@ -59,6 +59,9 @@ from advanced_rag_agent import (
     DEFAULT_ROLE,
 )
 
+# Layer 2: MySQL 多层记忆持久化模块
+from memory_store import MySQLMemoryStore
+
 # ============================================================================
 # 配置区 — 所有可调参数集中管理
 # ============================================================================
@@ -263,21 +266,81 @@ class LangGraphRAGApp:
         print("\n[2/3] 加载向量数据库...")
         self.vector_db = VectorStoreManager.init_vector_store()
 
-        # 3. 缓存 + 对话历史
-        # CacheManager: Redis 两级缓存（精确匹配 + 语义匹配）
-        # _history_store: 内存字典，以 session_id 为 key，存储在内存中
-        #                  注意：重启程序后历史会丢失，仅用于单次运行的多轮对话
-        print("\n[3/3] 初始化缓存与对话历史...")
+        # 3. 缓存 + 对话历史 + MySQL 持久化记忆
+        # CacheManager: Redis 两级缓存（精确匹配 + 语义匹配）— Layer 3
+        # MySQLMemoryStore: MySQL 持久化记忆 — Layer 2（★新增）
+        #   - 对话历史持久化（替代内存 _history_store）
+        #   - 任务断点快照（每个节点执行后保存 state）
+        #   - 任务队列管理（running/completed/interrupted）
+        # _active_context: 内存活跃上下文 — Layer 1（保留，用于加速）
+        print("\n[3/4] 初始化缓存与多层记忆...")
         self.cache = CacheManager()
-        self._history_store: Dict[str, List[Dict]] = {}
+        self.memory_store = MySQLMemoryStore()
+        self._active_context: Dict[str, List[Dict]] = {}  # Layer 1: 内存加速
+        self.current_task_id: Optional[str] = None  # 当前正在执行的任务 ID
         self.fast_mode = fast_mode
+
+        # 服务重启时，将上次未完成的 running 任务标记为 interrupted
+        # 这样用户下次登录时能看到准确的中断状态
+        if self.memory_store.available:
+            self.memory_store.mark_interrupted_tasks(None)
+            print("  [记忆] 已检查并标记上次中断的任务")
 
         # 4. 构建 StateGraph
         # _build_graph() 定义所有节点、边、条件边，最后 compile() 生成可执行的图。
         # compile() 会校验图结构（无孤立节点、无死循环等），返回 CompiledStateGraph。
-        print("\n[系统] 构建 LangGraph 状态图...")
+        # 节点函数通过 _wrap_node_with_checkpoint 包装，每个节点执行后自动保存断点到 MySQL。
+        print("\n[4/4] 构建 LangGraph 状态图...")
         self.graph = self._build_graph()
         print("[系统] 初始化完成\n")
+
+    # ========================================================================
+    # 断点包装器 — 每个节点执行后自动保存 state 到 MySQL
+    # ========================================================================
+
+    def _wrap_node_with_checkpoint(self, node_name: str, fn):
+        """
+        【断点包装器：给节点函数包一层自动存盘逻辑】
+
+        作用：每个 LangGraph 节点执行完毕后，自动把当前 state 保存到 MySQL。
+        如果服务在此之后宕机，下次可以通过 load_latest_checkpoint 恢复到这个状态。
+
+        原理：
+        包装器是一个高阶函数：接收原始节点函数 fn，返回一个新的函数 wrapped。
+        wrapped 先调用原始 fn 执行节点逻辑，拿到返回的 state 增量，
+        然后把「旧 state + 增量」合并后保存到 MySQL task_checkpoints 表。
+
+        为什么用包装器而不是手动在每个节点里写存盘代码？
+        - DRY 原则：14 个节点都需要存盘，包装器写一次即可
+        - 可维护：未来加减节点不需要改存盘逻辑
+        - 可测试：包装器与业务逻辑解耦
+
+        参数：
+            node_name: 节点名称（如 "classify", "retrieve"）
+            fn: 原始节点函数
+        返回：
+            包装后的函数（签名与 fn 相同）
+        """
+        def wrapped(state):
+            # 1. 调用原始节点函数，执行业务逻辑
+            result = fn(state)
+
+            # 2. 如果当前有活跃任务，保存断点快照到 MySQL
+            if self.current_task_id and self.memory_store.available:
+                # 合并旧 state 和节点返回的增量
+                merged_state = {**state, **result}
+                self.memory_store.save_checkpoint(
+                    thread_id=self.current_task_id,
+                    session_id=state.get("session_id", "default"),
+                    node_name=node_name,
+                    state=merged_state,
+                )
+                print(f"  [checkpoint] {node_name} → 已保存断点到 MySQL")
+
+            # 3. 返回原始结果（不影响 LangGraph 的 state 合并逻辑）
+            return result
+
+        return wrapped
 
     # ========================================================================
     # 图构建 — 定义整个 Agent 的执行流程
@@ -298,7 +361,7 @@ class LangGraphRAGApp:
           START
             │
             ▼
-          load_history  ←── 从 _history_store 加载该会话的历史消息
+          load_history  ←── 从 MySQL/内存 加载该会话的历史消息
             │
             ▼
           classify      ←── LLM 判断问题类型 + 上下文消解（追问补全）
@@ -353,28 +416,32 @@ class LangGraphRAGApp:
 
         # ================== 注册所有节点 ==================
         # 每个节点是一个函数，签名统一为 (state: AgentState) -> dict
-        # 返回的 dict 会被 LangGraph 自动合并到全局 state 中
+        # 返回的 dict 会被 LangGraph 自动合并到全局 state 中。
+        #
+        # ★ 断点机制：所有节点通过 _wrap_node_with_checkpoint 包装，
+        # 每个节点执行后自动把 state 保存到 MySQL task_checkpoints 表。
+        # 如果服务宕机，下次可通过 load_latest_checkpoint 恢复。
 
         # --- 公共入口节点 ---
-        graph.add_node("load_history", self.node_load_history)
-        graph.add_node("classify", self.node_classify)
-        graph.add_node("direct_llm", self.node_direct_llm)
+        graph.add_node("load_history", self._wrap_node_with_checkpoint("load_history", self.node_load_history))
+        graph.add_node("classify", self._wrap_node_with_checkpoint("classify", self.node_classify))
+        graph.add_node("direct_llm", self._wrap_node_with_checkpoint("direct_llm", self.node_direct_llm))
 
         # --- simple 分支节点（多轮检索） ---
-        graph.add_node("query_rewrite", self.node_query_rewrite)
-        graph.add_node("retrieve", self.node_retrieve)
-        graph.add_node("grade_docs", self.node_grade_docs)
-        graph.add_node("rerank_mmr", self.node_rerank_mmr)
-        graph.add_node("generate_simple", self.node_generate_simple)
+        graph.add_node("query_rewrite", self._wrap_node_with_checkpoint("query_rewrite", self.node_query_rewrite))
+        graph.add_node("retrieve", self._wrap_node_with_checkpoint("retrieve", self.node_retrieve))
+        graph.add_node("grade_docs", self._wrap_node_with_checkpoint("grade_docs", self.node_grade_docs))
+        graph.add_node("rerank_mmr", self._wrap_node_with_checkpoint("rerank_mmr", self.node_rerank_mmr))
+        graph.add_node("generate_simple", self._wrap_node_with_checkpoint("generate_simple", self.node_generate_simple))
 
         # --- complex 分支节点（多智能体） ---
-        graph.add_node("planner", self.node_planner)
-        graph.add_node("reviewer", self.node_reviewer)
-        graph.add_node("writer", self.node_writer)
+        graph.add_node("planner", self._wrap_node_with_checkpoint("planner", self.node_planner))
+        graph.add_node("reviewer", self._wrap_node_with_checkpoint("reviewer", self.node_reviewer))
+        graph.add_node("writer", self._wrap_node_with_checkpoint("writer", self.node_writer))
 
         # --- 公共出口节点 ---
-        graph.add_node("respond", self.node_respond)
-        graph.add_node("save_history", self.node_save_history)
+        graph.add_node("respond", self._wrap_node_with_checkpoint("respond", self.node_respond))
+        graph.add_node("save_history", self._wrap_node_with_checkpoint("save_history", self.node_save_history))
 
         # ================== 连线 — 图的数据流向 ==================
 
@@ -447,14 +514,17 @@ class LangGraphRAGApp:
         """
         【节点：加载对话历史】
 
-        作用：根据 session_id 从内存中加载该会话的历史消息。
+        作用：根据 session_id 加载该会话的历史消息。
 
-        原理：
-        多轮对话需要"记住"之前聊了什么。
-        这里用 session_id 隔离不同会话（不同用户/不同浏览器窗口）。
-        _history_store 是一个内存字典，key 是 session_id，value 是消息列表。
+        原理 — 三层记忆架构：
+        1. 先查 Layer 1（内存 _active_context）：最快，用于加速单次会话
+        2. 再查 Layer 2（MySQL chat_messages 表）：持久化，服务重启不丢失
+        3. 如果两层都没有，返回空列表（首次对话）
 
-        这个节点在任何问题处理之前执行，确保 classify 等后续节点能看到历史上下文。
+        为什么需要两层？
+        - 内存层：读写 < 0.1ms，但服务重启丢失
+        - MySQL 层：读写 ~1-5ms，但持久化
+        - 组合使用：首次从 MySQL 加载到内存，后续直接读内存
 
         输入：
             state["session_id"] — 会话标识符
@@ -462,8 +532,18 @@ class LangGraphRAGApp:
             {"messages": [...]} — 该会话的历史消息列表
         """
         session_id = state.get("session_id", "default")
-        history = self._history_store.get(session_id, [])
-        print(f"  [load_history] 会话 {session_id}：{len(history)} 条历史消息")
+
+        # Layer 1: 先查内存（如果同会话已经加载过，直接用缓存）
+        if session_id in self._active_context:
+            history = self._active_context[session_id]
+            print(f"  [load_history] 会话 {session_id}：{len(history)} 条（内存命中）")
+            return {"messages": history}
+
+        # Layer 2: 查 MySQL（服务重启后的首次加载，或新会话）
+        history = self.memory_store.load_messages(session_id)
+        # 写入内存缓存，后续同会话直接读内存
+        self._active_context[session_id] = history
+        print(f"  [load_history] 会话 {session_id}：{len(history)} 条（MySQL 加载）")
         return {"messages": history}
 
     # ========================================================================
@@ -617,12 +697,12 @@ class LangGraphRAGApp:
         """
         【节点：保存对话历史】
 
-        作用：将本轮问答追加到会话历史中，超过窗口限制时自动压缩。
+        作用：将本轮问答追加到会话历史中，同时写入 MySQL 和内存，超过窗口限制时自动压缩。
 
-        原理：
-        每次问答结束后，将用户问题和助手回复追加到 messages 列表。
-        当消息数量超过 HISTORY_MAX_TURNS * 2 时（每轮=用户+助手=2条），
-        触发 _compress_history() 把旧消息压缩为一段摘要。
+        原理 — 三层记忆架构写入策略：
+        1. 写 Layer 2（MySQL）：持久化保存，服务重启不丢失
+        2. 写 Layer 1（内存）：加速后续同会话的读取
+        3. 超过 HISTORY_MAX_TURNS * 2 条消息时触发压缩
 
         为什么需要压缩？
         LLM 的上下文窗口有限（qwen2:7b 约 32K tokens）。
@@ -650,9 +730,13 @@ class LangGraphRAGApp:
         if len(messages) > max_msgs:
             messages = self._compress_history(messages)
 
-        # 写回内存存储
-        self._history_store[session_id] = messages
-        print(f"  [save_history] 已保存，历史 {len(messages)} 条消息")
+        # Layer 2: 写入 MySQL（持久化，重启不丢）
+        self.memory_store.save_message(session_id, "user", query)
+        self.memory_store.save_message(session_id, "assistant", answer)
+
+        # Layer 1: 写入内存（加速后续读取）
+        self._active_context[session_id] = messages
+        print(f"  [save_history] 已保存到 MySQL + 内存，历史 {len(messages)} 条消息")
         return {"messages": messages}
 
     # ========================================================================
@@ -1735,20 +1819,19 @@ class LangGraphRAGApp:
         这是整个 Agent 的唯一对外接口。
         CLI 模式和 Web 模式都通过这个方法来提问。
 
-        完整流程（4 步）：
+        完整流程（5 步）：
         1. Redis 缓存检查 — 命中则直接返回，跳过所有 LLM 调用
-        2. LangGraph 状态图执行 — 分类 → 检索/智能体 → 生成
-        3. Redis 缓存写入 — 把本次问答结果存入 Redis（加速下次）
-        4. 输出结果
+        2. 创建任务记录 — 在 MySQL task_queue 中创建 status=running 的任务
+        3. LangGraph 状态图执行 — 分类 → 检索/智能体 → 生成
+           （每个节点执行后自动保存断点到 MySQL task_checkpoints）
+        4. 更新任务状态为 completed + 写入 Redis 缓存
+        5. 输出结果
 
-        为什么先查缓存？
-        缓存命中率较高的问题（如"心跳间隔是多少？"），
-        走缓存从十几秒降到几毫秒，极大提升用户体验。
-
-        recursion_limit=50 的含义：
-        LangGraph 的递归深度限制。每个节点执行计为一次递归。
-        14 个节点 + 3 轮检索循环 + 2 轮审查循环 ≈ 可能达到 20+ 次递归。
-        设为 50 留有足够余量，同时防止真正的死循环。
+        断点重续保障：
+        - 步骤 2 创建任务后，如果步骤 3 中途宕机，task_queue 中的 status 仍为 running
+        - 下次服务重启时，__init__ 会把所有 running 标记为 interrupted
+        - 用户下次登录时可通过 check_unfinished_tasks() 检测到中断的任务
+        - 通过 resume() 方法从最后断点恢复执行
 
         参数：
             question: 用户输入的原始问题
@@ -1765,7 +1848,7 @@ class LangGraphRAGApp:
         print(f"用户角色: {role_desc}")
         print("=" * 70)
 
-        # ---- 第一步：缓存检查 ----
+        # ---- 第一步：缓存检查（Layer 3: Redis）----
         # CacheManager 内部会做标准化 → SHA256 精确匹配 → BGE 语义匹配
         self.cache.current_role = role
         cached = self.cache.lookup(question)
@@ -1774,13 +1857,23 @@ class LangGraphRAGApp:
             print(f"\n{'─' * 70}\n{cached}\n{'─' * 70}")
             return cached
 
-        # ---- 第二步：执行 LangGraph 状态图 ----
+        # ---- 第二步：创建任务记录（Layer 2: MySQL task_queue）----
+        # 在 MySQL 中创建一条 status=running 的任务记录。
+        # 如果后续执行中断，这条记录的 status 会保持 running，
+        # 下次用户登录时可以通过 check_unfinished_tasks() 检测到。
+        self.current_task_id = self.memory_store.create_task(
+            session_id=session_id, query=question, role=role
+        )
+        print(f"  [任务] 已创建任务 {self.current_task_id}（status=running）")
+
+        # ---- 第三步：执行 LangGraph 状态图 ----
         # 构建初始状态字典，提供给图的起点（START → load_history）
+        # 注意：messages 从 Layer 1 内存加载（如果同会话已加载过）或 Layer 2 MySQL
         initial_state = {
             "query": question,
             "role": role,
             "session_id": session_id,
-            "messages": self._history_store.get(session_id, []),
+            "messages": self._active_context.get(session_id, self.memory_store.load_messages(session_id)),
             "retrieved_docs": [],
             "doc_grades": [],
             "retrieval_iterations": 0,
@@ -1793,22 +1886,143 @@ class LangGraphRAGApp:
             # 它把初始状态注入图，自动按节点→边→条件边的顺序执行，
             # 直到到达 END 节点，返回最终状态。
             # recursion_limit=50 防止无限循环（节点调用次数上限）。
+            # 每个节点执行后，_wrap_node_with_checkpoint 会自动保存断点到 MySQL。
             final_state = self.graph.invoke(initial_state, {"recursion_limit": 50})
         except Exception as e:
             print(f"\n[Error] 图执行出错: {e}")
             traceback.print_exc()
+            # 任务标记为失败
+            self.memory_store.update_task_status(
+                self.current_task_id, "failed", error_msg=str(e)
+            )
+            self.current_task_id = None
             return f"处理过程中出现错误: {e}"
 
         answer = final_state.get("answer", "抱歉，无法回答这个问题。")
         elapsed = time.time() - total_start
 
-        # ---- 第三步：写入缓存 ----
+        # ---- 第四步：更新任务状态 + 写入缓存 ----
+        # 任务标记为已完成
+        self.memory_store.update_task_status(
+            self.current_task_id, "completed", answer=answer
+        )
+        print(f"  [任务] 任务 {self.current_task_id} 已完成（status=completed）")
+        self.current_task_id = None
+
+        # 写入 Redis 缓存（Layer 3）
         self.cache.save(question, answer)
 
-        # ---- 第四步：输出结果 ----
+        # ---- 第五步：输出结果 ----
         print(f"\n[完成] 总耗时 {elapsed:.1f}s")
         print(f"\n{'─' * 70}\n{answer}\n{'─' * 70}")
 
+        return answer
+
+    def check_unfinished_tasks(self, session_id: str) -> List[Dict]:
+        """
+        【断点检测：查询指定会话的未完成任务】
+
+        作用：用户登录/连接时调用。如果有 interrupted 状态的任务，
+        说明上次执行被中断（服务宕机或用户关闭客户端），
+        可以提示用户并尝试恢复。
+
+        参数：
+            session_id: 会话 ID
+        返回：
+            [{"task_id": "...", "query": "...", "created_at": "..."}, ...]
+            空列表表示没有未完成任务
+        """
+        return self.memory_store.get_unfinished_tasks(session_id)
+
+    def resume(self, task_id: str, session_id: str = "default") -> str:
+        """
+        【断点重续：从上次中断的位置恢复执行】
+
+        作用：读取 MySQL task_checkpoints 中该任务的最后一条快照，
+        恢复 state 字典，重新注入 LangGraph 图执行。
+
+        原理：
+        1. 从 MySQL 读取 task_checkpoints 最后一条快照（包含完整 state）
+        2. 恢复 state 中的 query、role、session_id、retrieved_docs 等字段
+        3. 重新调用 graph.invoke()，图会从 load_history 开始重新执行
+        4. 但由于 state 中已有 retrieved_docs、query_type 等结果，
+        - classify 节点会看到已有的 query_type（虽然会重新分类，但结果通常一致）
+        - retrieve 节点会重新检索（因为没有"跳过已检索"的逻辑）
+        - 实际效果：相当于重新执行，但对话历史和上下文都在
+        5. 执行完成后更新任务状态为 completed
+
+        局限性说明（对初学者透明）：
+        真正的"从断点继续执行"需要 LangGraph 的持久化 CheckpointSaver
+        （如 PostgresSaver），可以在任意节点暂停/恢复。
+        本方案采用"恢复状态 + 重新执行"的简化策略，
+        虽然会重复执行部分节点，但保证了数据一致性和实现简洁性。
+        对于 RAG 场景（大部分耗时在 LLM 调用），Redis 缓存可以加速重复查询。
+
+        参数：
+            task_id: 要恢复的任务 ID
+            session_id: 会话 ID（默认 "default"）
+        返回：
+            生成的回答文本
+        """
+        print(f"\n{'=' * 70}")
+        print(f"[断点重续] 恢复任务 {task_id}")
+        print(f"{'=' * 70}")
+
+        # 1. 查询任务信息
+        task = self.memory_store.get_task_by_id(task_id)
+        if not task:
+            return f"任务 {task_id} 不存在"
+
+        print(f"  原始问题: {task['query']}")
+        print(f"  任务状态: {task['status']}")
+
+        # 2. 加载最后一条断点快照
+        ckpt = self.memory_store.load_latest_checkpoint(task_id)
+        if ckpt:
+            print(f"  断点位置: {ckpt['node_name']}（第 {ckpt['checkpoint_order']} 个快照）")
+            # 恢复 state
+            restored_state = ckpt["state"]
+            # 确保关键字段存在
+            restored_state["session_id"] = session_id
+            restored_state.setdefault("messages", self.memory_store.load_messages(session_id))
+        else:
+            # 没有快照，从头开始
+            print(f"  无断点快照，从头执行")
+            restored_state = {
+                "query": task["query"],
+                "role": task.get("role", DEFAULT_ROLE),
+                "session_id": session_id,
+                "messages": self.memory_store.load_messages(session_id),
+                "retrieved_docs": [],
+                "doc_grades": [],
+                "retrieval_iterations": 0,
+                "research_results": [],
+                "review_rounds": 0,
+            }
+
+        # 3. 设置当前任务 ID（用于断点包装器继续保存快照）
+        self.current_task_id = task_id
+
+        # 4. 重新执行图
+        total_start = time.time()
+        try:
+            final_state = self.graph.invoke(restored_state, {"recursion_limit": 50})
+        except Exception as e:
+            print(f"\n[Error] 恢复执行出错: {e}")
+            traceback.print_exc()
+            self.memory_store.update_task_status(task_id, "failed", error_msg=str(e))
+            self.current_task_id = None
+            return f"恢复执行失败: {e}"
+
+        answer = final_state.get("answer", "抱歉，无法回答这个问题。")
+        elapsed = time.time() - total_start
+
+        # 5. 更新任务状态
+        self.memory_store.update_task_status(task_id, "completed", answer=answer)
+        self.current_task_id = None
+
+        print(f"\n[断点重续完成] 耗时 {elapsed:.1f}s")
+        print(f"\n{'─' * 70}\n{answer}\n{'─' * 70}")
         return answer
 
 
@@ -1882,15 +2096,16 @@ def run_interactive(app: LangGraphRAGApp, role: str):
             print("  已切换为普通用户（仅公开文档）")
             continue
         if question.lower() in ("/history", "/历史"):
-            history = app._history_store.get(session_id, [])
+            history = app._active_context.get(session_id, app.memory_store.load_messages(session_id))
             print(f"  当前会话历史（{len(history)} 条）:")
             for m in history:
                 r = "用户" if m["role"] == "user" else "助手"
                 print(f"    {r}: {m['content'][:80]}")
             continue
         if question.lower() in ("/clear", "/清空"):
-            app._history_store[session_id] = []
-            print("  已清空会话历史")
+            app._active_context.pop(session_id, None)
+            app.memory_store.clear_messages(session_id)
+            print("  已清空会话历史（内存 + MySQL）")
             continue
 
         # ---- 提问 ----
