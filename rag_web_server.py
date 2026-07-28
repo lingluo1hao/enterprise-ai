@@ -41,13 +41,31 @@ from advanced_rag_agent import (
     VectorStoreManager,
 )
 
+
+class LangGraphEngine:
+    """适配器：让 LangGraphRAGApp 兼容 rag_web_server 的 RAGOrchestrator 接口"""
+
+    def __init__(self, fast_mode=True, user_role=DEFAULT_ROLE):
+        from langgraph_rag_agent import LangGraphRAGApp
+        self.app = LangGraphRAGApp(fast_mode=fast_mode)
+        self.user_role = user_role
+        self.cache = self.app.cache
+        # 兼容角色切换中的 skill_registry.get_skill() 调用
+        self.skill_registry = type("SR", (), {"get_skill": lambda self, name: None})()
+
+    def query(self, question, user_role=None):
+        role = user_role or self.user_role
+        return self.app.query(question, role=role, session_id="web_session")
+
+
 # ====== Flask 应用 ======
 app = Flask(__name__)
 
 # 全局变量
-orchestrator: RAGOrchestrator = None
+orchestrator = None
 llm = None
 vector_db = None
+use_langgraph = False
 
 
 # ======================================================================
@@ -777,7 +795,7 @@ function formatTime() {
 
 def init_system():
     """初始化 LLM + 向量数据库 + 编排器"""
-    global orchestrator, llm, vector_db
+    global orchestrator, llm, vector_db, use_langgraph
 
     print("\n" + "=" * 60)
     print("  初始化 RAG Agent 系统...")
@@ -801,8 +819,12 @@ def init_system():
         sys.exit(1)
 
     # 3. 编排器
-    orchestrator = RAGOrchestrator(llm, vector_db, fast_mode=True, user_role=DEFAULT_ROLE)
-    print(f"  ✓ RAG Orchestrator 就绪")
+    if use_langgraph:
+        orchestrator = LangGraphEngine(fast_mode=True, user_role=DEFAULT_ROLE)
+        print(f"  ✓ LangGraph Engine 就绪（多轮检索+多智能体+多轮对话）")
+    else:
+        orchestrator = RAGOrchestrator(llm, vector_db, fast_mode=True, user_role=DEFAULT_ROLE)
+        print(f"  ✓ RAG Orchestrator 就绪")
     print(f"  ✓ 用户角色: {DEFAULT_ROLE}")
     print(f"  ✓ Web 界面已启动\n")
 
@@ -812,7 +834,11 @@ def main():
     parser = argparse.ArgumentParser(description="RAG Agent Web Server")
     parser.add_argument("--port", type=int, default=8080, help="Web 服务器端口 (默认 8080)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="绑定的主机地址")
+    parser.add_argument("--langgraph", action="store_true", help="使用 LangGraph 引擎（多轮检索+多智能体+多轮对话）")
     args = parser.parse_args()
+
+    global use_langgraph
+    use_langgraph = args.langgraph
 
     init_system()
 
