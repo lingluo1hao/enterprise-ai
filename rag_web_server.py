@@ -834,7 +834,12 @@ def main():
     parser = argparse.ArgumentParser(description="RAG Agent Web Server")
     parser.add_argument("--port", type=int, default=8080, help="Web 服务器端口 (默认 8080)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="绑定的主机地址")
-    parser.add_argument("--langgraph", action="store_true", help="使用 LangGraph 引擎（多轮检索+多智能体+多轮对话）")
+    parser.add_argument(
+        "--langgraph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="使用 LangGraph 引擎（默认开启，--no-langgraph 使用旧版）",
+    )
     args = parser.parse_args()
 
     global use_langgraph

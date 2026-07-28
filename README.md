@@ -276,14 +276,17 @@ python advanced_rag_agent.py "问题" --admin --fast
 > 注意：在 Windows 上请使用 PowerShell 或 CMD 启动，Git Bash 中 ChromaDB 底层依赖可能异常退出。
 
 ```bash
-# 默认引擎（旧版），默认端口 8080
+# 默认使用 LangGraph 引擎，默认端口 8080
 python rag_web_server.py
 
-# 使用 LangGraph 引擎（推荐：多轮检索+多智能体+多轮对话）
-python rag_web_server.py --langgraph
+# 切换为旧版 LangChain 引擎
+python rag_web_server.py --no-langgraph
 
 # 指定端口
-python rag_web_server.py --langgraph --port 9090
+python rag_web_server.py --port 9090
+
+# 旧版 + 指定端口
+python rag_web_server.py --no-langgraph --port 9090
 ```
 
 打开浏览器访问：
