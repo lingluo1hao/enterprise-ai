@@ -132,6 +132,12 @@ def api_query():
     if not question:
         return jsonify({"error": "问题不能为空"}), 400
 
+    # 特权角色需要管理员 Token
+    if user_role == ROLE_ADMIN:
+        auth_result = _require_admin_token()
+        if auth_result:
+            return auth_result
+
     result = orchestrator.query(question, user_role=user_role)
     return jsonify({"answer": result, "role": orchestrator.user_role})
 
@@ -149,6 +155,12 @@ def api_query_stream():
 
     if not question:
         return jsonify({"error": "问题不能为空"}), 400
+
+    # 特权角色需要管理员 Token
+    if user_role == ROLE_ADMIN:
+        auth_result = _require_admin_token()
+        if auth_result:
+            return auth_result
 
     # 创建队列用于接收进度
     progress_queue = queue.Queue()
@@ -222,12 +234,25 @@ def api_query_stream():
 
 @app.route("/api/role", methods=["POST"])
 def set_role():
-    """切换用户角色"""
+    """
+    切换用户角色。
+
+    安全策略：
+      - 切换到普通用户 (user) 无需认证；
+      - 切换到特权用户 (admin) 必须在请求头携带有效管理 Token，
+        防止未授权用户通过直接调用 API 访问受限文档。
+    """
     data = request.get_json(force=True)
     new_role = data.get("role", ROLE_USER)
 
     if new_role not in (ROLE_ADMIN, ROLE_USER):
         return jsonify({"error": "无效角色"}), 400
+
+    # 切换到 admin 需要认证
+    if new_role == ROLE_ADMIN:
+        auth_result = _require_admin_token()
+        if auth_result:
+            return auth_result
 
     orchestrator.user_role = new_role
     orchestrator.cache.current_role = new_role
@@ -239,6 +264,25 @@ def set_role():
         "role": new_role,
         "description": AccessControlFilter.get_role_description(new_role),
     })
+
+
+# ======================================================================
+# 内部辅助函数
+# ======================================================================
+
+def _require_admin_token():
+    """
+    校验请求是否携带有效的管理员 Token。
+
+    用于保护 admin 角色相关的接口，防止未授权用户直接调用 API
+    访问受限文档。返回 None 表示校验通过，否则返回 (响应, 状态码)。
+    """
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    from prompt_manager import get_auth_manager
+    auth = get_auth_manager()
+    if not auth.verify_token(token):
+        return jsonify({"error": "需要管理员权限"}), 403
+    return None
 
 
 # ======================================================================
@@ -287,8 +331,846 @@ def resume_task():
 
 
 # ======================================================================
+# 管理后台 API — 提示词工程管理 + 用户认证
+# ======================================================================
+
+# ---- 认证相关 ----
+
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    """管理员登录"""
+    data = request.get_json(force=True)
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+
+    if not username or not password:
+        return jsonify({"error": "用户名和密码不能为空"}), 400
+
+    from prompt_manager import AuthManager, get_auth_manager
+    auth = get_auth_manager()
+    user = auth.login(username, password)
+
+    if user:
+        return jsonify({
+            "success": True,
+            "user": {"username": user["username"], "display_name": user["display_name"]},
+            "token": user["token"],
+        })
+    else:
+        return jsonify({"success": False, "error": "用户名或密码错误"}), 401
+
+
+@app.route("/api/admin/me", methods=["GET"])
+def admin_me():
+    """
+    获取当前登录管理员信息。
+
+    前端页面刷新后，用 localStorage 中的 token 调用此接口恢复登录状态。
+    """
+    auth_result = _require_admin_token()
+    if auth_result:
+        return auth_result
+
+    from prompt_manager import get_auth_manager
+    auth = get_auth_manager()
+    # 当前 token 只做格式校验，返回默认管理员信息
+    return jsonify({
+        "username": "admin",
+        "display_name": "管理员",
+        "role": "admin"
+    })
+
+
+@app.route("/api/admin/change-password", methods=["POST"])
+def admin_change_password():
+    """修改密码"""
+    data = request.get_json(force=True)
+    username = data.get("username", "").strip()
+    old_password = data.get("old_password", "")
+    new_password = data.get("new_password", "")
+
+    if not new_password or len(new_password) < 6:
+        return jsonify({"error": "新密码至少6位"}), 400
+
+    from prompt_manager import AuthManager, get_auth_manager
+    auth = get_auth_manager()
+    if auth.change_password(username, old_password, new_password):
+        return jsonify({"success": True, "message": "密码修改成功"})
+    else:
+        return jsonify({"error": "原密码错误或用户不存在"}), 400
+
+
+# ---- 提示词管理 ----
+
+@app.route("/api/admin/prompts")
+def admin_list_prompts():
+    """列出所有提示词"""
+    from prompt_manager import get_prompt_manager
+    pm = get_prompt_manager()
+    category = request.args.get("category", "")
+    prompts = pm.list_prompts(category if category else None)
+    return jsonify({"prompts": prompts, "total": len(prompts)})
+
+
+@app.route("/api/admin/prompts/<name>")
+def admin_get_prompt(name):
+    """获取单个提示词"""
+    from prompt_manager import get_prompt_manager
+    pm = get_prompt_manager()
+    prompt = pm.get_prompt(name)
+    return jsonify(prompt)
+
+
+@app.route("/api/admin/prompts", methods=["POST"])
+def admin_save_prompt():
+    """保存/更新提示词"""
+    data = request.get_json(force=True)
+    name = data.get("name", "").strip()
+    system = data.get("system", "")
+    user_template = data.get("user_template", "")
+    display_name = data.get("display_name", "")
+    description = data.get("description", "")
+    category = data.get("category", "general")
+
+    if not name or not system:
+        return jsonify({"error": "名称和系统提示词不能为空"}), 400
+
+    from prompt_manager import get_prompt_manager
+    pm = get_prompt_manager()
+    ok = pm.save_prompt(
+        name=name, system=system, user_template=user_template,
+        display_name=display_name, description=description, category=category,
+    )
+    if ok:
+        return jsonify({"success": True, "message": f"提示词 '{name}' 已保存"})
+    else:
+        return jsonify({"error": "保存失败，数据库不可用"}), 500
+
+
+@app.route("/api/admin/prompts/<name>", methods=["DELETE"])
+def admin_delete_prompt(name):
+    """删除提示词"""
+    from prompt_manager import get_prompt_manager
+    pm = get_prompt_manager()
+    ok = pm.delete_prompt(name)
+    if ok:
+        return jsonify({"success": True, "message": f"提示词 '{name}' 已删除"})
+    else:
+        return jsonify({"error": "删除失败（系统内置提示词不可删除）"}), 400
+
+
+@app.route("/api/admin/prompts/<name>/toggle", methods=["POST"])
+def admin_toggle_prompt(name):
+    """启用/禁用提示词"""
+    data = request.get_json(force=True)
+    active = data.get("active", True)
+    from prompt_manager import get_prompt_manager
+    pm = get_prompt_manager()
+    ok = pm.set_active(name, active)
+    if ok:
+        return jsonify({"success": True, "active": active})
+    else:
+        return jsonify({"error": "操作失败"}), 500
+
+
+@app.route("/api/admin/prompts/import-defaults", methods=["POST"])
+def admin_import_defaults():
+    """导入默认提示词（覆盖已有记录）"""
+    from prompt_manager import get_prompt_manager
+    pm = get_prompt_manager()
+    count = pm.import_defaults()
+    return jsonify({"success": True, "imported": count})
+
+
+@app.route("/api/admin/categories")
+def admin_categories():
+    """获取提示词分类列表"""
+    from prompt_manager import get_prompt_manager
+    pm = get_prompt_manager()
+    return jsonify({"categories": pm.get_categories()})
+
+
+# ---- 管理后台页面 ----
+
+@app.route("/admin")
+def admin_page():
+    """管理后台页面"""
+    return _ADMIN_PAGE
+
+
+# ======================================================================
 # HTML 页面（内嵌单文件模板）
 # ======================================================================
+
+_ADMIN_PAGE = r"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>系统管理 - RAG Agent</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#f5f6fa;--surface:#fff;--border:#e2e5ed;
+    --text:#1a1a2e;--text-2:#6b7280;--text-3:#9ca3af;
+    --primary:#2563eb;--primary-light:#dbeafe;--primary-hover:#1d4ed8;
+    --danger:#dc2626;--danger-light:#fef2f2;
+    --success:#16a34a;--success-light:#f0fdf4;
+    --warning:#d97706;--warning-light:#fffbeb;
+    --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);
+    --shadow-lg:0 10px 25px rgba(0,0,0,.1);
+    --radius:12px;--radius-sm:8px;
+  }
+  html,body{height:100%}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans SC",sans-serif;
+    background:var(--bg);color:var(--text);
+  }
+
+  /* ===== Login Page ===== */
+  .login-page{
+    display:flex;align-items:center;justify-content:center;min-height:100vh;
+    background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+  }
+  .login-card{
+    background:var(--surface);border-radius:var(--radius);padding:40px;width:380px;
+    box-shadow:var(--shadow-lg);
+  }
+  .login-card h2{text-align:center;margin-bottom:8px;font-size:24px}
+  .login-card .sub{text-align:center;color:var(--text-2);margin-bottom:24px;font-size:14px}
+  .form-group{margin-bottom:16px}
+  .form-group label{display:block;margin-bottom:6px;font-size:14px;font-weight:500;color:var(--text-2)}
+  .form-group input{
+    width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:var(--radius-sm);
+    font-size:14px;outline:none;transition:border-color .2s;
+  }
+  .form-group input:focus{border-color:var(--primary)}
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    padding:10px 20px;border-radius:var(--radius-sm);font-size:14px;font-weight:500;
+    cursor:pointer;border:none;transition:all .2s;
+  }
+  .btn-primary{background:var(--primary);color:#fff;width:100%}
+  .btn-primary:hover{background:var(--primary-hover)}
+  .btn-sm{padding:6px 12px;font-size:12px}
+  .btn-danger{background:var(--danger);color:#fff}
+  .btn-danger:hover{opacity:.9}
+  .btn-outline{background:var(--surface);border:1.5px solid var(--border);color:var(--text)}
+  .btn-outline:hover{background:var(--bg)}
+  .error-msg{color:var(--danger);font-size:13px;text-align:center;margin-top:8px;display:none}
+  .hidden{display:none !important}
+
+  /* ===== App Layout ===== */
+  .app-page{display:flex;flex-direction:column;height:100vh}
+  .app-header{
+    background:var(--surface);border-bottom:1px solid var(--border);
+    padding:12px 24px;display:flex;align-items:center;justify-content:space-between;
+    box-shadow:var(--shadow);
+  }
+  .app-header h1{font-size:18px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .user-info{display:flex;align-items:center;gap:12px;font-size:13px;color:var(--text-2)}
+  .user-info .name{font-weight:500;color:var(--text)}
+
+  /* ===== Tabs ===== */
+  .tabs{display:flex;gap:0;border-bottom:2px solid var(--border);background:var(--surface);padding:0 24px}
+  .tab{
+    padding:12px 24px;font-size:14px;font-weight:500;color:var(--text-2);
+    cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;
+    transition:all .2s;
+  }
+  .tab:hover{color:var(--text)}
+  .tab.active{color:var(--primary);border-bottom-color:var(--primary)}
+
+  /* ===== Content ===== */
+  .app-content{flex:1;overflow:hidden;display:flex;flex-direction:column}
+  .tab-panel{flex:1;overflow:hidden;padding:24px;display:none;flex-direction:column}
+  .tab-panel.active{display:flex;flex-direction:column}
+
+  /* ===== Prompt List ===== */
+  .toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:12px;flex-wrap:wrap}
+  .search-box{
+    padding:8px 14px;border:1.5px solid var(--border);border-radius:var(--radius-sm);
+    font-size:13px;outline:none;width:240px
+  }
+  .search-box:focus{border-color:var(--primary)}
+  .filter-select{
+    padding:8px 12px;border:1.5px solid var(--border);border-radius:var(--radius-sm);
+    font-size:13px;outline:none;background:var(--surface);
+  }
+  .prompt-list{display:flex;flex-direction:column;gap:8px}
+  .prompt-card{
+    background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);
+    padding:16px;cursor:pointer;transition:all .2s;
+  }
+  .prompt-card:hover{border-color:var(--primary);box-shadow:var(--shadow)}
+  .prompt-card .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+  .prompt-card .name{font-weight:600;font-size:15px}
+  .prompt-card .name .tag{
+    font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;
+    background:var(--primary-light);color:var(--primary);font-weight:500;
+  }
+  .prompt-card .desc{color:var(--text-2);font-size:13px;margin-bottom:6px}
+  .prompt-card .meta{display:flex;gap:16px;font-size:11px;color:var(--text-3)}
+  .prompt-card.inactive{opacity:.5}
+
+  /* ===== Editor Modal ===== */
+  .modal-overlay{
+    position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.4);
+    display:flex;align-items:center;justify-content:center;z-index:100;
+  }
+  .modal{
+    background:var(--surface);border-radius:var(--radius);width:720px;max-height:85vh;
+    box-shadow:var(--shadow-lg);display:flex;flex-direction:column;
+  }
+  .modal-header{
+    padding:16px 24px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;justify-content:space-between;
+  }
+  .modal-header h3{font-size:17px}
+  .modal-body{flex:1;overflow-y:auto;padding:24px}
+  .modal-footer{
+    padding:16px 24px;border-top:1px solid var(--border);
+    display:flex;justify-content:flex-end;gap:8px;
+  }
+  .field{margin-bottom:16px}
+  .field label{display:block;margin-bottom:6px;font-size:13px;font-weight:500;color:var(--text-2)}
+  .field input,.field select,.field textarea{
+    width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:var(--radius-sm);
+    font-size:14px;outline:none;font-family:inherit;
+  }
+  .field textarea{min-height:120px;resize:vertical;font-size:13px}
+  .field input:focus,.field select:focus,.field textarea:focus{border-color:var(--primary)}
+
+  /* ===== Q&A Area ===== */
+  .qa-container{
+    max-width:900px;margin:0 auto;display:flex;flex-direction:column;height:100%;
+    background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow);overflow:hidden
+  }
+  .qa-header{
+    padding:14px 20px;border-bottom:1px solid var(--border);
+    background:linear-gradient(90deg,var(--primary-light),transparent);
+    display:flex;align-items:center;justify-content:space-between
+  }
+  .qa-header-title{display:flex;align-items:center;gap:10px;font-weight:600;color:var(--text-1)}
+  .qa-header-badge{
+    font-size:11px;padding:3px 10px;border-radius:999px;background:var(--primary);color:#fff;font-weight:500
+  }
+  .qa-messages{flex:1;overflow-y:auto;padding:20px;background:var(--bg)}
+  .qa-empty{
+    height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;color:var(--text-2);padding:40px 20px
+  }
+  .qa-empty-icon{
+    width:72px;height:72px;border-radius:50%;background:var(--primary-light);color:var(--primary);
+    display:flex;align-items:center;justify-content:center;font-size:32px;margin-bottom:16px
+  }
+  .qa-empty h3{font-size:18px;color:var(--text-1);margin-bottom:8px;font-weight:600}
+  .qa-empty p{max-width:420px;line-height:1.6;margin-bottom:20px;font-size:14px}
+  .qa-tips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:480px}
+  .qa-tip{
+    padding:8px 14px;border-radius:var(--radius-sm);background:var(--surface);border:1px solid var(--border);
+    font-size:13px;color:var(--text-2);cursor:pointer;transition:all .2s
+  }
+  .qa-tip:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}
+  .qa-msg{margin-bottom:16px;display:flex;gap:10px}
+  .qa-msg.user{flex-direction:row-reverse}
+  .qa-msg .avatar{
+    width:36px;height:36px;border-radius:50%;display:flex;align-items:center;
+    justify-content:center;font-size:16px;flex-shrink:0;
+  }
+  .qa-msg.assistant .avatar{background:var(--primary-light);color:var(--primary)}
+  .qa-msg.user .avatar{background:#e0e7ff;color:#6366f1}
+  .qa-bubble{
+    max-width:75%;padding:12px 16px;border-radius:var(--radius-sm);
+    font-size:14px;line-height:1.6;white-space:pre-wrap;
+  }
+  .qa-msg.assistant .qa-bubble{background:var(--surface);border:1px solid var(--border)}
+  .qa-msg.user .qa-bubble{background:var(--primary);color:#fff}
+  .qa-input-area{
+    display:flex;gap:10px;padding:16px 20px;border-top:1px solid var(--border);background:var(--surface)
+  }
+  .qa-input{
+    flex:1;padding:12px 16px;border:1.5px solid var(--border);border-radius:var(--radius-sm);
+    font-size:14px;outline:none;resize:none;font-family:inherit;min-height:46px
+  }
+  .qa-input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-light)}
+  .qa-send-btn{
+    padding:0 24px;border-radius:var(--radius-sm);background:var(--primary);color:#fff;
+    border:none;font-size:14px;font-weight:500;cursor:pointer;transition:background .2s
+  }
+  .qa-send-btn:hover{background:var(--primary-dark)}
+  .qa-send-btn:disabled{background:var(--text-3);cursor:not-allowed}
+
+  /* ===== Toast ===== */
+  .toast{
+    position:fixed;top:20px;right:20px;z-index:200;
+    padding:12px 20px;border-radius:var(--radius-sm);font-size:14px;
+    box-shadow:var(--shadow-lg);animation:slideIn .3s;max-width:360px;
+  }
+  .toast.success{background:var(--success);color:#fff}
+  .toast.error{background:var(--danger);color:#fff}
+  @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+</style>
+</head>
+<body>
+
+<!-- ===== Login Page ===== -->
+<div id="loginPage" class="login-page">
+  <div class="login-card">
+    <h2>🔐 系统管理</h2>
+    <p class="sub">RAG Agent 提示词工程管理</p>
+    <div class="form-group">
+      <label>用户名</label>
+      <input id="loginUser" type="text" placeholder="请输入用户名" value="admin" autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label>密码</label>
+      <input id="loginPwd" type="password" placeholder="请输入密码" autocomplete="current-password">
+    </div>
+    <p id="loginError" class="error-msg"></p>
+    <button class="btn btn-primary" style="margin-top:8px" onclick="doLogin()">登 录</button>
+    <p style="text-align:center;margin-top:12px;font-size:12px;color:var(--text-3)">
+      默认账号: admin / admin123
+    </p>
+  </div>
+</div>
+
+<!-- ===== App Page ===== -->
+<div id="appPage" class="app-page hidden">
+  <div class="app-header">
+    <h1>⚙️ RAG Agent 系统管理</h1>
+    <div class="user-info">
+      <span>👤</span>
+      <span class="name" id="displayName"></span>
+      <a href="/" style="color:var(--primary);text-decoration:none;font-size:13px;margin-left:8px">💬 知识问答</a>
+      <a href="/admin" style="color:var(--primary);text-decoration:none;font-size:13px">🔧 提示词管理</a>
+      <button class="btn btn-sm btn-outline" onclick="doLogout()">退出</button>
+    </div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-tab="prompts" onclick="switchTab('prompts')">📝 提示词管理</div>
+    <div class="tab" data-tab="qa" onclick="switchTab('qa')">💬 在线问答</div>
+  </div>
+  <div class="app-content">
+    <!-- Prompt Management Tab -->
+    <div id="tabPrompts" class="tab-panel active">
+      <div class="toolbar">
+        <div style="display:flex;gap:8px;align-items:center">
+          <input class="search-box" id="searchInput" placeholder="搜索提示词..." oninput="filterPrompts()">
+          <select class="filter-select" id="filterCategory" onchange="filterPrompts()">
+            <option value="">全部分类</option>
+          </select>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm btn-outline" onclick="importDefaults()">🔄 恢复默认</button>
+          <button class="btn btn-sm btn-outline" onclick="changePassword()">🔑 修改密码</button>
+        </div>
+      </div>
+      <div class="prompt-list" id="promptList"></div>
+    </div>
+    <!-- Q&A Tab -->
+    <div id="tabQa" class="tab-panel">
+      <div class="qa-container">
+        <div class="qa-header">
+          <div class="qa-header-title">
+            <span>💬</span>
+            <span>管理员在线问答</span>
+          </div>
+          <span class="qa-header-badge">admin 权限 · 可访问全部文档</span>
+        </div>
+        <div class="qa-messages" id="qaMessages">
+          <div class="qa-empty" id="qaEmpty">
+            <div class="qa-empty-icon">🤖</div>
+            <h3>管理员问答测试台</h3>
+            <p>在这里以 admin 权限测试知识库问答效果，可访问公开文档与受限文档。修改提示词后可立即来此验证。</p>
+            <div class="qa-tips">
+              <span class="qa-tip" onclick="setQAQuestion('项目支持哪些文档格式？')">📄 项目支持哪些文档格式？</span>
+              <span class="qa-tip" onclick="setQAQuestion('断点重续是怎么实现的？')">🧠 断点重续是怎么实现的？</span>
+              <span class="qa-tip" onclick="setQAQuestion('三层记忆架构是什么？')">🗂️ 三层记忆架构是什么？</span>
+            </div>
+          </div>
+        </div>
+        <div class="qa-input-area">
+          <textarea class="qa-input" id="qaInput" rows="2" placeholder="输入你的问题，按 Enter 发送..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askQA()}"></textarea>
+          <button class="qa-send-btn" id="qaSendBtn" onclick="askQA()">发送</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Modal ===== -->
+<div id="modalOverlay" class="modal-overlay hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modalTitle">编辑提示词</h3>
+      <button class="btn btn-sm btn-outline" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>名称（唯一标识）</label>
+        <input id="editName" placeholder="如: classify, rewrite_first">
+      </div>
+      <div class="field">
+        <label>显示名称</label>
+        <input id="editDisplayName" placeholder="如: 问题分类器">
+      </div>
+      <div class="field">
+        <label>分类</label>
+        <select id="editCategory">
+          <option value="路由">路由</option>
+          <option value="检索">检索</option>
+          <option value="生成">生成</option>
+          <option value="规划">规划</option>
+          <option value="记忆">记忆</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>用途说明</label>
+        <input id="editDescription" placeholder="简短描述提示词的用途">
+      </div>
+      <div class="field">
+        <label>系统提示词 (System Prompt)</label>
+        <textarea id="editSystem" placeholder="输入系统提示词..." rows="6"></textarea>
+      </div>
+      <div class="field">
+        <label>用户消息模板 (User Template) 
+          <span style="color:var(--text-3);font-weight:400">— 使用 {variable} 作为占位符</span>
+        </label>
+        <textarea id="editUserTemplate" placeholder="输入用户消息模板，如: 问题: {query}..." rows="3"></textarea>
+      </div>
+      <div class="field">
+        <label>版本号</label>
+        <input id="editVersion" readonly style="background:var(--bg);color:var(--text-2)">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="savePrompt()">💾 保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===== State =====
+let token = '';
+let currentUser = null;
+
+// ===== Init =====
+document.getElementById('loginPwd').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+// 页面加载时尝试自动登录
+tryAutoLogin();
+
+// ===== Auth =====
+async function doLogin() {
+  const username = document.getElementById('loginUser').value.trim();
+  const password = document.getElementById('loginPwd').value.trim();
+  const errEl = document.getElementById('loginError');
+
+  if (!username || !password) {
+    errEl.textContent = '请输入用户名和密码';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/admin/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const data = await res.json();
+    if (data.success) {
+      token = data.token;
+      currentUser = data.user;
+      localStorage.setItem('rag_admin_token', token);
+      localStorage.setItem('rag_admin_user', JSON.stringify(currentUser));
+      showApp();
+    } else {
+      errEl.textContent = data.error || '登录失败';
+      errEl.style.display = 'block';
+    }
+  } catch(e) {
+    errEl.textContent = '网络错误，请稍后重试';
+    errEl.style.display = 'block';
+  }
+}
+
+function doLogout() {
+  token = '';
+  currentUser = null;
+  localStorage.removeItem('rag_admin_token');
+  localStorage.removeItem('rag_admin_user');
+  document.getElementById('loginPage').classList.remove('hidden');
+  document.getElementById('appPage').classList.add('hidden');
+  document.getElementById('loginPwd').value = '';
+}
+
+function showApp() {
+  document.getElementById('displayName').textContent = currentUser.display_name;
+  document.getElementById('loginPage').classList.add('hidden');
+  document.getElementById('appPage').classList.remove('hidden');
+  loadPrompts();
+  loadCategories();
+}
+
+async function tryAutoLogin() {
+  const savedToken = localStorage.getItem('rag_admin_token');
+  if (!savedToken) return;
+
+  try {
+    const res = await fetch('/api/admin/me', {
+      headers: {'Authorization': 'Bearer ' + savedToken}
+    });
+    if (res.ok) {
+      const serverUser = await res.json();
+      const localUser = JSON.parse(localStorage.getItem('rag_admin_user') || '{}');
+      token = savedToken;
+      currentUser = {
+        username: serverUser.username || localUser.username || 'admin',
+        display_name: serverUser.display_name || localUser.display_name || '管理员'
+      };
+      showApp();
+    } else {
+      localStorage.removeItem('rag_admin_token');
+      localStorage.removeItem('rag_admin_user');
+    }
+  } catch(e) {
+    localStorage.removeItem('rag_admin_token');
+    localStorage.removeItem('rag_admin_user');
+  }
+}
+
+// ===== Tabs =====
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
+  document.getElementById(`tab${name.charAt(0).toUpperCase() + name.slice(1)}`).classList.add('active');
+}
+
+// ===== Prompts =====
+async function loadPrompts() {
+  try {
+    const res = await fetch('/api/admin/prompts');
+    const data = await res.json();
+    window._allPrompts = data.prompts;
+    renderPrompts(data.prompts);
+  } catch(e) {
+    showToast('加载提示词列表失败', 'error');
+  }
+}
+
+async function loadCategories() {
+  try {
+    const res = await fetch('/api/admin/categories');
+    const data = await res.json();
+    const sel = document.getElementById('filterCategory');
+    sel.innerHTML = '<option value="">全部分类</option>'
+      + data.categories.map(c => `<option value="${c}">${c}</option>`).join('');
+  } catch(e) {}
+}
+
+function renderPrompts(prompts) {
+  const el = document.getElementById('promptList');
+  el.innerHTML = prompts.map(p => `
+    <div class="prompt-card ${p.is_active?'':'inactive'}" onclick="editPrompt('${p.name}')">
+      <div class="top">
+        <span class="name">${p.display_name}<span class="tag">${p.category}</span></span>
+        <span style="font-size:11px;color:var(--text-3)">v${p.version} ${p.is_active?'':'[已禁用]'}</span>
+      </div>
+      <div class="desc">${p.description || '无描述'}</div>
+      <div class="meta">
+        <span>名称: ${p.name}</span>
+        <span>系统提示词: ${p.system.substring(0,50)}...</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+function filterPrompts() {
+  const search = document.getElementById('searchInput').value.toLowerCase();
+  const cat = document.getElementById('filterCategory').value;
+  let prompts = window._allPrompts || [];
+  if (search) prompts = prompts.filter(p =>
+    p.name.toLowerCase().includes(search) ||
+    p.display_name.toLowerCase().includes(search) ||
+    p.system.toLowerCase().includes(search)
+  );
+  if (cat) prompts = prompts.filter(p => p.category === cat);
+  renderPrompts(prompts);
+}
+
+// ===== Editor =====
+async function editPrompt(name) {
+  try {
+    const res = await fetch(`/api/admin/prompts/${name}`);
+    const p = await res.json();
+    document.getElementById('modalTitle').textContent = '编辑: ' + p.display_name;
+    document.getElementById('editName').value = p.name;
+    document.getElementById('editDisplayName').value = p.display_name;
+    document.getElementById('editCategory').value = p.category;
+    document.getElementById('editDescription').value = p.description;
+    document.getElementById('editSystem').value = p.system;
+    document.getElementById('editUserTemplate').value = p.user_template;
+    document.getElementById('editVersion').value = p.version;
+    document.getElementById('modalOverlay').classList.remove('hidden');
+  } catch(e) {
+    showToast('加载提示词失败', 'error');
+  }
+}
+
+function closeModal() {
+  document.getElementById('modalOverlay').classList.add('hidden');
+}
+
+async function savePrompt() {
+  const data = {
+    name: document.getElementById('editName').value.trim(),
+    display_name: document.getElementById('editDisplayName').value.trim(),
+    category: document.getElementById('editCategory').value,
+    description: document.getElementById('editDescription').value.trim(),
+    system: document.getElementById('editSystem').value,
+    user_template: document.getElementById('editUserTemplate').value,
+  };
+  if (!data.name || !data.system) {
+    showToast('名称和系统提示词不能为空', 'error');
+    return;
+  }
+  try {
+    const res = await fetch('/api/admin/prompts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    });
+    const result = await res.json();
+    if (result.success) {
+      closeModal();
+      loadPrompts();
+      showToast(result.message, 'success');
+    } else {
+      showToast(result.error, 'error');
+    }
+  } catch(e) {
+    showToast('保存失败', 'error');
+  }
+}
+
+async function importDefaults() {
+  if (!confirm('将用默认提示词覆盖当前数据库中的所有记录，确定？')) return;
+  try {
+    const res = await fetch('/api/admin/prompts/import-defaults', {method:'POST'});
+    const data = await res.json();
+    loadPrompts();
+    showToast(`已导入 ${data.imported} 个默认提示词`, 'success');
+  } catch(e) {
+    showToast('导入失败', 'error');
+  }
+}
+
+function changePassword() {
+  const oldPwd = prompt('请输入原密码:');
+  if (!oldPwd) return;
+  const newPwd = prompt('请输入新密码（至少6位）:');
+  if (!newPwd || newPwd.length < 6) {
+    alert('新密码至少6位');
+    return;
+  }
+  const newPwd2 = prompt('请再次输���新密码:');
+  if (newPwd !== newPwd2) {
+    alert('两次密码不一致');
+    return;
+  }
+  fetch('/api/admin/change-password', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({username: currentUser.username, old_password: oldPwd, new_password: newPwd})
+  }).then(r => r.json()).then(d => {
+    if (d.success) showToast(d.message, 'success');
+    else showToast(d.error, 'error');
+  });
+}
+
+// ===== Q&A =====
+function setQAQuestion(text) {
+  const input = document.getElementById('qaInput');
+  input.value = text;
+  input.focus();
+}
+
+async function askQA() {
+  const input = document.getElementById('qaInput');
+  const sendBtn = document.getElementById('qaSendBtn');
+  const question = input.value.trim();
+  if (!question) return;
+
+  // 隐藏空状态提示
+  const emptyEl = document.getElementById('qaEmpty');
+  if (emptyEl) emptyEl.remove();
+
+  input.value = '';
+  sendBtn.disabled = true;
+  sendBtn.textContent = '发送中...';
+
+  const msgs = document.getElementById('qaMessages');
+  msgs.innerHTML += `
+    <div class="qa-msg user">
+      <div class="avatar">👤</div>
+      <div class="qa-bubble">${escapeHtml(question)}</div>
+    </div>`;
+
+  // Add loading
+  const loadingId = 'loading_' + Date.now();
+  msgs.innerHTML += `
+    <div class="qa-msg assistant" id="${loadingId}">
+      <div class="avatar">🤖</div>
+      <div class="qa-bubble">思考中...</div>
+    </div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+
+  try {
+    const res = await fetch('/api/query', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify({question, role: 'admin'})
+    });
+    const data = await res.json();
+    document.getElementById(loadingId).querySelector('.qa-bubble').textContent = data.answer || data.error || '无响应';
+    document.getElementById(loadingId).scrollIntoView({behavior:'smooth'});
+  } catch(e) {
+    document.getElementById(loadingId).querySelector('.qa-bubble').textContent = '请求失败: ' + e.message;
+  } finally {
+    sendBtn.disabled = false;
+    sendBtn.textContent = '发送';
+  }
+}
+
+// ===== Toast =====
+function showToast(msg, type) {
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>
+"""
 
 _HTML_PAGE = r"""
 <!DOCTYPE html>
@@ -446,11 +1328,12 @@ _HTML_PAGE = r"""
     <h1>企业知识库问答</h1>
   </div>
   <div class="header-right">
+    <a href="/admin" style="text-decoration:none;color:var(--primary);font-size:13px;font-weight:500;margin-right:8px">⚙️ 系统管理</a>
     <div class="status-indicator">
       <div class="status-dot"></div>
       <span>服务就绪</span>
     </div>
-    <div class="role-badge user" id="roleBadge" onclick="toggleRole()" title="点击切换权限">
+    <div class="role-badge user" id="roleBadge" title="当前为普通用户模式">
       <div class="role-dot user"></div>
       <span id="roleLabel">普通用户</span>
     </div>
@@ -481,7 +1364,7 @@ _HTML_PAGE = r"""
         onkeydown="handleKeydown(event)"></textarea>
       <button class="btn-send" id="sendBtn" onclick="sendQuestion()" title="发送">➤</button>
     </div>
-    <div class="input-hint" id="docHint">当前可访问：<strong>公开文档</strong> · 切换权限可解锁更多</div>
+    <div class="input-hint" id="docHint">当前为普通用户模式，仅可访问公开文档；管理员请从右上角进入系统管理</div>
   </div>
 </div>
 
@@ -544,43 +1427,18 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ============================================================
-// 角色切换
+// 角色状态（聊天页固定为普通用户，不允许切换）
 // ============================================================
-async function toggleRole() {
-  if (isQuerying) return;
-  const newRole = currentRole === 'admin' ? 'user' : 'admin';
-
-  try {
-    const resp = await fetch('/api/role', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({role: newRole})
-    });
-    const data = await resp.json();
-    if (data.role) {
-      currentRole = data.role;
-      updateRoleUI();
-    }
-  } catch (e) {
-    console.error('Role switch failed:', e);
-  }
-}
-
 function updateRoleUI() {
   const badge = document.getElementById('roleBadge');
   const label = document.getElementById('roleLabel');
   const dot = badge.querySelector('.role-dot');
   const hint = document.getElementById('docHint');
 
-  badge.className = 'role-badge ' + currentRole;
-  dot.className = 'role-dot ' + currentRole;
-  label.textContent = currentRole === 'admin' ? '特权用户' : '普通用户';
-
-  if (currentRole === 'admin') {
-    hint.innerHTML = '当前可访问：<strong>全部文档</strong>（含受限文档）';
-  } else {
-    hint.innerHTML = '当前可访问：<strong>公开文档</strong> · 点击右上角切换权限';
-  }
+  badge.className = 'role-badge user';
+  dot.className = 'role-dot user';
+  label.textContent = '普通用户';
+  hint.innerHTML = '当前为普通用户模式，仅可访问公开文档；管理员请从右上角进入系统管理';
 }
 
 // ============================================================

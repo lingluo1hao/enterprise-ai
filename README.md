@@ -23,7 +23,8 @@
 - **MMR 重排序 & 多样性补搜**：最大边际相关性去冗余，避免信息遗漏。
 - **Redis 两级缓存**：精确匹配（SHA256 <1ms）+ 语义匹配（BGE embedding 余弦相似度 > 0.80）。
 - **文档级访问控制**：支持普通用户与特权用户，敏感文档按权限隔离，缓存也按角色隔离。
-- **Web 图形界面**：基于 Flask + SSE 实时推送推理进度，自动检测未完成任务并弹窗提示恢复。
+- **提示词工程管理系统**：11 个提示词模板存储于 MySQL，通过管理后台（`/admin`）在线 CRUD，修改后即时生效无需重启。内置管理员认证（salt:sha256）。
+- **Web 图形界面**：基于 Flask + SSE 实时推送推理进度，自动检测未完成任务并弹窗提示恢复。聊天页面（`/`）与管理后台（`/admin`）权限隔离。
 
 ## 界面预览
 
@@ -38,9 +39,10 @@ enterprise-ai/
 ├── langgraph_rag_agent.py  # 【核心】LangGraph 引擎：StateGraph + 多轮检索 + 多智能体 + 多轮对话 + 断点重续
 ├── advanced_rag_agent.py   # 基础模块（OllamaLLM / VectorStoreManager / CacheManager / AccessControlFilter）
 ├── memory_store.py         # MySQL 多层记忆持久化（对话历史 + 断点快照 + 任务队列）
-├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 前端聊天界面 + 断点恢复 API
+├── prompt_manager.py       # 提示词工程管理 + 管理员认证（PromptManager + AuthManager）
+├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 聊天界面 + 管理后台 + 断点恢复 API
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
-├── docs/                   # 企业 PDF 文档目录
+├── docs/                   # 企业 PDF 文档目���
 ├── chroma_db/              # ChromaDB 向量数据库持久化目录
 ├── screenshots/            # 项目截图
 ├── .env                    # 环境变量（当前仅 DASHSCOPE_API_KEY 占位）
@@ -54,7 +56,8 @@ enterprise-ai/
 | `langgraph_rag_agent.py` | **核心引擎**，含 LangGraphRAGApp 类、AgentState 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。 |
 | `advanced_rag_agent.py` | 基础组件库，提供 OllamaLLM、VectorStoreManager、CacheManager、AccessControlFilter、DocSearchSkill 等可复用类。同时保留原 LangChain 版 RAGOrchestrator 实现（兼容旧模式）。 |
 | `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 3 张表：`chat_messages`（对话历史）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）。支持连接池、线程安全、自动降级。 |
-| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供 `/api/tasks/unfinished` 和 `/api/tasks/resume` 断点恢复 API。 |
+| `prompt_manager.py` | **提示词工程管理模块**，含 PromptManager（11 个提示词模板的 CRUD + 动态加载）和 AuthManager（管理员 salt:sha256 密码认证）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务。 |
+| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。 |
 | `docs/` | 存放企业 PDF 文档，首次运行时会自动构建向量索引到 `chroma_db/`。 |
 | `chroma_db/` | ChromaDB 持久化目录，保存文档切片与向量。 |
 
@@ -65,6 +68,7 @@ enterprise-ai/
     │
     ▼
 rag_web_server.py ──Flask──► Web 聊天界面 (SSE 流式)
+    │               ──Flask──► 管理后台 /admin（提示词管理 + admin 问答）
     │                        langgraph_rag_agent.py (CLI)
     ├─ LangGraphEngine 适配器
     │
@@ -103,6 +107,7 @@ langgraph_rag_agent.py — StateGraph 状态图引擎
     ├─ CacheManager（Redis 两级智能缓存）
     ├─ AccessControlFilter（文档级权限过滤）
     ├─ MySQLMemoryStore（三层记忆 + 断点重续）
+    ├─ PromptManager（提示词动态加载，MySQL 存储，在线编辑即时生效）
     │
     ▼
 Ollama（192.168.200.128:11434 / qwen2:7b）
@@ -240,7 +245,7 @@ docker run -d --name mysql8 \
   --collation-server=utf8mb4_unicode_ci
 ```
 
-系统首次连接时会自动创建 `rag_agent` 数据库和 3 张表（`chat_messages`、`task_checkpoints`、`task_queue`），无需手动建表。
+系统首次连接时会自动创建 `rag_agent` 数据库和 6 张表（`chat_messages`、`task_checkpoints`、`task_queue`、`prompt_templates`、`admin_users`、`prompt_categories`），无需手动建表。
 
 **验证连接：**
 
@@ -340,12 +345,51 @@ python rag_web_server.py --no-langgraph --port 9090
 - 局域网：`http://<本机IP>:8080`
 
 Web 界面功能：
-- 聊天式问答
-- 普通用户 / 特权用户角色切换
+- 聊天式问答（固定普通用户角色，仅访问公开文档）
 - 实时显示推理进度（SSE 流式推送）
 - 快捷示例问题
 - LangGraph 模式：支持多轮对话追问
 - 断点恢复：登录时自动检测未完成任务，弹窗提示恢复
+- **管理后台**（`/admin`）：管理员登录后可在线编辑提示词、使用 admin 角色问答测试
+
+## 系统管理后台
+
+访问 `http://localhost:8080/admin` 进入管理后台，默认管理员账号：`admin` / `admin123`。
+
+### 功能概览
+
+| 功能 | 说明 |
+|------|------|
+| **提示词工程** | 在线编辑 11 个提示词模板（classify / rewrite / generate 等），支持搜索、按分类过滤、一键恢复默认。修改后即时生效，无需重启服务。 |
+| **在线问答（admin）** | 以管理员角色提问，可访问全部文档（含受限文档），方便验证修改后的提示词效果。 |
+| **登录认证** | salt:sha256 密码哈希存储，token 持久化到 localStorage，刷新页面保持登录状态。 |
+
+### 权限隔离设计
+
+| 页面 | 角色 | 可访问文档 | 是否需要登录 |
+|------|------|------------|:----------:|
+| `/` 聊天页 | 固定 `user` | 仅公开文档 | ❌ 无需 |
+| `/admin` 管理后台 | 登录后 `admin` | 全部文档 | ✅ 需登录 |
+
+> 聊天页面不再提供角色切换功能，管理员如需访问受限文档，请从右上角「⚙️ 系统管理」进入管理后台的「在线问答」标签页。
+
+### 提示词模板列表
+
+系统内置 11 个提示词模板，均可在管理后台在线编辑：
+
+| 模板 | 作用 |
+|------|------|
+| `classify` | 问题分类 + 上下文消解 |
+| `chitchat` | 闲聊直接回答 |
+| `rewrite_first` | 第 1 轮查询改写 |
+| `rewrite_retry` | 换角度重新改写 |
+| `grade_docs` | 文档相关性评分 |
+| `generate_simple` | 基于检索文档生成答案 |
+| `plan_decompose` | Planner：拆解复杂问题 |
+| `plan_supplement` | Planner：补充新子问题 |
+| `reviewer` | Reviewer：审查研究结果 |
+| `writer` | Writer：汇总撰写最终回答 |
+| `compress_history` | 对话历史超窗摘要压缩 |
 
 ## LangGraph 设计详解
 
@@ -377,10 +421,10 @@ DOC_ACCESS_RULES = {
 }
 ```
 
-| 角色 | 可访问文档 |
-|------|------------|
-| 普通用户（user） | 仅公开文档（如 Jimi IoT 个人定位终端通讯协议） |
-| 特权用户（admin） | 全部文档（含 JM-S509 指令表） |
+| 角色 | 可访问文档 | 入口 |
+|------|------------|------|
+| 普通用户（user） | 仅公开文档（如 Jimi IoT 个人定位终端通讯协议） | 聊天页 `/` |
+| 特权用户（admin） | 全部文档（含 JM-S509 指令表） | 管理后台 `/admin` → 在线问答 |
 
 权限过滤发生在 ChromaDB 检索之后：普通用户检索到受限文档片段时会被自动丢弃。同时 Redis 缓存也按角色隔离，避免 admin 的完整答案通过缓存泄漏给普通用户。
 
@@ -495,7 +539,7 @@ DOC_ACCESS_RULES = {
 ### 7. 权限没有生效
 
 - 确认文件名包含 `JM-S509` 才会被标记为受限文档
-- Web 界面点击右上角角色 badge 切换到「特权用户」后再提问
+- 聊天页固定为普通用户，如需访问全部文档请从右上角「⚙️ 系统管理」进入管理后台，登录后在「在线问答」中提问
 - 命令行加 `--admin` 参数启动
 
 ### 8. 运行时 segfault / 闪退
@@ -508,6 +552,33 @@ DOC_ACCESS_RULES = {
 - **LangGraph（`--langgraph` 或直接 `langgraph_rag_agent.py`）**：支持多轮检索、多智能体协作、多轮对话，回答更全面但耗时更长。
 - **旧版（`advanced_rag_agent.py` / 不带 `--langgraph` 的 Web 服务）**：单次检索 + 一次生成，速度快但可能遗漏信息。
 - 推荐日常使用 LangGraph 模式，追求速度时用旧版。
+
+### 10. 管理后台登录不了 / 忘记密码
+
+- 默认管理员账号：`admin` / `admin123`
+- 如果忘记了修改后的密码，可以在 MySQL 中手动重置：
+  ```sql
+  -- 先生成新密码哈希（Python 中运行）：
+  -- import hashlib, os
+  -- salt = os.urandom(16).hex()
+  -- pwd_hash = salt + ":" + hashlib.sha256((salt + "新密码").encode()).hexdigest()
+  -- print(pwd_hash)
+  UPDATE admin_users SET password_hash = '<上面生成的值>' WHERE username = 'admin';
+  ```
+- 登录状态通过 localStorage 持久化，刷新页面不会丢失，直到点击「退出」
+
+### 11. 提示词修改后没生效
+
+- 提示词修改后即时生效，无需重启服务
+- 确保修改后点击了「保存」按钮（弹窗中）
+- 可在管理后台「在线问答」中立即测试修改后的提示词效果
+- 「恢复默认」可一键还原为内置初始值
+
+### 12. 管理后台「在线问答」页面空白
+
+- 确保已登录管理后台（token 存在）
+- 刷新页面后会自动调用 `tryAutoLogin()` 恢复登录状态
+- 如果仍然空白，检查浏览器控制台是否有 CORS 或网络错误
 
 ## 许可证
 

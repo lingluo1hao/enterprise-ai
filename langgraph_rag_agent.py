@@ -62,6 +62,9 @@ from advanced_rag_agent import (
 # Layer 2: MySQL 多层记忆持久化模块
 from memory_store import MySQLMemoryStore
 
+# 提示词工程管理 — 从 MySQL 动态加载提示词（替代硬编码）
+from prompt_manager import PromptManager, get_prompt_manager
+
 # ============================================================================
 # 配置区 — 所有可调参数集中管理
 # ============================================================================
@@ -273,12 +276,22 @@ class LangGraphRAGApp:
         #   - 任务断点快照（每个节点执行后保存 state）
         #   - 任务队列管理（running/completed/interrupted）
         # _active_context: 内存活跃上下文 — Layer 1（保留，用于加速）
-        print("\n[3/4] 初始化缓存与多层记忆...")
+        print("\n[3/5] 初始化缓存与多层记忆...")
         self.cache = CacheManager()
         self.memory_store = MySQLMemoryStore()
         self._active_context: Dict[str, List[Dict]] = {}  # Layer 1: 内存加速
         self.current_task_id: Optional[str] = None  # 当前正在执行的任务 ID
         self.fast_mode = fast_mode
+
+        # 4. 提示词管理器（从 MySQL 动态加载，DB 不可用时回退到默认值）
+        print("\n[4/5] 初始化提示词管理器...")
+        self.pm = get_prompt_manager()
+        # 首次运行：将默认提示词导入 MySQL
+        if self.pm.available:
+            self.pm.import_defaults()
+
+        # 5. 构建 StateGraph
+        print("\n[5/5] 构建 LangGraph 状态图...")
 
         # 服务重启时，将上次未完成的 running 任务标记为 interrupted
         # 这样用户下次登录时能看到准确的中断状态
@@ -286,11 +299,9 @@ class LangGraphRAGApp:
             self.memory_store.mark_interrupted_tasks(None)
             print("  [记忆] 已检查并标记上次中断的任务")
 
-        # 4. 构建 StateGraph
         # _build_graph() 定义所有节点、边、条件边，最后 compile() 生成可执行的图。
         # compile() 会校验图结构（无孤立节点、无死循环等），返回 CompiledStateGraph。
         # 节点函数通过 _wrap_node_with_checkpoint 包装，每个节点执行后自动保存断点到 MySQL。
-        print("\n[4/4] 构建 LangGraph 状态图...")
         self.graph = self._build_graph()
         print("[系统] 初始化完成\n")
 
@@ -592,22 +603,13 @@ class LangGraphRAGApp:
             print(f"  [classify] 类型={qtype}（快速分类）")
             return {"query_type": qtype, "resolved_query": query}
 
-        # 构造 LLM prompt：让 LLM 同时进行分类和上下文消解
-        # 注意：{{ 和 }} 是 Python 字符串中花括号的转义写法，
-        # 因为 f-string 中的 {} 有特殊含义，这里虽然不是 f-string，
-        # 但 LangChain 的 prompt 模板也会解析花括号，所以需要双花括号转义
-        system = (
-            "你是问题分类器。判断用户问题的类型，输出 JSON：\n"
-            '{{"type": "simple|complex|chitchat", "resolved": "消解后的完整问题"}}\n\n'
-            "分类规则：\n"
-            '- simple：单一事实查询（如"心跳间隔是多少？"）\n'
-            '- complex：多维度复合问题（如"定位精度？几种方式？续航如何？"）\n'
-            '- chitchat：闲聊/打招呼\n\n'
-            "如果问题是追问（依赖上文），resolved 要补全为完整的独立问题。\n"
-            "如果不依赖上文，resolved 等于原问题。\n"
-            "只输出 JSON，不要其他文字。"
+        # 从提示词管理器获取 classify 模板
+        prompt = self.pm.get_prompt("classify")
+        system = prompt["system"]
+        user = self.pm.format_user_message(
+            prompt["user_template"],
+            history=history_text, query=query
         )
-        user = f"对话历史:\n{history_text}\n\n当前问题: {query}"
         result = self.llm.chat(system, user)
 
         # 解析 LLM 输出的 JSON（含容错兜底）
@@ -662,8 +664,10 @@ class LangGraphRAGApp:
         """
         query = state.get("resolved_query", state["query"])
         print(f"  [direct_llm] 闲聊直接回答")
-        system = "你是友好的企业助手。简短自然地回答用户的话。"
-        answer = self.llm.chat(system, query)
+        prompt = self.pm.get_prompt("chitchat")
+        system = prompt["system"]
+        user = self.pm.format_user_message(prompt["user_template"], query=query)
+        answer = self.llm.chat(system, user)
         return {"answer": answer}
 
     # ========================================================================
@@ -1092,11 +1096,12 @@ class LangGraphRAGApp:
             [f"- 子任务: {r['subtask']}\n  回答: {r['answer'][:200]}" for r in results]
         )
 
-        system = (
-            "你是严格的审查员。判断以上子任务结果是否充分回答了原始问题。\n"
-            '只回答"充分"或"不充分"。'
+        prompt = self.pm.get_prompt("reviewer_check")
+        system = prompt["system"]
+        user = self.pm.format_user_message(
+            prompt["user_template"],
+            query=query, results_text=results_text
         )
-        user = f"原始问题: {query}\n\n子任务结果:\n{results_text}"
         result = self.llm.chat(system, user)
 
         passed = "充分" in result
@@ -1158,16 +1163,12 @@ class LangGraphRAGApp:
             [f"【{r['subtask']}】\n{r['answer']}" for r in results]
         )
 
-        system = (
-            "你是技术文档撰写员。根据各子任务的研究结果，撰写一份完整的回答。\n\n"
-            "要求：\n"
-            "- 整合所有子任务结果，按逻辑组织，可分点\n"
-            "- 回答必须基于研究结果，不要编造\n"
-            "- 用中文，条理清晰\n"
-            "- 如果某方面信息不足，如实说明"
+        prompt = self.pm.get_prompt("writer_compose")
+        system = prompt["system"]
+        user = self.pm.format_user_message(
+            prompt["user_template"],
+            query=query, results_text=results_text
         )
-        user = f"原始问题: {query}\n\n各子任务研究结果:\n{results_text}"
-
         answer = self.llm.chat(system, user)
         print(f"  [writer] 生成最终答案 ({len(answer)} 字)")
         return {"answer": answer}
@@ -1202,22 +1203,22 @@ class LangGraphRAGApp:
         """
         if prev_docs is None:
             # 第 1 轮：正常改写
-            system = (
-                "你是查询重写专家。将用户问题改写为 2-3 个更利于向量检索的搜索词。\n"
-                "每个搜索词独占一行，不要编号，不要解释。"
-            )
-            result = self.llm.chat(system, query)
+            prompt = self.pm.get_prompt("rewrite_first")
+            system = prompt["system"]
+            user = self.pm.format_user_message(prompt["user_template"], query=query)
+            result = self.llm.chat(system, user)
         else:
             # 第 N 轮：基于之前的检索结果，换角度改写
             # 只取前 3 个文档的前 120 字符，避免 prompt 过长
             prev_text = "\n".join(
                 [d[0].page_content[:120] for d in prev_docs[:3]]
             )
-            system = (
-                "之前的检索结果不够相关。请换一个角度改写搜索词，输出 2-3 个。\n"
-                "每行一个，不要编号。"
+            prompt = self.pm.get_prompt("rewrite_retry")
+            system = prompt["system"]
+            user = self.pm.format_user_message(
+                prompt["user_template"],
+                query=query, prev_text=prev_text
             )
-            user = f"原问题: {query}\n\n已检索片段:\n{prev_text}"
             result = self.llm.chat(system, user)
 
         # 解析 LLM 输出：按行拆分，取前 3 个非空行
@@ -1295,13 +1296,12 @@ class LangGraphRAGApp:
         doc_texts = [
             f"[{i}] {d[0].page_content[:200]}" for i, d in enumerate(docs)
         ]
-        system = (
-            "判断每个文档片段是否与问题有关联（包括间接相关）。\n"
-            "只要文档包含问题涉及的主题词或相关概念，就算关联。\n"
-            "输出有关联的文档编号，逗号分隔，如: 0,2,3\n"
-            "如果没有，输出: none"
+        prompt = self.pm.get_prompt("grade_docs")
+        system = prompt["system"]
+        user = self.pm.format_user_message(
+            prompt["user_template"],
+            query=query, docs="\n".join(doc_texts)
         )
-        user = f"问题: {query}\n\n文档:\n" + "\n".join(doc_texts)
         result = self.llm.chat(system, user)
 
         # 初始化：全部标记为 False
@@ -1343,14 +1343,12 @@ class LangGraphRAGApp:
         context = "\n\n".join(
             [f"[文档{i+1}] {d[0].page_content[:DOC_TRUNCATE]}" for i, d in enumerate(docs[:5])]
         )
-        system = (
-            "你是企业文档问答助手。根据检索到的文档片段回答问题。\n\n"
-            "要求：\n"
-            "- 回答必须基于文档内容，不要编造\n"
-            "- 如果信息不足，如实说明\n"
-            "- 用中文回答，条理清晰"
+        prompt = self.pm.get_prompt("generate_answer")
+        system = prompt["system"]
+        user = self.pm.format_user_message(
+            prompt["user_template"],
+            query=query, context=context
         )
-        user = f"问题: {query}\n\n检索到的文档:\n{context}"
         return self.llm.chat(system, user)
 
     def _research_subtask(self, subtask: Dict, role: str) -> Dict:
@@ -1455,13 +1453,10 @@ class LangGraphRAGApp:
         返回：
             [{"id": 1, "task": "..."}, ...]
         """
-        system = (
-            "你是任务规划器。将复杂问题拆解为 2-4 个独立的子问题，"
-            "每个子问题可以独立检索回答。\n\n"
-            '输出 JSON: {{"subtasks": [{{"id": 1, "task": "子问题"}}]}}\n'
-            "只输出 JSON，不要其他文字。"
-        )
-        result = self.llm.chat(system, query)
+        prompt = self.pm.get_prompt("planner_decompose")
+        system = prompt["system"]
+        user = self.pm.format_user_message(prompt["user_template"], query=query)
+        result = self.llm.chat(system, user)
         return self._parse_json_list(result, "subtasks", query)
 
     def _do_plan_supplement(self, query: str, existing: List[Dict]) -> List[Dict]:
@@ -1490,12 +1485,12 @@ class LangGraphRAGApp:
         existing_text = "\n".join(
             [f"- {r['subtask']}: {r['answer'][:100]}" for r in existing]
         )
-        system = (
-            "之前的回答不够充分。请补充 1-2 个新的子问题来填补信息缺口。\n\n"
-            '输出 JSON: {{"subtasks": [{{"id": 1, "task": "新子问题"}}]}}\n'
-            "只输出 JSON。"
+        prompt = self.pm.get_prompt("planner_supplement")
+        system = prompt["system"]
+        user = self.pm.format_user_message(
+            prompt["user_template"],
+            query=query, existing_text=existing_text
         )
-        user = f"原问题: {query}\n\n已有结果:\n{existing_text}"
         result = self.llm.chat(system, user)
         return self._parse_json_list(result, "subtasks", query)
 
@@ -1572,8 +1567,10 @@ class LangGraphRAGApp:
             [f"{m['role']}: {m['content'][:100]}" for m in old]
         )
         # 让 LLM 压缩旧历史为摘要
-        system = "将以下对话历史压缩为一段简短摘要（不超过100字），保留关键信息。"
-        summary = self.llm.chat(system, old_text)
+        prompt = self.pm.get_prompt("compress_history")
+        system = prompt["system"]
+        user = self.pm.format_user_message(prompt["user_template"], history_text=old_text)
+        summary = self.llm.chat(system, user)
 
         print(f"  [save_history] 历史压缩: {len(old)} 条 → 1 条摘要")
         # 摘要放在最前面，近期消息附加在后面
