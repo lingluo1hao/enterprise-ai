@@ -27,9 +27,9 @@
 
 ## 界面预览
 
-![Web 聊天界面](screenshots/web-ui-preview.png)
+![项目演示动画](screenshots/demo.gif)
 
-> 上图：通过 Web 界面提问，系统实时显示推理进度，返回结构化的答案。
+> 上图 GIF 展示了完整的一次问答流程：用户在 Web 界面输入问题 → 系统从 Redis 缓存检查开始，依次执行 `load_history / classify / query_rewrite / retrieve / grade_docs / rerank_mmr / generate_simple / respond / save_history` → 最终返回答案并持久化历史。最后展示了 MySQL 断点重续的工作机制。
 
 ## 项目结构
 

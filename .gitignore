@@ -21,3 +21,6 @@ server_startup.log
 
 # ====== WorkBuddy ======
 .workbuddy/
+
+# ====== 演示动画生成脚本（本地工具，不提交） ======
+generate_demo_gif.py
