@@ -1158,6 +1158,17 @@ class LangGraphRAGApp:
         query = state.get("resolved_query", state["query"])
         results = state.get("research_results", [])
 
+        # 如果没有任何子任务结果，直接返回“未检索到相关内容”
+        if not results:
+            return {"answer": "未检索到与问题相关的文档内容，无法回答。"}
+
+        # 如果所有子任务都返回“未检索到相关内容”，则无需调用 LLM，直接兜底
+        all_unknown = all(
+            "未检索到" in str(r.get("answer", "")) for r in results
+        )
+        if all_unknown:
+            return {"answer": "未检索到与问题相关的文档内容，无法回答。"}
+
         # 格式化所有子任务结果为统一格式
         results_text = "\n\n".join(
             [f"【{r['subtask']}】\n{r['answer']}" for r in results]
@@ -1339,10 +1350,19 @@ class LangGraphRAGApp:
         返回：
             LLM 生成的回答文本
         """
+        # 文档为空或没有实质内容时，直接返回“未检索到相关内容”，不再调用 LLM
+        # 避免 LLM 在零上下文或弱上下文下胡编乱造
+        if not docs:
+            return "未检索到与问题相关的文档内容，无法回答。"
+
         # 构建上下文：最多 5 个文档，每个截断到 350 字符
         context = "\n\n".join(
             [f"[文档{i+1}] {d[0].page_content[:DOC_TRUNCATE]}" for i, d in enumerate(docs[:5])]
         )
+        # 过滤后上下文仍为空（理论上不会，但做兜底）
+        if not context.strip():
+            return "未检索到与问题相关的文档内容，无法回答。"
+
         prompt = self.pm.get_prompt("generate_answer")
         system = prompt["system"]
         user = self.pm.format_user_message(

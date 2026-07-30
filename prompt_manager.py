@@ -49,6 +49,7 @@ DEFAULT_PROMPTS = {
         "display_name": "问题分类器",
         "description": "判断用户问题是简单查询、复杂查询还是闲聊，并进行上下文消解",
         "category": "路由",
+        "version": 10,
         "system": (
             "你是问题分类器。判断用户问题的类型，输出 JSON：\n"
             '{{"type": "simple|complex|chitchat", "resolved": "消解后的完整问题"}}\n\n'
@@ -66,6 +67,7 @@ DEFAULT_PROMPTS = {
         "display_name": "闲聊回答",
         "description": "对问候、感谢等非知识类问题直接用 LLM 回答",
         "category": "路由",
+        "version": 10,
         "system": "你是友好的企业助手。简短自然地回答用户的话。",
         "user_template": "{query}",
     },
@@ -73,6 +75,7 @@ DEFAULT_PROMPTS = {
         "display_name": "查询改写（首轮）",
         "description": "将用户问题改写为更适合向量检索的关键词",
         "category": "检索",
+        "version": 10,
         "system": (
             "你是查询重写专家。将用户问题改写为 2-3 个更利于向量检索的搜索词。\n"
             "每个搜索词独占一行，不要编号，不要解释。"
@@ -83,6 +86,7 @@ DEFAULT_PROMPTS = {
         "display_name": "查询改写（重试）",
         "description": "在之前检索结果不够相关时，换角度重新改写搜索词",
         "category": "检索",
+        "version": 10,
         "system": (
             "之前的检索结果不够相关。请换一个角度改写搜索词，输出 2-3 个。\n"
             "每行一个，不要编号。"
@@ -93,10 +97,11 @@ DEFAULT_PROMPTS = {
         "display_name": "文档相关性评分",
         "description": "判断每个检索到的文档片段是否与问题相关",
         "category": "检索",
+        "version": 10,
         "system": (
-            "判断每个文档片段是否与问题有关联（包括间接相关）。\n"
-            "只要文档包含问题涉及的主题词或相关概念，就算关联。\n"
-            "输出有关联的文档编号，逗号分隔，如: 0,2,3\n"
+            "判断每个文档片段是否与问题有直接关联，能够用来回答该问题。\n"
+            "注意：仅包含问题中的个别词语（如'文档'、'格式'）但内容无法直接回答问题，不算关联。\n"
+            "输出有直接关联的文档编号，逗号分隔，如: 0,2,3\n"
             "如果没有，输出: none"
         ),
         "user_template": "问题: {query}\n\n文档:\n{docs}",
@@ -105,9 +110,13 @@ DEFAULT_PROMPTS = {
         "display_name": "生成答案",
         "description": "基于检索到的文档片段让 LLM 生成最终回答",
         "category": "生成",
+        "version": 10,
         "system": (
             "你是企业文档问答助手。根据检索到的文档片段回答问题。\n\n"
-            "要求：\n"
+            "严格要求：\n"
+            "- 你只能根据下面提供的「检索到的文档」回答问题，禁止依赖常识或外部知识。\n"
+            "- 如果文档中没有直接回答问题所需的信息，必须明确回答：未检索到相关内容。\n"
+            "- 不要为了让回答看起来完整而拼凑、推断或编造文档中没有的信息。\n"
             "- 回答必须基于文档内容，不要编造\n"
             "- 如果信息不足，如实说明\n"
             "- 用中文回答，条理清晰"
@@ -118,6 +127,7 @@ DEFAULT_PROMPTS = {
         "display_name": "任务拆解",
         "description": "将复杂问题拆解为 2-4 个独立可检索的子问题",
         "category": "规划",
+        "version": 10,
         "system": (
             "你是任务规划器。将复杂问题拆解为 2-4 个独立的子问题，"
             "每个子问题可以独立检索回答。\n\n"
@@ -130,6 +140,7 @@ DEFAULT_PROMPTS = {
         "display_name": "补充拆解",
         "description": "审查不通过时，基于已有结果补充新的子任务",
         "category": "规划",
+        "version": 10,
         "system": (
             "之前的回答不够充分。请补充 1-2 个新的子问题来填补信息缺口。\n\n"
             '输出 JSON: {{"subtasks": [{{"id": 1, "task": "新子问题"}}]}}\n'
@@ -141,6 +152,7 @@ DEFAULT_PROMPTS = {
         "display_name": "审查把关",
         "description": "审查子任务研究结果是否充分回答了原始问题",
         "category": "规划",
+        "version": 10,
         "system": (
             "你是严格的审查员。判断以上子任务结果是否充分回答了原始问题。\n"
             '只回答"充分"或"不充分"。'
@@ -151,9 +163,13 @@ DEFAULT_PROMPTS = {
         "display_name": "汇总撰写",
         "description": "汇总所有子任务的研究结果，撰写结构化最终答案",
         "category": "生成",
+        "version": 10,
         "system": (
             "你是技术文档撰写员。根据各子任务的研究结果，撰写一份完整的回答。\n\n"
-            "要求：\n"
+            "严格要求：\n"
+            "- 你只能根据各子任务的研究结果撰写回答，禁止依赖常识或外部知识。\n"
+            "- 如果所有子任务结果都无法回答原始问题，必须明确回答：未检索到相关内容。\n"
+            "- 不要为了让回答看起来完整而拼凑、推断或编造研究结果中没有的信息。\n"
             "- 整合所有子任务结果，按逻辑组织，可分点\n"
             "- 回答必须基于研究结果，不要编造\n"
             "- 用中文，条理清晰\n"
@@ -165,6 +181,7 @@ DEFAULT_PROMPTS = {
         "display_name": "历史压缩",
         "description": "对话消息过多时，将旧消息压缩为摘要",
         "category": "记忆",
+        "version": 10,
         "system": "将以下对话历史压缩为一段简短摘要（不超过100字），保留关键信息。",
         "user_template": "{history_text}",
     },
@@ -371,32 +388,52 @@ class PromptManager:
 
     def save_prompt(self, name: str, system: str, user_template: str = "",
                     display_name: str = "", description: str = "",
-                    category: str = "general") -> bool:
+                    category: str = "general", version: int = None) -> bool:
         """
         保存或更新提示词。
 
-        如果 name 已存在，更新 system/display_name/description/category 并递增 version；
-        否则插入新记录。
+        如果 name 已存在：
+          - 若传入 version，则更新为该 version；
+          - 若未传入 version，则递增 version。
+        否则插入新记录，version 默认为 1。
         """
         if not self.available:
             return False
         try:
             conn = self._get_conn()
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO prompt_templates (name, display_name, description, "
-                "category, system_prompt, user_template, version) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 1) "
-                "ON DUPLICATE KEY UPDATE "
-                "display_name=VALUES(display_name), "
-                "description=VALUES(description), "
-                "category=VALUES(category), "
-                "system_prompt=VALUES(system_prompt), "
-                "user_template=VALUES(user_template), "
-                "version=version+1",
-                (name, display_name or name, description or "",
-                 category, system, user_template or "")
-            )
+            if version is None:
+                # 未指定版本：插入为 1，存在则递增
+                cursor.execute(
+                    "INSERT INTO prompt_templates (name, display_name, description, "
+                    "category, system_prompt, user_template, version) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, 1) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "display_name=VALUES(display_name), "
+                    "description=VALUES(description), "
+                    "category=VALUES(category), "
+                    "system_prompt=VALUES(system_prompt), "
+                    "user_template=VALUES(user_template), "
+                    "version=version+1",
+                    (name, display_name or name, description or "",
+                     category, system, user_template or "")
+                )
+            else:
+                # 指定版本：强制覆盖为传入版本（用于工厂默认升级）
+                cursor.execute(
+                    "INSERT INTO prompt_templates (name, display_name, description, "
+                    "category, system_prompt, user_template, version) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "display_name=VALUES(display_name), "
+                    "description=VALUES(description), "
+                    "category=VALUES(category), "
+                    "system_prompt=VALUES(system_prompt), "
+                    "user_template=VALUES(user_template), "
+                    "version=VALUES(version)",
+                    (name, display_name or name, description or "",
+                     category, system, user_template or "", version)
+                )
             conn.commit()  # PooledDB autocommit=True 但显式 commit 更安全
             cursor.close()
             conn.close()
@@ -463,14 +500,41 @@ class PromptManager:
 
     def import_defaults(self) -> int:
         """
-        将 DEFAULT_PROMPTS 中的所有条目导入 MySQL（不覆盖已有记录）。
+        将 DEFAULT_PROMPTS 中的所有条目导入 MySQL。
+
+        逻辑：
+          - 若数据库中不存在该提示词，直接插入。
+          - 若数据库中已存在，但 DEFAULT_PROMPTS 中的 version 更高，则覆盖升级。
+          - 若数据库中 version 大于等于默认 version，保留用户版本不覆盖。
 
         首次部署时调用，或在管理后台点击"恢复默认"按钮时调用。
         """
         if not self.available:
             return 0
+
+        # 先批量读取当前数据库中的版本号
+        current_versions: Dict[str, int] = {}
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, version FROM prompt_templates")
+            for row in cursor.fetchall():
+                current_versions[row[0]] = row[1]
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            print(f"  [PromptManager] import_defaults 读取版本失败: {e}")
+
         count = 0
         for name, data in DEFAULT_PROMPTS.items():
+            default_version = data.get("version", 1)
+            db_version = current_versions.get(name, 0)
+
+            # 数据库版本更高或相等：保留用户编辑，跳过
+            if db_version >= default_version:
+                continue
+
+            # 数据库版本更低或不存在：覆盖/插入为工厂默认版本
             if self.save_prompt(
                 name=name,
                 system=data["system"],
@@ -478,9 +542,10 @@ class PromptManager:
                 display_name=data["display_name"],
                 description=data.get("description", ""),
                 category=data.get("category", "general"),
+                version=default_version,
             ):
                 count += 1
-        print(f"  [PromptManager] 导入 {count} 个默认提示词")
+        print(f"  [PromptManager] 导入/升级 {count} 个默认提示词")
         return count
 
     def format_user_message(self, user_template: str, **kwargs) -> str:
