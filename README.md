@@ -616,7 +616,7 @@ DOC_ACCESS_RULES = {
 
 | 防护层 | 机制 | 位置 |
 |--------|------|------|
-| **网络隔离** | 密码/连接串统一通过 `.env` 环境变量管理，代码中零硬编码密码。`.env` 已加入 `.gitignore`，不会提交到 Git。 | `.env` / 各模块 `os.getenv()` |
+| **凭据外部化** | 密码/连接串统一通过 `.env` 环境变量管理，代码中零硬编码密码。`.env` 已加入 `.gitignore`，不会提交到 Git。 | `.env` / 各模块 `os.getenv()` |
 | **输入防护** | 所有用户输入（question/用户名/密码/提示词字段）经过三层校验：长度上限、非空检查、危险模式拦截（如 `__import__`、`exec()`）。 | `rag_web_server.py` validate_input() |
 | **API 限流** | 令牌桶算法按 IP 限流：查询 10/min、流式 10/min、登录 20/min、通用 60/min。超限返回 HTTP 429 + retry_after。 | `rag_web_server.py` RateLimiter |
 | **审计日志** | 全部关键操作（登录/问答/提示词修改/删除/导入）记录到 `logs/audit.log`，JSON Lines 结构化格式（timestamp/ip/username/action/target/result）。自动轮转，500KB/3 备份。 | `audit_logger.py` |
