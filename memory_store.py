@@ -34,21 +34,49 @@ MySQL 多层记忆持久化模块
 """
 
 import json
+import os
 import time
 import uuid
 import threading
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
+# ---- 加载 .env 文件 ----
+def _load_dotenv(dotenv_path=None):
+    if dotenv_path is None:
+        import __main__
+        dotenv_path = os.path.join(
+            os.path.dirname(os.path.abspath(
+                __main__.__file__ if hasattr(__main__, '__file__') else __file__
+            )),
+            ".env"
+        )
+    if not os.path.isfile(dotenv_path):
+        return
+    with open(dotenv_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 # ============================================================================
 # 配置区 — MySQL 连接参数
 # ============================================================================
 
-MYSQL_HOST = "192.168.200.128"
-MYSQL_PORT = 3306
-MYSQL_USER = "root"
-MYSQL_PASSWORD = "Root@2026"
-MYSQL_DATABASE = "rag_agent"  # 专用数据库（不复用 nacos）
+MYSQL_HOST = os.getenv("MYSQL_HOST", "192.168.200.128")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "Root@2026")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "rag_agent")
 MYSQL_CHARSET = "utf8mb4"
 
 # 对话历史最大保留条数（超过则触发压缩）

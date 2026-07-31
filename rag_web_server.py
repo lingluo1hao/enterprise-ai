@@ -32,6 +32,7 @@ warnings.filterwarnings("ignore")
 from flask import Flask, request, jsonify, Response
 
 # ====== 导入核心模块 ======
+from audit_logger import get_audit_logger
 from advanced_rag_agent import (
     OLLAMA_URL, MODEL_NAME, DB_PATH, DOC_FOLDER,
     ROLE_ADMIN, ROLE_USER, DEFAULT_ROLE,
@@ -99,6 +100,141 @@ class ProgressWriter(io.StringIO):
 
 
 # ======================================================================
+# 输入校验 — 安全防护
+# ======================================================================
+
+# ---- 字段长度限制 ----
+MAX_QUESTION_LEN = 2000          # 用户问题最大字符数
+MAX_PROMPT_NAME_LEN = 100        # 提示词名称
+MAX_PROMPT_SYSTEM_LEN = 10000    # 系统提示词
+MAX_PROMPT_USER_TEMPLATE_LEN = 10000  # 用户模板
+MAX_PROMPT_DISPLAY_LEN = 200     # 显示名称
+MAX_PROMPT_DESC_LEN = 500        # 描述
+MAX_PROMPT_CATEGORY_LEN = 50     # 分类
+MAX_USERNAME_LEN = 50            # 用户名
+MAX_PASSWORD_LEN = 128           # 密码
+
+# 禁止在用户输入中出现的危险模式（简单的注入防护）
+_DANGEROUS_PATTERNS = [
+    "__import__", "exec(", "eval(", "os.system", "subprocess",
+    "open(", "compile(", "globals(", "locals(", "getattr(",
+]
+
+def validate_input(value: str, max_len: int, field_name: str = "输入") -> str | None:
+    """
+    校验单个输入字段，返回错误消息（None 表示通过）。
+    做三层检查：空值、长度、危险模式。
+    """
+    if not value or not value.strip():
+        return f"{field_name}不能为空"
+    if len(value) > max_len:
+        return f"{field_name}过长（最大 {max_len} 字符，当前 {len(value)} 字符）"
+    # 对所有用户输入做危险模式检查
+    lower = value.lower()
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern in lower:
+            return f"{field_name}包含不被允许的字符模式"
+    return None
+
+
+# ---- API 限流（令牌桶算法） ----
+import threading as _threading
+import time as _time
+
+# 默认限流配置：每分钟请求数
+RATE_LIMIT_DEFAULT = 60          # 通用接口
+RATE_LIMIT_QUERY = 30            # 查询接口（较重）
+RATE_LIMIT_STREAM = 10           # 流式查询（最重）
+RATE_LIMIT_ADMIN = 30            # 管理接口
+
+_RATE_WINDOW = 60                # 时间窗口（秒）
+
+
+class RateLimiter:
+    """基于 IP 的令牌桶限流器，线程安全。"""
+
+    def __init__(self):
+        self._buckets: dict[str, dict] = {}
+        self._lock = _threading.Lock()
+
+    def is_allowed(self, ip: str, max_req_per_minute: int) -> bool:
+        """检查某 IP 是否允许请求，自动补充令牌。新 IP 初始满令牌。"""
+        now = _time.time()
+        with self._lock:
+            bucket = self._buckets.get(ip)
+            if bucket is None:
+                # 新 IP：初始给满令牌后消耗 1 个
+                self._buckets[ip] = {"tokens": max_req_per_minute - 1, "last_time": now}
+                return True
+
+            elapsed = now - bucket["last_time"]
+            bucket["last_time"] = now
+            # 按时间比例补充令牌（最多补满到上限）
+            bucket["tokens"] = min(
+                max_req_per_minute,
+                bucket["tokens"] + elapsed * (max_req_per_minute / _RATE_WINDOW)
+            )
+            if bucket["tokens"] >= 1.0:
+                bucket["tokens"] -= 1.0
+                return True
+            return False
+
+
+_rate_limiter = RateLimiter()
+
+
+def _get_client_ip() -> str:
+    """获取真实客户端 IP，支持反向代理。"""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "127.0.0.1"
+
+
+def _get_rate_limit_for_route() -> int:
+    """根据请求路径返回对应的限流阈值。"""
+    path = request.path
+    if path == "/api/query":
+        return RATE_LIMIT_QUERY
+    if path == "/api/query/stream":
+        return RATE_LIMIT_STREAM
+    if path.startswith("/api/admin/"):
+        return RATE_LIMIT_ADMIN
+    return RATE_LIMIT_DEFAULT
+
+
+@app.before_request
+def _rate_limit_before_request():
+    """Flask 全局前置钩子：对每个 API 请求执行 IP 限流。"""
+    if not request.path.startswith("/api/"):
+        return None  # 静态页面不限流
+
+    ip = _get_client_ip()
+    max_req = _get_rate_limit_for_route()
+
+    if not _rate_limiter.is_allowed(ip, max_req):
+        get_audit_logger().log(
+            ip=ip, username="anonymous", action="rate_limit_blocked",
+            target=request.path, result="blocked",
+            detail=f"超过 {max_req} 次/分钟限制"
+        )
+        return jsonify({
+            "error": f"请求过于频繁，请稍后再试（{max_req} 次/分钟）",
+            "retry_after": 3,
+        }), 429
+
+
+def _audit_log(action: str, target: str = "",
+               result: str = "success", detail: str = "",
+               username: str = "anonymous"):
+    """便捷方法：记录审计日志，自动获取 IP。"""
+    get_audit_logger().log(
+        ip=_get_client_ip(), username=username,
+        action=action, target=target, result=result, detail=detail,
+    )
+
+
+# ======================================================================
 # API 路由
 # ======================================================================
 
@@ -125,11 +261,16 @@ def api_query():
     同步查询（简单模式）：直接运行并返回结果，不流式推送。
     前端用 fetch + 轮询 /api/progress。
     """
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+
     question = data.get("question", "").strip()
     user_role = data.get("role", orchestrator.user_role)
 
-    if not question:
+    err = validate_input(question, MAX_QUESTION_LEN, "问题")
+    if err:
+        return jsonify({"error": err}), 400
         return jsonify({"error": "问题不能为空"}), 400
 
     # 特权角色需要管理员 Token
@@ -139,6 +280,7 @@ def api_query():
             return auth_result
 
     result = orchestrator.query(question, user_role=user_role)
+    _audit_log("query", target=question[:80], username=user_role)
     return jsonify({"answer": result, "role": orchestrator.user_role})
 
 
@@ -149,12 +291,18 @@ def api_query_stream():
     启动后台线程执行查询，前端通过 EventSource 接收进度事件。
     """
 
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        result = jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+        return result
+
     question = data.get("question", "").strip()
     user_role = data.get("role", orchestrator.user_role)
 
-    if not question:
-        return jsonify({"error": "问题不能为空"}), 400
+    err = validate_input(question, MAX_QUESTION_LEN, "问题")
+    if err:
+        result = jsonify({"error": err}), 400
+        return result
 
     # 特权角色需要管理员 Token
     if user_role == ROLE_ADMIN:
@@ -211,6 +359,13 @@ def api_query_stream():
 
             # 恢复 stdout
             sys.stdout = original_stdout
+
+            # 审计日志
+            if result_holder["error"]:
+                _audit_log("query", target=question[:80], username=user_role,
+                           result="failure", detail=result_holder["error"])
+            else:
+                _audit_log("query", target=question[:80], username=user_role)
 
             # 发送最终结果
             if result_holder["error"]:
@@ -339,24 +494,36 @@ def resume_task():
 @app.route("/api/admin/login", methods=["POST"])
 def admin_login():
     """管理员登录"""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+
     username = data.get("username", "").strip()
     password = data.get("password", "").strip()
 
-    if not username or not password:
-        return jsonify({"error": "用户名和密码不能为空"}), 400
+    for val, limit, lbl in [
+        (username, MAX_USERNAME_LEN, "用户名"),
+        (password, MAX_PASSWORD_LEN, "密码"),
+    ]:
+        err = validate_input(val, limit, lbl)
+        if err:
+            _audit_log("login", target=username, result="failure", detail=err)
+            return jsonify({"error": err}), 400
 
     from prompt_manager import AuthManager, get_auth_manager
     auth = get_auth_manager()
     user = auth.login(username, password)
 
     if user:
+        _audit_log("login", target=username, result="success", username=username)
         return jsonify({
             "success": True,
             "user": {"username": user["username"], "display_name": user["display_name"]},
             "token": user["token"],
         })
     else:
+        _audit_log("login", target=username, result="failure",
+                   detail="用户名或密码错误", username=username)
         return jsonify({"success": False, "error": "用户名或密码错误"}), 401
 
 
@@ -384,19 +551,33 @@ def admin_me():
 @app.route("/api/admin/change-password", methods=["POST"])
 def admin_change_password():
     """修改密码"""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+
     username = data.get("username", "").strip()
     old_password = data.get("old_password", "")
     new_password = data.get("new_password", "")
 
-    if not new_password or len(new_password) < 6:
+    for val, limit, lbl in [
+        (new_password, MAX_PASSWORD_LEN, "新密码"),
+        (old_password, MAX_PASSWORD_LEN, "原密码"),
+    ]:
+        err = validate_input(val, limit, lbl)
+        if err:
+            return jsonify({"error": err}), 400
+
+    if len(new_password) < 6:
         return jsonify({"error": "新密码至少6位"}), 400
 
     from prompt_manager import AuthManager, get_auth_manager
     auth = get_auth_manager()
     if auth.change_password(username, old_password, new_password):
+        _audit_log("change_password", target=username, result="success", username=username)
         return jsonify({"success": True, "message": "密码修改成功"})
     else:
+        _audit_log("change_password", target=username, result="failure",
+                   detail="原密码错误", username=username)
         return jsonify({"error": "原密码错误或用户不存在"}), 400
 
 
@@ -424,7 +605,10 @@ def admin_get_prompt(name):
 @app.route("/api/admin/prompts", methods=["POST"])
 def admin_save_prompt():
     """保存/更新提示词"""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+
     name = data.get("name", "").strip()
     system = data.get("system", "")
     user_template = data.get("user_template", "")
@@ -432,8 +616,18 @@ def admin_save_prompt():
     description = data.get("description", "")
     category = data.get("category", "general")
 
-    if not name or not system:
-        return jsonify({"error": "名称和系统提示词不能为空"}), 400
+    # 逐字段校验
+    for val, limit, lbl in [
+        (name, MAX_PROMPT_NAME_LEN, "提示词名称"),
+        (system, MAX_PROMPT_SYSTEM_LEN, "系统提示词"),
+        (user_template, MAX_PROMPT_USER_TEMPLATE_LEN, "用户模板"),
+        (display_name, MAX_PROMPT_DISPLAY_LEN, "显示名称"),
+        (description, MAX_PROMPT_DESC_LEN, "描述"),
+        (category, MAX_PROMPT_CATEGORY_LEN, "分类"),
+    ]:
+        err = validate_input(val, limit, lbl)
+        if err:
+            return jsonify({"error": err}), 400
 
     from prompt_manager import get_prompt_manager
     pm = get_prompt_manager()
@@ -442,8 +636,11 @@ def admin_save_prompt():
         display_name=display_name, description=description, category=category,
     )
     if ok:
+        _audit_log("save_prompt", target=name, username="admin")
         return jsonify({"success": True, "message": f"提示词 '{name}' 已保存"})
     else:
+        _audit_log("save_prompt", target=name, result="failure",
+                   detail="数据库不可用", username="admin")
         return jsonify({"error": "保存失败，数据库不可用"}), 500
 
 
@@ -454,8 +651,11 @@ def admin_delete_prompt(name):
     pm = get_prompt_manager()
     ok = pm.delete_prompt(name)
     if ok:
+        _audit_log("delete_prompt", target=name, username="admin")
         return jsonify({"success": True, "message": f"提示词 '{name}' 已删除"})
     else:
+        _audit_log("delete_prompt", target=name, result="failure",
+                   detail="不可删除", username="admin")
         return jsonify({"error": "删除失败（系统内置提示词不可删除）"}), 400
 
 
@@ -479,6 +679,7 @@ def admin_import_defaults():
     from prompt_manager import get_prompt_manager
     pm = get_prompt_manager()
     count = pm.import_defaults()
+    _audit_log("import_defaults", target=f"共 {count} 个提示词", username="admin")
     return jsonify({"success": True, "imported": count})
 
 

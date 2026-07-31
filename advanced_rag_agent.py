@@ -80,8 +80,36 @@
 # 环境配置（必须在所有 import 之前）
 # ============================================================================
 import os
+
+# ---- 加载 .env 文件（轻量实现，零依赖） ----
+def _load_dotenv(dotenv_path: str | None = None):
+    """解析 .env 文件并将未设置的变量注入 os.environ。"""
+    if dotenv_path is None:
+        # 从当前文件所在目录向上查找 .env
+        import __main__
+        dotenv_path = os.path.join(
+            os.path.dirname(os.path.abspath(__main__.__file__ if hasattr(__main__, '__file__') else __file__)),
+            ".env"
+        )
+    if not os.path.isfile(dotenv_path):
+        return
+    with open(dotenv_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 # HF_ENDPOINT 指向国内镜像，加速 embedding 模型下载
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 # 屏蔽 LangChain 的弃用警告，让输出更干净
 import warnings
@@ -90,6 +118,8 @@ warnings.filterwarnings("ignore")
 import re
 import sys
 import json
+import ast
+import operator as op
 import time
 import hashlib
 import traceback
@@ -102,18 +132,18 @@ from typing import List, Dict, Optional, Tuple, Any
 # ============================================================================
 DOC_FOLDER = "./docs"
 DB_PATH = "./chroma_db"
-OLLAMA_URL = "http://192.168.200.128:11434"
-MODEL_NAME = "qwen2:7b"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.200.128:11434")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2:7b")
 EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
 SEPARATORS = ["\n\n", "\n", "。", "；", "？", "！", "，", "、"]
 
 # Redis 缓存配置
-REDIS_HOST = "192.168.200.128"
-REDIS_PORT = 6379
-REDIS_PASSWORD = "dev0619"
-REDIS_DB = 0
+REDIS_HOST = os.getenv("REDIS_HOST", "192.168.200.128")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "dev0619")
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 CACHE_TTL = 7 * 24 * 3600          # 缓存过期时间：7 天
 CACHE_PREFIX = "rag:cache:"        # Redis 键前缀
 SEMANTIC_THRESHOLD = 0.80          # 语义匹配阈值（余弦相似度 > 0.80 即命中）
@@ -709,10 +739,36 @@ class BaseSkill(ABC):
     每个 Skill 需要声明：
       - name:        技能名称（Agent 用这个名字来调用）
       - description: 技能描述（Agent 根据描述决定是否使用该技能）
+
+    安全机制：
+      - validate_params()  子类覆写以实现参数白名单校验
+      - execute()          先调 validate_params，通过后才执行
     """
 
     name: str = "base_skill"
     description: str = "基础技能"
+
+    # 参数限制（子类覆写）
+    MAX_QUERY_LEN = 2000  # 默认最大输入长度
+
+    def validate_params(self, query: str) -> str | None:
+        """
+        参数白名单校验。返回 None 表示通过，否则返回错误描述。
+
+        子类应覆写此方法以实现特定校验逻辑。
+        默认检查：非空 + 长度限制 + 危险模式。
+        """
+        if not query or not query.strip():
+            return f"[{self.name}] 参数不能为空"
+        if len(query) > self.MAX_QUERY_LEN:
+            return f"[{self.name}] 参数过长（最大 {self.MAX_QUERY_LEN} 字符）"
+        lower = query.lower()
+        dangerous = ["__import__", "exec(", "eval(", "os.system", "subprocess",
+                      "open(", "compile(", "globals(", "locals(", "getattr("]
+        for pattern in dangerous:
+            if pattern in lower:
+                return f"[{self.name}] 参数包含不被允许的字符模式"
+        return None
 
     @abstractmethod
     def execute(self, query: str) -> str:
@@ -765,6 +821,11 @@ class DocSearchSkill(BaseSkill):
 
     def execute(self, query: str) -> str:
         """执行智能 RAG 检索流程"""
+        # 参数安全校验
+        err = self.validate_params(query)
+        if err:
+            return err
+
         print(f"\n    [DocSearchSkill] 开始智能检索: \"{query}\"")
 
         # ====== 第1步：查询重写（fast 模式跳过）======
@@ -1077,6 +1138,90 @@ class DocSearchSkill(BaseSkill):
         return " ".join(unique[:8]) if unique else ""
 
 
+# ============================================================
+# 安全数学求值器 — AST 白名单，杜绝 eval() 任意代码执行
+# ============================================================
+
+# 只允许的运算操作符
+_SAFE_BINOPS = {
+    ast.Add:      op.add,
+    ast.Sub:      op.sub,
+    ast.Mult:     op.mul,
+    ast.Div:      op.truediv,
+    ast.FloorDiv: op.floordiv,
+    ast.Mod:      op.mod,
+    ast.Pow:      op.pow,
+}
+_SAFE_UNARYOPS = {
+    ast.USub: op.neg,
+    ast.UAdd: op.pos,
+}
+
+_MAX_EXPR_LEN = 500        # 表达式最大长度
+_MAX_RESULT_ABS = 1e308    # 结果最大绝对值（防止溢出）
+_MAX_NODES = 100           # AST 节点数上限，防止递归炸弹
+
+
+def _eval_ast_node(node: ast.AST, depth: int = 0) -> float:
+    """递归安全求值 AST 节点 — 仅允许数字、二元/一元运算。"""
+    if depth > 50:
+        raise ValueError("表达式嵌套层级过深")
+
+    if isinstance(node, ast.Expression):
+        return _eval_ast_node(node.body, depth)
+
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return float(node.value)
+        raise ValueError(f"不支持的常量类型: {type(node.value).__name__}")
+
+    if isinstance(node, ast.BinOp):
+        left = _eval_ast_node(node.left, depth + 1)
+        right = _eval_ast_node(node.right, depth + 1)
+        optype = type(node.op)
+        if optype in _SAFE_BINOPS:
+            result = _SAFE_BINOPS[optype](left, right)
+            if abs(result) > _MAX_RESULT_ABS:
+                raise ValueError("计算结果溢出")
+            return result
+        raise ValueError(f"不支持的运算符: {optype.__name__}")
+
+    if isinstance(node, ast.UnaryOp):
+        operand = _eval_ast_node(node.operand, depth + 1)
+        optype = type(node.op)
+        if optype in _SAFE_UNARYOPS:
+            return _SAFE_UNARYOPS[optype](operand)
+        raise ValueError(f"不支持的一元运算符: {optype.__name__}")
+
+    raise ValueError(f"表达式包含不支持的语法: {type(node).__name__}")
+
+
+def safe_eval(expr: str) -> float:
+    """
+    白名单 AST 安全求值数学表达式。
+
+    仅允许：数字(int/float)、+ - * / // % **、括号、正负号。
+    彻底禁止：函数调用、变量名、属性访问、import 等任何可执行代码。
+    """
+    if not expr or not expr.strip():
+        raise ValueError("空表达式")
+    if len(expr) > _MAX_EXPR_LEN:
+        raise ValueError("表达式过长")
+
+    # 先 AST 解析（仅 mode='eval'，禁止语句和多行）
+    try:
+        tree = ast.parse(expr.strip(), mode='eval')
+    except SyntaxError as e:
+        raise ValueError(f"表达式语法错误: {e}") from e
+
+    # 节点数上限（防递归炸弹）
+    node_count = sum(1 for _ in ast.walk(tree))
+    if node_count > _MAX_NODES:
+        raise ValueError("表达式节点数过多")
+
+    return _eval_ast_node(tree, depth=0)
+
+
 class CalculatorSkill(BaseSkill):
     """
     计算器技能 — 执行数学运算
@@ -1091,7 +1236,14 @@ class CalculatorSkill(BaseSkill):
         "输入数学表达式（如 120/24 或 5*24），返回计算结果。"
     )
 
+    MAX_QUERY_LEN = 300  # 数学表达式不宜过长
+
     def execute(self, query: str) -> str:
+        # 参数安全校验
+        err = self.validate_params(query)
+        if err:
+            return f"计算失败：{err}"
+
         print(f"\n    [CalculatorSkill] 计算表达式: \"{query}\"")
         try:
             # 清理输入：只保留数字和运算符
@@ -1099,11 +1251,15 @@ class CalculatorSkill(BaseSkill):
             if not expr:
                 return "计算失败：无法识别有效的数学表达式"
 
-            # 安全计算（仅允许数字和基本运算符）
-            # 注意：生产环境应该用 ast.literal_eval 或 sympy 替代 eval
-            result = eval(expr)
-            print(f"    [CalculatorSkill] 结果: {expr} = {result}")
-            return f"计算结果：{expr} = {result}"
+            # 安全计算：使用 AST 白名单求值器，杜绝 eval() 风险
+            result = safe_eval(expr)
+            # 格式化输出：整数无小数点，浮点数保留 4 位
+            if isinstance(result, float) and result == int(result):
+                display = str(int(result))
+            else:
+                display = f"{result:.4f}".rstrip('0').rstrip('.')
+            print(f"    [CalculatorSkill] 结果: {expr} = {display}")
+            return f"计算结果：{expr} = {display}"
         except Exception as e:
             return f"计算失败：{query}，错误：{e}"
 

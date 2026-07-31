@@ -24,6 +24,7 @@
 - **Redis 两级缓存**：精确匹配（SHA256 <1ms）+ 语义匹配（BGE embedding 余弦相似度 > 0.80）。
 - **文档级访问控制**：支持普通用户与特权用户，敏感文档按权限隔离，缓存也按角色隔离。
 - **提示词工程管理系统**：11 个提示词模板存储于 MySQL，通过管理后台（`/admin`）在线 CRUD，修改后即时生效无需重启。内置管理员认证（salt:sha256），支持版本化默认提示词升级。
+- **安全沙箱加固**：密码 `.env` 环境变量管理（不落代码）、输入防护（长度/字符白名单/危险模式拦截）、API 令牌桶限流（4 档阈值 + HTTP 429）、结构化 JSON 审计日志（7 类操作）、工具沙箱（AST 安全求值器 + 参数白名单校验）。
 - **Web 图形界面**：基于 Flask + SSE 实时推送推理进度，自动检测未完成任务并弹窗提示恢复。聊天页面（`/`）与管理后台（`/admin`）权限隔离。
 
 ## 界面预览
@@ -40,12 +41,15 @@ enterprise-ai/
 ├── advanced_rag_agent.py   # 基础模块（OllamaLLM / VectorStoreManager / CacheManager / AccessControlFilter）
 ├── memory_store.py         # MySQL 多层记忆持久化（对话历史 + 断点快照 + 任务队列）
 ├── prompt_manager.py       # 提示词工程管理 + 管理员认证（PromptManager + AuthManager）
-├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 聊天界面 + 管理后台 + 断点恢复 API
+├── audit_logger.py         # 审计日志模块（JSON Lines 结构化日志，7 类操作记录）
+├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 聊天界面 + 管理后台 + 安全中间件
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
-├── docs/                   # 企业 PDF 文档目���
+├── docs/                   # 企业 PDF 文档目录
 ├── chroma_db/              # ChromaDB 向量数据库持久化目录
 ├── screenshots/            # 项目截图
-├── .env                    # 环境变量（当前仅 DASHSCOPE_API_KEY 占位）
+├── .env                    # 环境变量（MySQL/Redis/Ollama 密码等敏感配置，不提交 Git）
+├── .env.example            # 环境变量模板（可提交 Git，部署时复制为 .env）
+├── .gitignore              # Git 排除规则（含 .env / chroma_db/ / logs/）
 └── README.md               # 本文件
 ```
 
@@ -57,7 +61,8 @@ enterprise-ai/
 | `advanced_rag_agent.py` | 基础组件库，提供 OllamaLLM、VectorStoreManager、CacheManager、AccessControlFilter、DocSearchSkill 等可复用类。同时保留原 LangChain 版 RAGOrchestrator 实现（兼容旧模式）。 |
 | `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 3 张表：`chat_messages`（对话历史）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）。支持连接池、线程安全、自动降级。 |
 | `prompt_manager.py` | **提示词工程管理模块**，含 PromptManager（11 个提示词模板的 CRUD + 动态加载）和 AuthManager（管理员 salt:sha256 密码认证）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务。 |
-| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。 |
+| `audit_logger.py` | **审计日志模块**，JSON Lines 结构化日志。覆盖 login/logout/query/query_stream/save_prompt/delete_prompt/import_defaults 7 类操作，字段含 timestamp/ip/username/action/target/result/detail。自动轮转（500KB/3 备份）。 |
+| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。 |
 | `docs/` | 存放企业 PDF 文档，首次运行时会自动构建向量索引到 `chroma_db/`。 |
 | `chroma_db/` | ChromaDB 持久化目录，保存文档切片与向量。 |
 
@@ -262,28 +267,35 @@ mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"
 
 ### 7. 修改配置
 
-打开 `advanced_rag_agent.py`（基础配置均在此文件中），按实际情况修改顶部配置：
+配置文件统一在 `.env` 中管理，无需修改代码。敏感信息（密码、连接串）通过环境变量注入，由 `.gitignore` 排除不提交 Git。
 
-```python
-# 如果 Ollama 在本机，改为 127.0.0.1
-OLLAMA_URL = "http://192.168.200.128:11434"
-MODEL_NAME = "qwen2:7b"
-
-# 如果 Redis 在本机，改为 127.0.0.1
-REDIS_HOST = "192.168.200.128"
-REDIS_PORT = 6379
-REDIS_PASSWORD = "dev0619"
+```bash
+# 首次使用：复制 .env.example 为 .env（仅需一次）
+cp .env.example .env
 ```
 
-打开 `memory_store.py`，按实际情况修改 MySQL 连接配置：
+然后编辑 `.env` 文件：
 
-```python
-MYSQL_HOST = "192.168.200.128"
-MYSQL_PORT = 3306
-MYSQL_USER = "root"
-MYSQL_PASSWORD = "Root@2026"
-MYSQL_DATABASE = "rag_agent"  # 专用数据库（不复用 nacos）
+```bash
+# --- LLM 服务 ---
+OLLAMA_URL="http://192.168.200.128:11434"    # 如果 Ollama 在本机，改为 http://localhost:11434
+OLLAMA_MODEL="qwen2:7b"
+
+# --- MySQL 数据库 ---
+MYSQL_HOST="192.168.200.128"
+MYSQL_PORT="3306"
+MYSQL_USER="root"
+MYSQL_PASSWORD="你的 MySQL 密码"
+MYSQL_DATABASE="rag_agent"
+
+# --- Redis 缓存 ---
+REDIS_HOST="192.168.200.128"
+REDIS_PORT="6379"
+REDIS_PASSWORD="你的 Redis 密码"
+REDIS_DB="0"
 ```
+
+> 系统启动时自动从 `.env` 加载配置，`os.getenv()` 读取。所有配置项都有合理默认值，`.env` 缺失也不影响启动，但请务必填写真实密码以确保各服务正常连接。
 
 ## 使用方式
 
@@ -520,13 +532,13 @@ DOC_ACCESS_RULES = {
 
 ### 4. 连接 Redis 失败 / 缓存不生效
 
-- 检查 Redis 是否已启动：`redis-cli -h 192.168.200.128 -p 6379 -a dev0619 ping`
+- 检查 Redis 是否已启动：`redis-cli -h <IP> -p 6379 -a <密码> ping`（密码见 `.env` 中的 `REDIS_PASSWORD`）
 - 如果返回 `PONG` 则正常，否则启动 Redis 服务
 - 缓存不可用不影响核心问答功能，系统会自动降级
 
 ### 5. 连接 MySQL 失败 / 断点恢复不生效
 
-- 检查 MySQL 是否已启动：`mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"`
+- 检查 MySQL 是否已启动：`mysql -h <IP> -P 3306 -uroot -p<密码> -e "SHOW DATABASES;"`（密码见 `.env` 中的 `MYSQL_PASSWORD`）
 - 确认 `rag_agent` 数据库已自动创建（首次启动时会自动建库建表）
 - MySQL 不可用不影响核心问答功能，系统会自动降级为内存模式
 - 断点恢复仅在 LangGraph 引擎模式下可用（`python rag_web_server.py` 默认即为 LangGraph）
@@ -588,7 +600,33 @@ DOC_ACCESS_RULES = {
 - 如果仍出现幻觉，请到管理后台检查 `generate_answer` 和 `grade_docs` 提示词是否已被升级到最新版本（默认 v10）。
 - 也可以点击对应提示词的「恢复默认」按钮强制同步最新内置提示词。
 
-## 许可证
+### 14. 如何保障系统安全？
+
+系统已实施全面的安全沙箱加固，包含以下 6 层防护：
+
+| 防护层 | 机制 | 位置 |
+|--------|------|------|
+| **网络隔离** | 密码/连接串统一通过 `.env` 环境变量管理，代码中零硬编码密码。`.env` 已加入 `.gitignore`，不会提交到 Git。 | `.env` / 各模块 `os.getenv()` |
+| **输入防护** | 所有用户输入（question/用户名/密码/提示词字段）经过三层校验：长度上限、非空检查、危险模式拦截（如 `__import__`、`exec()`）。 | `rag_web_server.py` validate_input() |
+| **API 限流** | 令牌桶算法按 IP 限流：查询 10/min、流式 10/min、登录 20/min、通用 60/min。超限返回 HTTP 429 + retry_after。 | `rag_web_server.py` RateLimiter |
+| **审计日志** | 全部关键操作（登录/问答/提示词修改/删除/导入）记录到 `logs/audit.log`，JSON Lines 结构化格式（timestamp/ip/username/action/target/result）。自动轮转，500KB/3 备份。 | `audit_logger.py` |
+| **工具沙箱** | `CalculatorSkill` 的 `eval()` 已替换为基于 AST 模块的安全求值器，仅放行数字 + 6 种运算符，拒绝任意代码执行。所有 Skill 通过 `validate_params()` 钩子做参数白名单校验。 | `advanced_rag_agent.py` |
+| **管理员认证** | 管理后台需登录，密码 salt:sha256 哈希存储，Token 持久化到 localStorage。修改密码/编辑提示词等操作均需有效 Token。 | `prompt_manager.py` AuthManager |
+
+### 15. 为什么 `.env` 文件不见了 / 部署后服务启动不了？
+
+- `.env` 文件已在 `.gitignore` 中排除，不会随 Git 推送。新环境部署时需手动创建：
+  ```bash
+  cp .env.example .env     # 复制模板
+  vim .env                 # 填入真实的数据库密码和连接串
+  ```
+- `.env.example` 是模板文件，不含真实密码，可以安全提交到 Git。
+
+### 16. API 返回 429 Too Many Requests 是什么意思？
+
+- 系统为了保护 LLM 服务不被滥用，对每个 IP 实施了请求频率限制。
+- 查询接口限流 10 次/分钟，等待几秒后重试即可自动恢复（令牌桶自动补充）。
+- 如需调整限流参数，修改 `rag_web_server.py` 中的 `_get_rate_limit_for_route()` 函数。
 
 本项目为企业内部使用，具体许可证待定。
 
