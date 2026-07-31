@@ -313,6 +313,10 @@ def api_query_stream():
     # 创建队列用于接收进度
     progress_queue = queue.Queue()
 
+    # 流式响应的生成器会在请求上下文外执行，因此提前捕获 IP，
+    # 避免生成器内部访问 request 对象导致 RuntimeError。
+    client_ip = _get_client_ip()
+
     def generate():
         try:
             # 发送初始事件（建立连接）
@@ -360,12 +364,18 @@ def api_query_stream():
             # 恢复 stdout
             sys.stdout = original_stdout
 
-            # 审计日志
+            # 审计日志（生成器内无 request 上下文，使用提前捕获的 client_ip）
             if result_holder["error"]:
-                _audit_log("query", target=question[:80], username=user_role,
-                           result="failure", detail=result_holder["error"])
+                get_audit_logger().log(
+                    ip=client_ip, username=user_role, action="query_stream",
+                    target=question[:80], result="failure",
+                    detail=result_holder["error"][:200],
+                )
             else:
-                _audit_log("query", target=question[:80], username=user_role)
+                get_audit_logger().log(
+                    ip=client_ip, username=user_role, action="query_stream",
+                    target=question[:80], result="success",
+                )
 
             # 发送最终结果
             if result_holder["error"]:
