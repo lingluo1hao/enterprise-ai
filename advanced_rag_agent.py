@@ -732,53 +732,11 @@ class AccessControlFilter:
 #   - 新增能力只需写一个新 Skill 类并注册，无需改 Agent 代码
 #       → 这就是「可插拔」的含义
 
-class BaseSkill(ABC):
-    """
-    Skill 抽象基类
-
-    每个 Skill 需要声明：
-      - name:        技能名称（Agent 用这个名字来调用）
-      - description: 技能描述（Agent 根据描述决定是否使用该技能）
-
-    安全机制：
-      - validate_params()  子类覆写以实现参数白名单校验
-      - execute()          先调 validate_params，通过后才执行
-    """
-
-    name: str = "base_skill"
-    description: str = "基础技能"
-
-    # 参数限制（子类覆写）
-    MAX_QUERY_LEN = 2000  # 默认最大输入长度
-
-    def validate_params(self, query: str) -> str | None:
-        """
-        参数白名单校验。返回 None 表示通过，否则返回错误描述。
-
-        子类应覆写此方法以实现特定校验逻辑。
-        默认检查：非空 + 长度限制 + 危险模式。
-        """
-        if not query or not query.strip():
-            return f"[{self.name}] 参数不能为空"
-        if len(query) > self.MAX_QUERY_LEN:
-            return f"[{self.name}] 参数过长（最大 {self.MAX_QUERY_LEN} 字符）"
-        lower = query.lower()
-        dangerous = ["__import__", "exec(", "eval(", "os.system", "subprocess",
-                      "open(", "compile(", "globals(", "locals(", "getattr("]
-        for pattern in dangerous:
-            if pattern in lower:
-                return f"[{self.name}] 参数包含不被允许的字符模式"
-        return None
-
-    @abstractmethod
-    def execute(self, query: str) -> str:
-        """
-        执行技能，返回结果文本
-
-        :param query: 传入技能的参数（搜索关键词或计算表达式）
-        :return: 技能执行结果
-        """
-        pass
+# ============================================================================
+# Skill 内核已抽到 skill_framework.py（协议无关、可被 MCP Server 复用）
+# 这里只做再导出，保证文件内其余代码（DocSearchSkill / ReActAgent 等）零改动
+# ============================================================================
+from skill_framework import BaseSkill  # noqa: E402  (置于类定义原位置，保证下方引用不变)
 
 
 class DocSearchSkill(BaseSkill):
@@ -1139,165 +1097,14 @@ class DocSearchSkill(BaseSkill):
 
 
 # ============================================================
-# 安全数学求值器 — AST 白名单，杜绝 eval() 任意代码执行
+# 安全数学求值器 + CalculatorSkill 已抽到 skill_framework.py
+# （与 MCP Server 共用同一份实现，避免逻辑分叉）
 # ============================================================
-
-# 只允许的运算操作符
-_SAFE_BINOPS = {
-    ast.Add:      op.add,
-    ast.Sub:      op.sub,
-    ast.Mult:     op.mul,
-    ast.Div:      op.truediv,
-    ast.FloorDiv: op.floordiv,
-    ast.Mod:      op.mod,
-    ast.Pow:      op.pow,
-}
-_SAFE_UNARYOPS = {
-    ast.USub: op.neg,
-    ast.UAdd: op.pos,
-}
-
-_MAX_EXPR_LEN = 500        # 表达式最大长度
-_MAX_RESULT_ABS = 1e308    # 结果最大绝对值（防止溢出）
-_MAX_NODES = 100           # AST 节点数上限，防止递归炸弹
+from skill_framework import safe_eval, CalculatorSkill  # noqa: E402
 
 
-def _eval_ast_node(node: ast.AST, depth: int = 0) -> float:
-    """递归安全求值 AST 节点 — 仅允许数字、二元/一元运算。"""
-    if depth > 50:
-        raise ValueError("表达式嵌套层级过深")
-
-    if isinstance(node, ast.Expression):
-        return _eval_ast_node(node.body, depth)
-
-    if isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float)):
-            return float(node.value)
-        raise ValueError(f"不支持的常量类型: {type(node.value).__name__}")
-
-    if isinstance(node, ast.BinOp):
-        left = _eval_ast_node(node.left, depth + 1)
-        right = _eval_ast_node(node.right, depth + 1)
-        optype = type(node.op)
-        if optype in _SAFE_BINOPS:
-            result = _SAFE_BINOPS[optype](left, right)
-            if abs(result) > _MAX_RESULT_ABS:
-                raise ValueError("计算结果溢出")
-            return result
-        raise ValueError(f"不支持的运算符: {optype.__name__}")
-
-    if isinstance(node, ast.UnaryOp):
-        operand = _eval_ast_node(node.operand, depth + 1)
-        optype = type(node.op)
-        if optype in _SAFE_UNARYOPS:
-            return _SAFE_UNARYOPS[optype](operand)
-        raise ValueError(f"不支持的一元运算符: {optype.__name__}")
-
-    raise ValueError(f"表达式包含不支持的语法: {type(node).__name__}")
-
-
-def safe_eval(expr: str) -> float:
-    """
-    白名单 AST 安全求值数学表达式。
-
-    仅允许：数字(int/float)、+ - * / // % **、括号、正负号。
-    彻底禁止：函数调用、变量名、属性访问、import 等任何可执行代码。
-    """
-    if not expr or not expr.strip():
-        raise ValueError("空表达式")
-    if len(expr) > _MAX_EXPR_LEN:
-        raise ValueError("表达式过长")
-
-    # 先 AST 解析（仅 mode='eval'，禁止语句和多行）
-    try:
-        tree = ast.parse(expr.strip(), mode='eval')
-    except SyntaxError as e:
-        raise ValueError(f"表达式语法错误: {e}") from e
-
-    # 节点数上限（防递归炸弹）
-    node_count = sum(1 for _ in ast.walk(tree))
-    if node_count > _MAX_NODES:
-        raise ValueError("表达式节点数过多")
-
-    return _eval_ast_node(tree, depth=0)
-
-
-class CalculatorSkill(BaseSkill):
-    """
-    计算器技能 — 执行数学运算
-
-    当 Agent 需要计算数值时调用此技能。
-    例如："待机时间120小时换算成天" → 120 / 24 = 5天
-    """
-
-    name = "calculator"
-    description = (
-        "执行数学计算。适用于需要数值运算、单位换算等场景。"
-        "输入数学表达式（如 120/24 或 5*24），返回计算结果。"
-    )
-
-    MAX_QUERY_LEN = 300  # 数学表达式不宜过长
-
-    def execute(self, query: str) -> str:
-        # 参数安全校验
-        err = self.validate_params(query)
-        if err:
-            return f"计算失败：{err}"
-
-        print(f"\n    [CalculatorSkill] 计算表达式: \"{query}\"")
-        try:
-            # 清理输入：只保留数字和运算符
-            expr = re.sub(r'[^0-9+\-*/.()\s]', '', query).strip()
-            if not expr:
-                return "计算失败：无法识别有效的数学表达式"
-
-            # 安全计算：使用 AST 白名单求值器，杜绝 eval() 风险
-            result = safe_eval(expr)
-            # 格式化输出：整数无小数点，浮点数保留 4 位
-            if isinstance(result, float) and result == int(result):
-                display = str(int(result))
-            else:
-                display = f"{result:.4f}".rstrip('0').rstrip('.')
-            print(f"    [CalculatorSkill] 结果: {expr} = {display}")
-            return f"计算结果：{expr} = {display}"
-        except Exception as e:
-            return f"计算失败：{query}，错误：{e}"
-
-
-class SkillRegistry:
-    """
-    Skill 注册表 — 管理所有可用的 Skill
-
-    Agent 通过 registry.get_skill(name) 来获取和调用技能。
-    新增技能只需 registry.register(MySkill()) 即可。
-    """
-
-    def __init__(self):
-        self._skills: Dict[str, BaseSkill] = {}
-
-    def register(self, skill: BaseSkill):
-        """注册一个 Skill"""
-        self._skills[skill.name] = skill
-        print(f"  [SkillRegistry] 已注册: {skill.name}")
-
-    def get_skill(self, name: str) -> Optional[BaseSkill]:
-        """按名称获取 Skill"""
-        # 模糊匹配：LLM 可能输出 "doc_search" 或 "doc_search（文档检索）"
-        name = name.strip().lower()
-        if name in self._skills:
-            return self._skills[name]
-        # 尝试前缀匹配
-        for key in self._skills:
-            if key in name or name in key:
-                return self._skills[key]
-        return None
-
-    def get_all_descriptions(self) -> str:
-        """返回所有技能的描述（供 Agent 决策时参考）"""
-        lines = []
-        for name, skill in self._skills.items():
-            lines.append(f"  - {name}: {skill.description}")
-        return "\n".join(lines)
+# Skill 注册表已抽到 skill_framework.py（与 MCP Server 共用同一份实现）
+from skill_framework import SkillRegistry  # noqa: E402
 
 
 # ============================================================================

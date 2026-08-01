@@ -8,6 +8,7 @@
 ![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector-FF6F61?labelColor=555555&style=flat-square&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-Cache-DC382D?labelColor=555555&style=flat-square&logo=redis&logoColor=white)
 ![MySQL](https://img.shields.io/badge/MySQL-Memory-4479A1?labelColor=555555&style=flat-square&logo=mysql&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-FastMCP-9A7BFF?labelColor=555555&style=flat-square&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue?labelColor=555555&style=flat-square)
 
 企业智能知识库问答系统 —— 基于 LangGraph RAG 的私有文档问答 Agent，支持多层记忆与断点重续。
@@ -35,6 +36,7 @@
 - **文档级访问控制**：支持普通用户与特权用户，敏感文档按权限隔离，缓存也按角色隔离。
 - **提示词工程管理系统**：11 个提示词模板存储于 MySQL，通过管理后台（`/admin`）在线 CRUD，修改后即时生效无需重启。内置管理员认证（salt:sha256），支持版本化默认提示词升级。
 - **安全沙箱加固**：密码 `.env` 环境变量管理（不落代码）、输入防护（长度/字符白名单/危险模式拦截）、API 令牌桶限流（4 档阈值 + HTTP 429）、结构化 JSON 审计日志（7 类操作）、工具沙箱（AST 安全求值器 + 参数白名单校验）。
+- **MCP 生态暴露**：Skill 内核抽到 `skill_framework.py`，经 `mcp_server.py`（FastMCP）暴露为标准 MCP `Tools` / `Resource` / `Prompt`，任意兼容 MCP 的 AI 客户端（Claude Desktop / Cursor / 自研 Agent）可零改造复用你的工具（详见下方「MCP 生态」章节）。
 - **Web 图形界面**：基于 Flask + SSE 实时推送推理进度，自动检测未完成任务并弹窗提示恢复。聊天页面（`/`）与管理后台（`/admin`）权限隔离。
 
 ## 界面预览
@@ -53,6 +55,10 @@ enterprise-ai/
 ├── prompt_manager.py       # 提示词工程管理 + 管理员认证（PromptManager + AuthManager）
 ├── audit_logger.py         # 审计日志模块（JSON Lines 结构化日志，7 类操作记录）
 ├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 聊天界面 + 管理后台 + 安全中间件
+├── skill_framework.py          # 【MCP 改造】协议无关的 Skill 共享内核（BaseSkill/CalculatorSkill/SkillRegistry/safe_eval）
+├── mcp_server.py           # 【MCP 改造】MCP Server（FastMCP）：把 Skill 暴露为 Tools / Resource / Prompt
+├── mcp_client_example.py   # 【MCP 改造】外部调用示例：验证别的 AI 客户端如何复用工具
+├── MCP_README.md           # 【MCP 改造】改造说明（改造前后对比 / 能力映射 / 复用方式）
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
 ├── docs/                   # 企业 PDF 文档目录
 ├── chroma_db/              # ChromaDB 向量数据库持久化目录
@@ -374,6 +380,111 @@ Web 界面功能：
 - 断点恢复：登录时自动检测未完成任务，弹窗提示恢复
 - **管理后台**（`/admin`）：管理员登录后可在线编辑提示词、使用 admin 角色问答测试
 
+## MCP 生态（工具对外暴露）
+
+本项目已把「可被 LLM 调用的能力（Skill）」从单体进程内调用，升级为**标准 MCP（Model Context Protocol）协议暴露**，让任意兼容 MCP 的 AI 客户端零改造复用你的工具。MCP 被称为「AI 的 USB-C 接口」——你的工具只需写一次，就能被 Claude Desktop、Cursor、自研 Agent 等任意 MCP 客户端调用。
+
+### 改造前 vs 改造后
+
+- **改造前**：`CalculatorSkill` / `DocSearchSkill` 锁在 `advanced_rag_agent.py` 的 `SkillRegistry` 内存字典里，只有你自己的 ReAct / Planning Agent 能调，别的客户端进不来。
+- **改造后**：抽出协议无关的共享内核 `skill_framework.py`，in-process Agent 与 `mcp_server.py`（FastMCP）**共用同一份实现**；Server 把 Skill 暴露为标准 MCP 原语，任意 MCP 客户端可跨进程 / 跨机器调用。
+
+```
+skill_framework.py（共享内核：BaseSkill / CalculatorSkill / SkillRegistry / safe_eval）
+      │
+      ├──► 原 ReAct / Planning Agent（零改动，照旧 import 使用）
+      └──► mcp_server.py（FastMCP）
+              ├── Tools:    calculator / doc_search
+              ├── Resource: skills://list（能力清单，客户端自动发现）
+              └── Prompt:   security_review（可复用安全体检提示词）
+                        │
+            ┌───────────┼────────────┐
+            ▼           ▼            ▼
+      Claude Desktop  Cursor/IDE   自研 AI 客户端
+```
+
+### 能力映射（Skill → MCP 原语）
+
+| 项目概念 | 改造前 | 改造后（MCP 原语） |
+|----------|--------|--------------------|
+| `CalculatorSkill` | `registry.get_skill("calculator").execute()` | **Tool** `calculator(expression)` |
+| `DocSearchSkill` | `registry.get_skill("doc_search").execute()` | **Tool** `doc_search(query, top_k)` |
+| `SkillRegistry.get_all_descriptions()` | Agent 内部拼提示词 | **Resource** `skills://list` |
+| 安全评审口径 | 散落在代码注释 | **Prompt** `security_review(skill_name)` |
+| `validate_params()` / `safe_eval()` | 调用前守门 | Tool 内部**原样复用**（安全未降级） |
+
+### 方式四：MCP Server / 外部调用测试
+
+下面的测试会拉起 `mcp_server.py` 子进程，模拟「别的 AI 客户端」通过 MCP 协议连接、发现工具、调用工具，验证你的能力确实能被外部复用。
+
+```bash
+# 1) 安装 MCP SDK（需 Python 3.10+）
+pip install fastmcp
+
+# 2) 运行外部调用测试（自动拉起 mcp_server.py 子进程）
+python mcp_client_example.py
+```
+
+预期输出（要点）：
+
+```
+[发现工具] 服务端暴露了：
+   - calculator: 执行数学计算……
+   - doc_search: 搜索企业文档知识库……
+
+[调用工具] calculator('120/24')
+   返回: 计算结果：120/24 = 5          ← 复用 AST 安全求值，正确
+
+[调用工具] calculator("__import__('os').system('rm -rf /')")
+   返回: 计算失败：[calculator] 参数包含不被允许的字符模式   ← 沙箱原样生效
+
+[调用工具] doc_search('JM-S509 定位精度')
+   返回: [doc_search] 参数校验通过……  ← 复用同一份 validate_params 安全守门
+
+[读取资源] skills://list
+   返回: [{"name": "calculator", ...}]   ← 客户端自动发现能力
+
+[获取提示词] security_review(calculator)
+   返回: 请对技能 `calculator` 做一次上线前安全体检……
+```
+
+> 演示环境中 `mcp_server.py` 未挂载 ChromaDB / Ollama，故 `doc_search` 仅完成安全守门；在真实运行环境（已装 chromadb + ollama）中，按 `mcp_server.py` 内标注的接缝把 `DocSearchSkill(llm, vector_db, fast_mode=True)` 实例接上即可返回真实文档片段。
+
+### 别的 AI 客户端如何复用你的工具
+
+**方式 A：Claude Desktop / Cursor（改配置即可）**
+
+把下面这段加进对应客户端的 MCP 配置文件（`claude_desktop_config.json` 或 Cursor 的 MCP 设置），重启客户端即可自动发现工具，无需写一行客户端代码：
+
+```json
+{
+  "mcpServers": {
+    "enterprise-rag": {
+      "command": "python",
+      "args": ["D:/work/workspace/pythonspace/mcp_server.py"]
+    }
+  }
+}
+```
+
+**方式 B：远程暴露（Streamable HTTP）**
+
+```bash
+python mcp_server.py --http --host 0.0.0.0 --port 8000
+```
+
+其它机器上的客户端用 `http://<你的IP>:8000/mcp` 连接，实现团队级工具共享。
+
+**方式 C：自研 AI 客户端（代码集成）**
+
+见 `mcp_client_example.py`——它用官方 `mcp` SDK 的 `stdio_client` + `ClientSession` 完成「握手 → list_tools → call_tool → read_resource → get_prompt」，证明任何语言/框架只要实现 MCP 客户端就能调你的工具。
+
+### 安全延续
+
+MCP 改造**不降级任何安全机制**：所有 Tool 调用都必须先过 `BaseSkill.validate_params()` 参数白名单；计算器仍走 `safe_eval()`（AST 白名单），禁止任何新代码写 `eval()`；凭据已在 `.env` 外部化，Server 本身不持有密钥。
+
+> 完整改造说明（含改造前后维度对比表、迁移要点）见 [`MCP_README.md`](MCP_README.md)。
+
 ## 系统管理后台
 
 访问 `http://localhost:8080/admin` 进入管理后台，默认管理员账号：`admin` / `admin123`。
@@ -637,6 +748,17 @@ DOC_ACCESS_RULES = {
 - 系统为了保护 LLM 服务不被滥用，对每个 IP 实施了请求频率限制。
 - 查询接口限流 10 次/分钟，等待几秒后重试即可自动恢复（令牌桶自动补充）。
 - 如需调整限流参数，修改 `rag_web_server.py` 中的 `_get_rate_limit_for_route()` 函数。
+
+### 17. 怎么让别的 AI 客户端（Claude Desktop / Cursor / 自研 Agent）用上我的工具？
+
+本项目已支持 **MCP 协议暴露**（详见上方「MCP 生态」章节）：
+
+1. 安装 SDK：`pip install fastmcp`
+2. 在客户端 MCP 配置里加一段 `mcpServers`（指向 `mcp_server.py`），重启即自动发现 `calculator` / `doc_search` 两个工具；
+3. 或远程共享：`python mcp_server.py --http --port 8000`，其它机器连 `http://<IP>:8000/mcp`；
+4. 想验证「外部到底能不能调」，直接跑 `python mcp_client_example.py`，它会模拟一个客户端完成握手、列工具、调工具的全过程。
+
+> 所有工具调用仍经过 `validate_params()` 沙箱与 `safe_eval()` 安全求值，安全机制不降级。
 
 本项目为企业内部使用，具体许可证待定。
 
