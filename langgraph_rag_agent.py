@@ -49,6 +49,7 @@ from langgraph.graph import StateGraph, END, START
 # 复用现有模块的配置和工具类（不重复造轮子）
 from advanced_rag_agent import (
     OllamaLLM,
+    create_llm,
     VectorStoreManager,
     CacheManager,
     AccessControlFilter,
@@ -257,11 +258,11 @@ class LangGraphRAGApp:
         print("  LangGraph RAG Agent 初始化")
         print("=" * 70)
 
-        # 1. LLM（复用现有 OllamaLLM）
-        # OllamaLLM 封装了对 Ollama 的 HTTP API 调用。
-        # chat(system_prompt, user_prompt) 方法发送 prompt 并返回文本响应。
+        # 1. LLM（走企业级网关，初始化失败自动回退单模型直连）
+        # create_llm() 返回的对象一定满足 BaseLLM 接口，
+        # 所以本文件里 11 处 self.llm.chat(system, user) 一行都不用改。
         print("\n[1/3] 连接 LLM...")
-        self.llm = OllamaLLM()
+        self.llm = create_llm()
 
         # 2. 向量数据库（复用现有 VectorStoreManager）
         # VectorStoreManager 封装了 ChromaDB 的初始化、文档索引、向量检索。
@@ -610,7 +611,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             history=history_text, query=query
         )
-        result = self.llm.chat(system, user)
+        result = self.llm.chat(system, user, task="classify")
 
         # 解析 LLM 输出的 JSON（含容错兜底）
         qtype, resolved = self._parse_classify(result, query)
@@ -667,7 +668,7 @@ class LangGraphRAGApp:
         prompt = self.pm.get_prompt("chitchat")
         system = prompt["system"]
         user = self.pm.format_user_message(prompt["user_template"], query=query)
-        answer = self.llm.chat(system, user)
+        answer = self.llm.chat(system, user, task="direct")
         return {"answer": answer}
 
     # ========================================================================
@@ -1102,7 +1103,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, results_text=results_text
         )
-        result = self.llm.chat(system, user)
+        result = self.llm.chat(system, user, task="review")
 
         passed = "充分" in result
         print(f"  [reviewer] 审查结果: {'通过' if passed else '不通过'}")
@@ -1180,7 +1181,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, results_text=results_text
         )
-        answer = self.llm.chat(system, user)
+        answer = self.llm.chat(system, user, task="write")
         print(f"  [writer] 生成最终答案 ({len(answer)} 字)")
         return {"answer": answer}
 
@@ -1217,7 +1218,7 @@ class LangGraphRAGApp:
             prompt = self.pm.get_prompt("rewrite_first")
             system = prompt["system"]
             user = self.pm.format_user_message(prompt["user_template"], query=query)
-            result = self.llm.chat(system, user)
+            result = self.llm.chat(system, user, task="rewrite")
         else:
             # 第 N 轮：基于之前的检索结果，换角度改写
             # 只取前 3 个文档的前 120 字符，避免 prompt 过长
@@ -1230,7 +1231,7 @@ class LangGraphRAGApp:
                 prompt["user_template"],
                 query=query, prev_text=prev_text
             )
-            result = self.llm.chat(system, user)
+            result = self.llm.chat(system, user, task="rewrite")
 
         # 解析 LLM 输出：按行拆分，取前 3 个非空行
         queries = [q.strip() for q in result.strip().split("\n") if q.strip()][:3]
@@ -1313,7 +1314,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, docs="\n".join(doc_texts)
         )
-        result = self.llm.chat(system, user)
+        result = self.llm.chat(system, user, task="grade")
 
         # 初始化：全部标记为 False
         grades = [False] * len(docs)
@@ -1369,7 +1370,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, context=context
         )
-        return self.llm.chat(system, user)
+        return self.llm.chat(system, user, task="generate")
 
     def _research_subtask(self, subtask: Dict, role: str) -> Dict:
         """
@@ -1476,7 +1477,7 @@ class LangGraphRAGApp:
         prompt = self.pm.get_prompt("planner_decompose")
         system = prompt["system"]
         user = self.pm.format_user_message(prompt["user_template"], query=query)
-        result = self.llm.chat(system, user)
+        result = self.llm.chat(system, user, task="plan")
         return self._parse_json_list(result, "subtasks", query)
 
     def _do_plan_supplement(self, query: str, existing: List[Dict]) -> List[Dict]:
@@ -1511,7 +1512,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, existing_text=existing_text
         )
-        result = self.llm.chat(system, user)
+        result = self.llm.chat(system, user, task="plan")
         return self._parse_json_list(result, "subtasks", query)
 
     # ========================================================================
@@ -1590,7 +1591,7 @@ class LangGraphRAGApp:
         prompt = self.pm.get_prompt("compress_history")
         system = prompt["system"]
         user = self.pm.format_user_message(prompt["user_template"], history_text=old_text)
-        summary = self.llm.chat(system, user)
+        summary = self.llm.chat(system, user, task="compress")
 
         print(f"  [save_history] 历史压缩: {len(old)} 条 → 1 条摘要")
         # 摘要放在最前面，近期消息附加在后面

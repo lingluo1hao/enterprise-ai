@@ -1,0 +1,179 @@
+# ============================================================================
+# 企业级大模型网关配置
+# ============================================================================
+# 这个文件是「模型热切换」的落地点：改这里不用改代码、不用重启进程。
+# 网关每隔 reload_interval 秒检查一次文件 mtime，变了就自动重建模型运行时。
+#
+# 密钥永远不写在这里，只写「环境变量名」(api_key_env)，实际值放 .env。
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 模型注册表
+# ----------------------------------------------------------------------------
+# provider 可选：
+#   ollama         —— 本地 Ollama，走 /api/chat
+#   openai_compat  —— 任何 OpenAI 兼容接口，走 /chat/completions
+#                     (openai / deepseek / dashscope / moonshot / vllm 都是它的别名)
+#
+# tier 只是标注（small/large），真正决定路由的是下面的 routing 表。
+# price_* 单位是「美元 / 每百万 token」，本地模型填 0。
+#   注意：下面第三方模型的价格是示例值，接入前请以厂商官网当前定价为准。
+models:
+
+  # ---- 主力模型：本地 Ollama（当前唯一实际可用的模型）----------------------
+  local-qwen:
+    provider: ollama
+    model: qwen2:7b
+    base_url: http://192.168.200.128:11434
+    tier: large
+    timeout: 120.0
+    temperature: 0.1
+    rpm: 60             # 每分钟最多 60 次调用
+    tpm: 150000         # 每分钟最多 15 万 token
+    fail_threshold: 3   # 连续失败 3 次触发熔断
+    recovery_sec: 30.0  # 熔断 30 秒后半开探测
+    price_in_per_1m: 0.0
+    price_out_per_1m: 0.0
+    enabled: true
+
+  # ---- 轻量模型：给分类/打分/改写这类"够用就行"的任务用 --------------------
+  # 已拉取：qwen2.5:1.5b（通过 GGUF 导入），启用后 grade/rewrite/compress 优先用它，classify 仍走 7b。
+  # 若不想用小模型，改成 enabled: false，网关会自动回落到 local-qwen（热重载，无需重启）。
+  local-small:
+    provider: ollama
+    model: qwen2.5:1.5b
+    base_url: http://192.168.200.128:11434
+    tier: small
+    timeout: 60.0
+    temperature: 0.0    # 分类打分要确定性，温度拉到 0
+    rpm: 200            # 小模型便宜，配额给大一些
+    tpm: 300000
+    fail_threshold: 3
+    recovery_sec: 20.0
+    enabled: true
+
+  # ---- 云端备选：DeepSeek（主模型挂了顶上）--------------------------------
+  # 需要在 .env 里配 DEEPSEEK_API_KEY，然后把 enabled 改成 true
+  deepseek-chat:
+    provider: deepseek
+    model: deepseek-chat
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    tier: large
+    timeout: 90.0
+    temperature: 0.1
+    rpm: 30
+    tpm: 100000
+    fail_threshold: 3
+    recovery_sec: 60.0
+    price_in_per_1m: 0.27
+    price_out_per_1m: 1.10
+    enabled: false
+
+  # ---- 云端备选：通义千问（.env 里已有 DASHSCOPE_API_KEY）-----------------
+  qwen-plus:
+    provider: dashscope
+    model: qwen-plus
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    tier: large
+    timeout: 90.0
+    temperature: 0.1
+    rpm: 30
+    tpm: 100000
+    fail_threshold: 3
+    recovery_sec: 60.0
+    price_in_per_1m: 0.11
+    price_out_per_1m: 0.28
+    enabled: false
+
+  # ---- 云端备选：OpenAI ----------------------------------------------------
+  gpt-4o-mini:
+    provider: openai
+    model: gpt-4o-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    tier: small
+    timeout: 60.0
+    temperature: 0.1
+    rpm: 60
+    tpm: 200000
+    fail_threshold: 3
+    recovery_sec: 60.0
+    price_in_per_1m: 0.15
+    price_out_per_1m: 0.60
+    enabled: false
+
+
+# ----------------------------------------------------------------------------
+# 路由表：任务类型 -> 模型链
+# ----------------------------------------------------------------------------
+# 列表第一个是主模型，后面依次是 fallback。
+# 链上的模型如果 enabled=false 或未定义，会被自动过滤掉，不会报错。
+#
+# 任务类型对应代码里的调用点：
+#   classify  langgraph_rag_agent.node_classify      判断问题类型 / 是否需检索
+#   grade     langgraph_rag_agent._do_grade          文档相关性打分
+#   rewrite   _query_rewrite / _do_rewrite           查询改写
+#   compress  _compress_history                      历史压缩
+#
+#   实测 qwen2.5:1.5b 能力边界（已替换 qwen2:1.5b）：
+#   · classify：在「是否需要联网搜索」上仍把“是”判成“否”，错不起，走 7b。
+#   · grade：    文档相关性打分很稳定，可以给 1.5b。
+#   · rewrite：  1.5b 输出“如何学习 Python？”，与 7b 质量相当，可下放。
+#   · compress： 1.5b 输出与 7b 一致（“用户想学习 Python。”），可下放。
+#
+#   generate  _do_generate                           基于文档生成答案
+#   write     node_writer                            长文写作
+#   synthesize PlannerAgent.synthesize               多子任务结果综合
+#   direct    node_direct_llm                        直接问答
+#   plan      _do_plan / PlannerAgent.plan           任务规划
+#   review    node_reviewer                          审阅
+#   react     ReActAgent.run                         ReAct 推理
+#     ↑ 以上是"论述题"，直接上大模型
+routing:
+  classify:   [local-qwen]           # 决定是否要走 RAG，质量优先
+  grade:      [local-small, local-qwen]
+  rewrite:    [local-small, local-qwen]
+  compress:   [local-small, local-qwen]
+
+  generate:   [local-qwen, deepseek-chat, qwen-plus]
+  write:      [local-qwen, deepseek-chat, qwen-plus]
+  synthesize: [local-qwen, deepseek-chat, qwen-plus]
+  direct:     [local-qwen, deepseek-chat, qwen-plus]
+  plan:       [local-qwen, deepseek-chat]
+  review:     [local-qwen, deepseek-chat]
+  react:      [local-qwen, deepseek-chat]
+
+# 没有在 routing 里命中的任务走这条链（保证老代码不传 task 时行为不变）
+default_chain: [local-qwen, deepseek-chat, qwen-plus]
+
+
+# ----------------------------------------------------------------------------
+# 全局流控
+# ----------------------------------------------------------------------------
+# 这是所有模型加起来的总闸门，防止某个 Agent 死循环把整个 LLM 集群打满。
+global_rpm: 120         # 全局每分钟请求上限
+global_tpm: 400000      # 全局每分钟 token 上限
+acquire_timeout: 5.0    # 拿不到令牌时最多阻塞等待 5 秒，超时才判失败
+
+
+# ----------------------------------------------------------------------------
+# 连接池
+# ----------------------------------------------------------------------------
+pool_size_per_host: 8   # 每个 host:port 最多缓存 8 条 keep-alive 连接
+pool_idle_timeout: 60.0 # 空闲超过 60 秒的连接丢弃重建（防拿到服务端已关的死连接）
+
+
+# ----------------------------------------------------------------------------
+# 重试与降级
+# ----------------------------------------------------------------------------
+max_retries: 1          # 同一模型内重试次数（之后才切 fallback）
+retry_backoff: 0.5      # 指数退避基数，实际等待 = backoff * 2^n * 抖动
+
+# 整条链全挂时的兜底文案。留空则抛 AllModelsFailed 异常。
+# 建议填上：对用户来说，一句友好提示远好过一个 500。
+degraded_reply: "抱歉，当前模型服务繁忙，请稍后重试。（网关已尝试全部备选模型）"
+
+# 配置热重载检查间隔（秒）
+reload_interval: 10.0

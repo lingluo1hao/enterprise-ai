@@ -434,12 +434,17 @@ class BaseLLM(ABC):
     """LLM 抽象基类 — 所有 LLM 后端都要实现 chat 方法"""
 
     @abstractmethod
-    def chat(self, system_prompt: str, user_prompt: str) -> str:
+    def chat(self, system_prompt: str, user_prompt: str,
+             task: str = "default", **kwargs) -> str:
         """
         发送对话请求，返回 LLM 生成的文本
 
         :param system_prompt: 系统提示词（定义角色和规则）
         :param user_prompt:   用户输入
+        :param task:          任务类型，供 LLM 网关做多模型路由
+                              （classify/grade/rewrite 走小模型，
+                                generate/write/synthesize 走大模型）
+                              单模型实现会忽略此参数，因此两条路径都能跑
         :return: LLM 回复文本
         """
         pass
@@ -468,12 +473,16 @@ class OllamaLLM(BaseLLM):
         self.total_time = 0.0
         print(f"[LLM] 已连接 Ollama: {base_url}, 模型: {model}")
 
-    def chat(self, system_prompt: str, user_prompt: str) -> str:
+    def chat(self, system_prompt: str, user_prompt: str,
+             task: str = "default", **kwargs) -> str:
         """
         调用 Ollama 生成回复
 
         内部用 LangChain 的 prompt template 拼接 system + user 消息，
         然后通过 chain 调用 LLM 并解析输出。
+
+        注意：`task` 参数在这里被有意忽略——单模型直连没有路由可言。
+        保留它只是为了与网关同签名，让上层调用点写法完全一致。
         """
         from langchain_core.prompts import ChatPromptTemplate
         from langchain_core.output_parsers import StrOutputParser
@@ -494,6 +503,44 @@ class OllamaLLM(BaseLLM):
         elapsed = time.time() - start
         self.total_time += elapsed
         return result
+
+
+# ----------------------------------------------------------------------------
+# LLM 工厂 —— 单一模型直连 vs 企业级网关，一个开关切换
+# ----------------------------------------------------------------------------
+# 为什么要有工厂：
+#   直接把 OllamaLLM() 散落在三个入口文件里，意味着任何 LLM 层的能力升级
+#   （多模型路由 / 限流 / 熔断 / 计费）都要改三个地方。收敛成一个工厂后，
+#   上层只管拿 BaseLLM，底下是直连还是走网关由配置说了算。
+#
+# 关键设计：LLMGateway 实现了与 BaseLLM 完全相同的 chat(system, user) 签名，
+#          所以全项目 16 处 `llm.chat(...)` 调用点一行都不用改。
+#
+# 开关：环境变量 USE_LLM_GATEWAY
+#   true (默认) —— 走网关，享受多模型路由 / 限流 / 熔断 / token 计费
+#   false       —— 退回改造前的单模型直连，用于对照或应急回滚
+
+USE_LLM_GATEWAY = os.getenv("USE_LLM_GATEWAY", "true").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def create_llm(verbose: bool = True):
+    """
+    创建 LLM 实例。返回值一定满足 BaseLLM 接口，上层无需关心具体实现。
+
+    网关初始化失败时自动回退到 OllamaLLM —— 网关是来提升可用性的，
+    不能反过来成为新的单点故障。
+    """
+    if USE_LLM_GATEWAY:
+        try:
+            from llm_gateway import get_gateway
+            gw = get_gateway(verbose=verbose)
+            if verbose:
+                print("[LLM] 已启用企业级网关 (多模型路由/限流/熔断/计费)")
+            return gw
+        except Exception as e:
+            print(f"[LLM] 网关初始化失败，回退单模型直连: {e}")
+    return OllamaLLM()
 
 
 # ============================================================================
@@ -868,7 +915,7 @@ class DocSearchSkill(BaseSkill):
 {{"rewrites": ["关键词组合1", "关键词组合2"]}}"""
 
         try:
-            result = self.llm.chat(system_prompt, query)
+            result = self.llm.chat(system_prompt, query, task="rewrite")
             # 清理可能存在的 markdown 标记
             result = result.strip()
             if result.startswith("```"):
@@ -1242,7 +1289,7 @@ Final Answer: [你的回答]"""
             # --- 调用 LLM 生成下一步 ---
             print(f"\n    │ Step {step_num}: 正在思考...")
             start_time = time.time()
-            llm_output = self.llm.chat(system_prompt, context)
+            llm_output = self.llm.chat(system_prompt, context, task="react")
             elapsed = time.time() - start_time
             print(f"    │ LLM 响应 ({elapsed:.1f}s)")
 
@@ -1285,7 +1332,7 @@ Final Answer: [你的回答]"""
         if observations:
             # 最后再调一次 LLM 让它总结
             final_prompt = f"请根据以下信息简要回答问题「{task}」：\n\n{observations[-1]}"
-            final_answer = self.llm.chat("你是文档问答助手，请根据提供的信息简要回答问题。", final_prompt)
+            final_answer = self.llm.chat("你是文档问答助手，请根据提供的信息简要回答问题。", final_prompt, task="generate")
             return final_answer, steps
         return "未能完成任务", steps
 
@@ -1422,7 +1469,7 @@ class PlanningAgent:
 
         # 调用 LLM 进行任务拆解
         start_time = time.time()
-        result = self.llm.chat(self.SYSTEM_PROMPT, user_query)
+        result = self.llm.chat(self.SYSTEM_PROMPT, user_query, task="plan")
         elapsed = time.time() - start_time
         print(f"  [PlanningAgent] LLM 规划完成 ({elapsed:.1f}s)")
 
@@ -1525,7 +1572,7 @@ class PlanningAgent:
         synthesis_user = f"用户问题：{user_query}\n\n各子任务检索结果：\n\n" + "\n\n".join(parts) + "\n\n请给出完整回答："
 
         start_time = time.time()
-        final_answer = self.llm.chat(synthesis_system, synthesis_user)
+        final_answer = self.llm.chat(synthesis_system, synthesis_user, task="synthesize")
         elapsed = time.time() - start_time
         print(f"  [PlanningAgent] LLM 汇总完成 ({elapsed:.1f}s)")
 
@@ -1786,9 +1833,9 @@ def main():
     ╚══════════════════════════════════════════════════════════════════╝
     """)
 
-    # 1. 初始化 LLM
+    # 1. 初始化 LLM（企业级网关，可用 USE_LLM_GATEWAY=false 回退直连）
     try:
-        llm = OllamaLLM()
+        llm = create_llm()
     except Exception as e:
         print(f"\n❌ 无法连接 Ollama: {e}")
         print(f"   请确认 Ollama 已启动: {OLLAMA_URL}")

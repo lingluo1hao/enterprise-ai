@@ -39,6 +39,7 @@ from advanced_rag_agent import (
     AccessControlFilter, CacheManager,
     RAGOrchestrator,
     OllamaLLM,
+    create_llm,
     VectorStoreManager,
 )
 
@@ -1959,10 +1960,13 @@ def init_system():
     print("  初始化 RAG Agent 系统...")
     print("=" * 60)
 
-    # 1. LLM
+    # 1. LLM（企业级网关：多模型路由 / 限流 / 熔断 / token 计费）
     try:
-        llm = OllamaLLM()
-        print(f"  ✓ LLM: {MODEL_NAME} @ {OLLAMA_URL}")
+        llm = create_llm()
+        if hasattr(llm, "resolve_chain"):
+            print(f"  ✓ LLM 网关: 默认链 {llm.resolve_chain('default')}")
+        else:
+            print(f"  ✓ LLM: {MODEL_NAME} @ {OLLAMA_URL}")
     except Exception as e:
         print(f"  ✗ LLM 初始化失败: {e}")
         print("    请确认 Ollama 已运行且已加载模型")

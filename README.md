@@ -4,6 +4,7 @@
 ![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-1C3C3C?labelColor=555555&style=flat-square&logo=langchain&logoColor=white)
 ![LangChain](https://img.shields.io/badge/LangChain-RAG-1C3C3C?labelColor=555555&style=flat-square&logo=langchain&logoColor=white)
 ![Ollama](https://img.shields.io/badge/Ollama-qwen2:7b-000000?labelColor=555555&style=flat-square&logo=ollama&logoColor=white)
+![LLM Gateway](https://img.shields.io/badge/LLM_Gateway-Multi--Model_Routing-FF6F61?labelColor=555555&style=flat-square)
 ![Flask](https://img.shields.io/badge/Flask-Web-000000?labelColor=555555&style=flat-square&logo=flask&logoColor=white)
 ![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector-FF6F61?labelColor=555555&style=flat-square&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-Cache-DC382D?labelColor=555555&style=flat-square&logo=redis&logoColor=white)
@@ -24,6 +25,7 @@
 ## 核心特性
 
 - **真实环境，无 Mock**：直接连接本地 ChromaDB 向量数据库与 Ollama 大模型。
+- **企业级 LLM 网关（LLM Gateway）**：所有 LLM 调用经统一网关出口，支持多模型路由（小模型接管分类/打分/改写/压缩等高频任务，大模型负责生成/规划）、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载（改 yaml 不重启）。业务代码 16 个调用点零改动接入，可一键回退单模型直连。
 - **LangGraph 状态机驱动**：显式 StateGraph 替代手写 ReAct 循环，14 个节点 + 条件边精细路由。
 - **三路智能分支**：简单查询走「多轮检索」、复杂问题走「多智能体协作」、闲聊直接回答。
 - **多轮检索反馈循环**：query_rewrite → retrieve → grade_docs，不相关自动换角度重新检索（最多 3 轮）。
@@ -59,6 +61,12 @@ enterprise-ai/
 ├── mcp_server.py           # 【MCP 改造】MCP Server（FastMCP）：把 Skill 暴露为 Tools / Resource / Prompt
 ├── mcp_client_example.py   # 【MCP 改造】外部调用示例：验证别的 AI 客户端如何复用工具
 ├── MCP_README.md           # 【MCP 改造】改造说明（改造前后对比 / 能力映射 / 复用方式）
+├── llm_gateway.py         # 【LLM 网关】统一 LLM 出口：多模型路由/限流/熔断/连接池/Token 计费/热重载（纯标准库）
+├── llm_gateway.yaml       # 【LLM 网关】模型注册表 + 路由表 + 限流熔断配置（支持热切换）
+├── LLM_GATEWAY_README.md  # 【LLM 网关】改造说明（架构/路由/踩坑/验证）
+├── test_llm_gateway.py    # 【LLM 网关】网关端到端测试（32 项断言）
+├── test_llm_gateway_models.py # 【LLM 网关】小模型 vs 大模型任务对比验证
+├── bench_routing_speed.py # 【LLM 网关】路由改版前后时延基准
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
 ├── docs/                   # 企业 PDF 文档目录
 ├── chroma_db/              # ChromaDB 向量数据库持久化目录
@@ -79,6 +87,8 @@ enterprise-ai/
 | `prompt_manager.py` | **提示词工程管理模块**，含 PromptManager（11 个提示词模板的 CRUD + 动态加载）和 AuthManager（管理员 salt:sha256 密码认证）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务。 |
 | `audit_logger.py` | **审计日志模块**，JSON Lines 结构化日志。覆盖 login/logout/query/query_stream/save_prompt/delete_prompt/import_defaults 7 类操作，字段含 timestamp/ip/username/action/target/result/detail。自动轮转（500KB/3 备份）。 |
 | `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。 |
+| `llm_gateway.py` | **企业级 LLM 网关**，统一所有 LLM 调用的出口。内含多模型路由、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载。纯标准库实现，零第三方依赖。 |
+| `llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
 | `docs/` | 存放企业 PDF 文档，首次运行时会自动构建向量索引到 `chroma_db/`。 |
 | `chroma_db/` | ChromaDB 持久化目录，保存文档切片与向量。 |
 
@@ -131,7 +141,13 @@ langgraph_rag_agent.py — StateGraph 状态图引擎
     ├─ PromptManager（提示词动态加载，MySQL 存储，在线编辑即时生效）
     │
     ▼
-Ollama（192.168.200.128:11434 / qwen2:7b）
+LLM Gateway（llm_gateway.yaml：多模型路由 / 限流 / 熔断 / 连接池 / 热重载）
+    │
+    ├─ local-small  (qwen2.5:1.5b)  ← 分类/打分/改写/压缩等高频小任务
+    ├─ local-qwen   (qwen2:7b)      ← 生成/规划等核心任务
+    └─ deepseek-chat / qwen-plus    ← 云端备选，主模型挂了顶上
+    ▼
+Ollama（192.168.200.128:11434 / qwen2:7b 等）
 ChromaDB（本地 ./chroma_db）
 Redis（192.168.200.128:6379）
 MySQL（192.168.200.128:3306 / rag_agent）
@@ -209,6 +225,8 @@ ollama pull qwen2:7b
 # 验证模型已加载
 ollama list
 ```
+
+> **轻量模型（可选）**：网关默认会把 `grade` / `rewrite` / `compress` 等高频小任务下放给 `qwen2.5:1.5b`（约 1GB，比 7b 快很多）。国内加速获取：从 ModelScope / HuggingFace 镜像拉取 `Qwen2.5-1.5B-Instruct-GGUF`，再用 `ollama create` 导入并命名为 `qwen2.5:1.5b`（详见 `LLM_GATEWAY_README.md`）。**不拉取也行**——`local-small` 未启用时，网关会自动回落到 7b，功能不受影响。
 
 **启动 Ollama 并允许远程访问（如果 Ollama 不在本机）：**
 
@@ -485,6 +503,64 @@ MCP 改造**不降级任何安全机制**：所有 Tool 调用都必须先过 `B
 
 > 完整改造说明（含改造前后维度对比表、迁移要点）见 [`MCP_README.md`](MCP_README.md)。
 
+## 企业级 LLM 网关（LLM Gateway）
+
+本项目已把"所有 LLM 调用"从裸调 `OllamaLLM` 升级为**统一的企业级网关**（对标大厂的多模型治理层）。业务代码 16 个调用点**零改动**接入：统一走 `create_llm()` 工厂出口，原 `OllamaLLM` 仅作为网关未启用时的兜底直连。
+
+### 改造前 vs 改造后
+
+| 维度 | 改造前（裸调） | 改造后（网关） |
+|------|---------------|----------------|
+| 调用方式 | 每个 Agent 直接 `OllamaLLM().chat()` | 统一走 `create_llm()` → `LLMGateway`，业务代码不变 |
+| 模型选择 | 写死 `qwen2:7b` | 按 `task` 路由到不同模型（小模型/大模型/云端） |
+| 限流 | 仅 Web 层按 IP 限流 | 网关层全局 + 单模型两级 RPM/TPM 令牌桶 |
+| 容错 | 单点失败即报错 | 三态熔断 + fallback 链 + 全挂兜底文案 |
+| 连接 | 每次请求新建连接 | 按 host 复用 keep-alive 连接池 |
+| 成本 | 无统计 | 真实 Token 计数 + 分模型成本统计 |
+| 配置 | 改代码重启 | 改 `llm_gateway.yaml` 热重载，10 秒内生效 |
+
+### 多模型路由
+
+网关按任务类型分流，把"够用就行"的判断题交给小模型，把"要质量"的论述题交给大模型：
+
+```yaml
+routing:
+  classify:   [local-qwen]                # 是否走 RAG，判错后果严重，死守 7b
+  grade:      [local-small, local-qwen]    # 文档相关性打分，下放 1.5b
+  rewrite:    [local-small, local-qwen]    # 查询改写，下放 1.5b
+  compress:   [local-small, local-qwen]    # 历史压缩，下放 1.5b
+  generate:   [local-qwen, deepseek-chat, qwen-plus]  # 论述题走大模型，云端兜底
+  write/plan/review/...: [local-qwen, deepseek-chat]   # 同论述题
+```
+
+> **实测结论**：`qwen2.5:1.5b` 在 `grade` / `rewrite` / `compress` 上质量与 7b 相当、速度更快，已下放小模型；`classify` 在"是否需要联网搜索"上仍会把"是"判成"否"，错不起，继续走 7b。
+
+### 如何开关 / 回退
+
+网关通过环境变量 `USE_LLM_GATEWAY` 控制（默认 `true`）：
+
+```bash
+# 关闭网关，退回改造前单模型直连（对照 / 应急回滚）
+export USE_LLM_GATEWAY=false
+
+# 开启（默认）
+export USE_LLM_GATEWAY=true
+```
+
+配置文件 `llm_gateway.yaml` 默认与代码同目录，也可用环境变量 `LLM_GATEWAY_CONFIG` 指定绝对路径。修改路由、限流阈值、熔断参数后**无需重启**，网关每 10 秒检查一次文件 mtime，变更自动重建运行时（未启用或拉取不到的模型会被自动过滤出链路，不会报错）。
+
+### 两个真实缺陷（均已修复并加测试锁死）
+
+1. **全局配额被重复扣减**：原实现把全局令牌获取放在 fallback 循环内，一次请求试 3 个模型就扣 3 个全局令牌，等于把全局限流悄悄收紧 3 倍。已把获取逻辑提到循环外只调一次，并加回归测试验证——实测真实扣减 **1.00**（修复前 3.00）。
+2. **AST 字节偏移坑**：批量给 16 处调用点插入 `task=` 参数时，`ast` 的 `end_col_offset` 是 UTF-8 字节偏移，含中文的行按字符切片直接越界崩溃。改为按字节切片 + 从后往前插入，16 处零越界完成。
+
+### 验证结果
+
+- `test_llm_gateway.py`：**32 项端到端断言全通过**（连接池复用、真实 Token、限流、熔断恢复、fallback、流式、成本）。
+- 路由改版基准 `bench_routing_speed.py`：一次 RAG 回合（classify→rewrite→grade→compress）时延 **1.18s vs 全 7b 的 2.64s，提速约 2.23x（快 55%）**。
+
+> 完整改造说明（架构图 / 配置字段详解 / 路由策略 / 踩坑细节）见 [`LLM_GATEWAY_README.md`](LLM_GATEWAY_README.md)。
+
 ## 系统管理后台
 
 访问 `http://localhost:8080/admin` 进入管理后台，默认管理员账号：`admin` / `admin123`。
@@ -625,6 +701,7 @@ DOC_ACCESS_RULES = {
 - 首次提问需加载 embedding 模型和连接向量库，耗时较长；之后重复问题可走缓存。
 - 简单问题在 LangGraph 模式下约 1-2 分钟，复杂多智能体问题约 5-10 分钟（受限于 qwen2:7b 的推理速度）。
 - 使用 `--fast` 模式可跳过 LLM 查询重写，减少一次 LLM 调用。
+- 引入企业级 LLM 网关后，高频预处理（`grade` / `rewrite` / `compress`）已下放 `qwen2.5:1.5b`，一次 RAG 回合整体时延较全 7b 方案提速约 **2.23x（快 55%）**；最终 `generate` 仍走 7b，保证答案质量。
 - 断点快照保存在 MySQL 中，每个节点执行后写入一次 JSON（~1-5ms），对整体性能影响可忽略。
 - 文档切片策略、top_k、检索轮次上限等参数可在 `langgraph_rag_agent.py` 顶部配置区调整。
 
@@ -759,6 +836,13 @@ DOC_ACCESS_RULES = {
 4. 想验证「外部到底能不能调」，直接跑 `python mcp_client_example.py`，它会模拟一个客户端完成握手、列工具、调工具的全过程。
 
 > 所有工具调用仍经过 `validate_params()` 沙箱与 `safe_eval()` 安全求值，安全机制不降级。
+
+### 18. 怎么开关 LLM 网关 / 想回退单模型直连怎么办？
+
+- 网关默认开启（`USE_LLM_GATEWAY=true`）。临时关闭：`export USE_LLM_GATEWAY=false`，业务代码会自动退回改造前的单模型直连，用于对照或应急回滚，无需改代码。
+- 路由、限流、熔断等参数都在 `llm_gateway.yaml`，修改后 10 秒内自动热重载，无需重启。
+- 想新增云端模型（如 DeepSeek / 通义千问），在 yaml 的 `models` 里配好 `provider` + `api_key_env`，并把 `enabled` 改为 `true` 即可，无需动业务代码。
+- 网关改造说明、路由策略与已修复的真实缺陷见 [`LLM_GATEWAY_README.md`](LLM_GATEWAY_README.md)。
 
 本项目为企业内部使用，具体许可证待定。
 
