@@ -227,14 +227,17 @@ Ollama 是一个本地大模型运行平台。安装后可直接在本地运行 
 **拉取模型：**
 
 ```bash
-# 拉取 qwen2:7b 模型（约 4GB，首次需下载）
+# 拉取主力模型 qwen2:7b（约 4GB，首次需下载）
 ollama pull qwen2:7b
+
+# 拉取轻量模型 qwen2.5:1.5b（约 1GB，网关用于分类/打分/改写/压缩等高频小任务）
+ollama pull qwen2.5:1.5b
 
 # 验证模型已加载
 ollama list
 ```
 
-> **轻量模型（可选）**：网关默认会把 `grade` / `rewrite` / `compress` 等高频小任务下放给 `qwen2.5:1.5b`（约 1GB，比 7b 快很多）。国内加速获取：从 ModelScope / HuggingFace 镜像拉取 `Qwen2.5-1.5B-Instruct-GGUF`，再用 `ollama create` 导入并命名为 `qwen2.5:1.5b`（详见 `LLM_GATEWAY_README.md`）。**不拉取也行**——`local-small` 未启用时，网关会自动回落到 7b，功能不受影响。
+> **轻量模型 `qwen2.5:1.5b` 拉取慢怎么办？** 它在部分网络下 `ollama pull` 极慢（官方仓库在国外）。国内加速：从 ModelScope / HuggingFace 镜像下载 `Qwen2.5-1.5B-Instruct-GGUF`（如 `qwen2.5-1.5b-instruct-q4_0.gguf`），再用 `ollama create` 导入并命名为 `qwen2.5:1.5b`（详见 `LLM_GATEWAY_README.md`）。**不拉取也行**——`local-small` 未启用时，网关会自动回落到 7b，功能不受影响。
 
 **启动 Ollama 并允许远程访问（如果 Ollama 不在本机）：**
 
