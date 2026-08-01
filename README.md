@@ -203,7 +203,15 @@ pip install flask flask-cors
 
 # 文档处理 + Embedding 模型
 pip install pypdf sentence-transformers
+
+# MCP 生态（mcp_server.py 依赖 fastmcp，mcp_client_example.py 依赖 mcp）
+pip install fastmcp mcp
+
+# 配置解析（llm_gateway.yaml 需要 pyyaml 才能加载你改的路由/限流；缺失则回退内置默认值）
+pip install pyyaml
 ```
+
+> **零依赖说明**：企业级 LLM 网关（`llm_gateway.py`，统一多模型路由 / 限流 / 熔断 / 连接池 / Token 计费 / 热重载）的核心逻辑完全基于 **Python 标准库**实现；但读取你编辑的 `llm_gateway.yaml` 配置需要 `pyyaml`（轻量、已并入上方安装命令）。**若未安装 `pyyaml`，网关会自动回退到内置默认配置，你在 `llm_gateway.yaml` 里的路由/限流/熔断改动将不生效**。MCP 改造所需的 `fastmcp` / `mcp` 也已合并进上方命令；若暂时不用 MCP 或网关，跳过对应部分不影响核心问答功能。
 
 ### 3. 搭建 Ollama 服务
 
