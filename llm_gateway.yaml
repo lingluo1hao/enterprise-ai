@@ -177,3 +177,10 @@ degraded_reply: "抱歉，当前模型服务繁忙，请稍后重试。（网关
 
 # 配置热重载检查间隔（秒）
 reload_interval: 10.0
+
+# Token 用量持久化：SQLite 文件路径（Python 标准库自带，零依赖）。
+#   留空  → 仅进程内累计，重启即丢（metrics() 仍可用，但无法查历史）
+#   设路径 → 落盘，支持「按用户 / 按时间」查询历史用量（见 gw.user_usage()）
+# 生产环境强烈建议设一个路径，否则用户没法查自己的历史 token 消耗。
+usage_db: ./llm_usage.db
+

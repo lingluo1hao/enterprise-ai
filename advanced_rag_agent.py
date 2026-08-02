@@ -435,7 +435,8 @@ class BaseLLM(ABC):
 
     @abstractmethod
     def chat(self, system_prompt: str, user_prompt: str,
-             task: str = "default", **kwargs) -> str:
+             task: str = "default", user: str = "anonymous",
+             **kwargs) -> str:
         """
         发送对话请求，返回 LLM 生成的文本
 
@@ -445,6 +446,8 @@ class BaseLLM(ABC):
                               （classify/grade/rewrite 走小模型，
                                 generate/write/synthesize 走大模型）
                               单模型实现会忽略此参数，因此两条路径都能跑
+        :param user:         调用方标识，网关据此把 token 用量归因到具体用户，
+                             支撑「用户查自己的历史 token 消耗」（单模型实现忽略）
         :return: LLM 回复文本
         """
         pass
@@ -823,6 +826,7 @@ class DocSearchSkill(BaseSkill):
         self.db = vector_db     # ChromaDB 实例
         self.fast_mode = fast_mode  # True=跳过查询重写，直接检索
         self.user_role = user_role  # 当前用户角色，用于文档访问权限过滤
+        self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
 
     def execute(self, query: str) -> str:
         """执行智能 RAG 检索流程"""
@@ -915,7 +919,7 @@ class DocSearchSkill(BaseSkill):
 {{"rewrites": ["关键词组合1", "关键词组合2"]}}"""
 
         try:
-            result = self.llm.chat(system_prompt, query, task="rewrite")
+            result = self.llm.chat(system_prompt, query, task="rewrite", user=self.user)
             # 清理可能存在的 markdown 标记
             result = result.strip()
             if result.startswith("```"):
@@ -1251,6 +1255,7 @@ Final Answer: [你的回答]"""
     def __init__(self, llm: BaseLLM, skill_registry: SkillRegistry, max_steps: int = 3):
         self.llm = llm
         self.skill_registry = skill_registry
+        self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.max_steps = max_steps  # 防止无限循环（通常2步足够：搜索→回答）
 
     def run(self, task: str) -> Tuple[str, List[ReActStep]]:
@@ -1289,7 +1294,7 @@ Final Answer: [你的回答]"""
             # --- 调用 LLM 生成下一步 ---
             print(f"\n    │ Step {step_num}: 正在思考...")
             start_time = time.time()
-            llm_output = self.llm.chat(system_prompt, context, task="react")
+            llm_output = self.llm.chat(system_prompt, context, task="react", user=self.user)
             elapsed = time.time() - start_time
             print(f"    │ LLM 响应 ({elapsed:.1f}s)")
 
@@ -1332,7 +1337,7 @@ Final Answer: [你的回答]"""
         if observations:
             # 最后再调一次 LLM 让它总结
             final_prompt = f"请根据以下信息简要回答问题「{task}」：\n\n{observations[-1]}"
-            final_answer = self.llm.chat("你是文档问答助手，请根据提供的信息简要回答问题。", final_prompt, task="generate")
+            final_answer = self.llm.chat("你是文档问答助手，请根据提供的信息简要回答问题。", final_prompt, task="generate", user=self.user)
             return final_answer, steps
         return "未能完成任务", steps
 
@@ -1456,6 +1461,7 @@ class PlanningAgent:
     def __init__(self, llm: BaseLLM, skill_registry: SkillRegistry, max_steps: int = 3):
         self.llm = llm
         self.skill_registry = skill_registry
+        self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.react_agent = ReActAgent(llm, skill_registry, max_steps=max_steps)
 
     def plan(self, user_query: str) -> List[SubTask]:
@@ -1469,7 +1475,7 @@ class PlanningAgent:
 
         # 调用 LLM 进行任务拆解
         start_time = time.time()
-        result = self.llm.chat(self.SYSTEM_PROMPT, user_query, task="plan")
+        result = self.llm.chat(self.SYSTEM_PROMPT, user_query, task="plan", user=self.user)
         elapsed = time.time() - start_time
         print(f"  [PlanningAgent] LLM 规划完成 ({elapsed:.1f}s)")
 
@@ -1572,7 +1578,7 @@ class PlanningAgent:
         synthesis_user = f"用户问题：{user_query}\n\n各子任务检索结果：\n\n" + "\n\n".join(parts) + "\n\n请给出完整回答："
 
         start_time = time.time()
-        final_answer = self.llm.chat(synthesis_system, synthesis_user, task="synthesize")
+        final_answer = self.llm.chat(synthesis_system, synthesis_user, task="synthesize", user=self.user)
         elapsed = time.time() - start_time
         print(f"  [PlanningAgent] LLM 汇总完成 ({elapsed:.1f}s)")
 
@@ -1619,6 +1625,7 @@ class RAGOrchestrator:
         self.vector_db = vector_db
         self.fast_mode = fast_mode
         self.user_role = user_role
+        self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.cache = cache or CacheManager()  # 默认自动连接 Redis，连不上则跳过
 
         # 设置缓存管理器的当前角色（影响缓存键，防止跨角色泄漏）
@@ -1644,7 +1651,8 @@ class RAGOrchestrator:
         print(f"[系统] 当前用户角色: {user_role}（{role_desc}）")
         print("[系统] 初始化完成\n")
 
-    def query(self, user_question: str, user_role: str = None) -> str:
+    def query(self, user_question: str, user_role: str = None,
+              user: str = None) -> str:
         """
         用户提问入口
 
@@ -1656,7 +1664,19 @@ class RAGOrchestrator:
 
         :param user_question: 用户问题
         :param user_role: 可选，覆盖默认用户角色（"admin" 或 "user"）
+        :param user: 可选，调用方标识，用于把本次问答的 token 用量归因给用户，
+                     支撑「用户查自己的历史消耗」（默认 anonymous）
         """
+        # 把 user 透传到所有子 Agent，让每处 LLM 调用都带上归因
+        if user:
+            self.user = user
+            self.planning_agent.user = user
+            if getattr(self.planning_agent, "react_agent", None):
+                self.planning_agent.react_agent.user = user
+            doc_skill = self.skill_registry.get_skill("doc_search")
+            if doc_skill:
+                doc_skill.user = user
+
         # 如果传入了 user_role，临时切换角色
         if user_role and user_role != self.user_role:
             self.user_role = user_role

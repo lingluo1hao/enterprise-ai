@@ -560,15 +560,52 @@ export USE_LLM_GATEWAY=true
 
 配置文件 `llm_gateway.yaml` 默认与代码同目录，也可用环境变量 `LLM_GATEWAY_CONFIG` 指定绝对路径。修改路由、限流阈值、熔断参数后**无需重启**，网关每 10 秒检查一次文件 mtime，变更自动重建运行时（未启用或拉取不到的模型会被自动过滤出链路，不会报错）。
 
-### 两个真实缺陷（均已修复并加测试锁死）
+### 三个真实缺陷（均已修复并加测试锁死）
 
 1. **全局配额被重复扣减**：原实现把全局令牌获取放在 fallback 循环内，一次请求试 3 个模型就扣 3 个全局令牌，等于把全局限流悄悄收紧 3 倍。已把获取逻辑提到循环外只调一次，并加回归测试验证——实测真实扣减 **1.00**（修复前 3.00）。
 2. **AST 字节偏移坑**：批量给 16 处调用点插入 `task=` 参数时，`ast` 的 `end_col_offset` 是 UTF-8 字节偏移，含中文的行按字符切片直接越界崩溃。改为按字节切片 + 从后往前插入，16 处零越界完成。
+3. **流式分支把布尔量当时间戳**：`stream_chat` 里 `started` 本是「是否已吐首字」的布尔标志，落盘时却被写成 `time.time() - started`，于是 `latency_s` 记成了 17.8 亿（Unix 时间戳）。这是接了用量看板后从真实数据里发现的——单独看日志根本看不出来，一画图就露馅。已改用独立的 `t0` 计时，并在 `UsageStore.record` 加一道钳制（`latency_s` 超 24h 视为异常置 0），历史脏数据一并修正。
 
 ### 验证结果
 
-- `test_llm_gateway.py`：**32 项端到端断言全通过**（连接池复用、真实 Token、限流、熔断恢复、fallback、流式、成本）。
+- `test_llm_gateway.py`：**43 项端到端断言全通过**（连接池复用、真实 Token、限流、熔断恢复、fallback、流式、成本，以及 Token 用量持久化 + 按用户/按时间查询 + 全用户排行）。
 - 路由改版基准 `bench_routing_speed.py`：一次 RAG 回合（classify→rewrite→grade→compress）时延 **1.18s vs 全 7b 的 2.64s，提速约 2.23x（快 55%）**。
+
+### Token 用量持久化与按用户查询
+
+真实 token 不能只打日志——进程一重启就没了，也无法区分用户。配置 `usage_db`（如 `./llm_usage.db`）后，每次调用的真实 token 数会**落盘到 SQLite**（纯标准库 `sqlite3`，零新增依赖）；`user` 标识从 Web 层（真实用户名/角色）经 Agent 一路透传到 `chat()`，因此天然支持「某用户查自己的历史用量」。
+
+```python
+# 配置 llm_gateway.yaml
+usage_db: ./llm_usage.db   # 非空落盘；留空则仅进程内累计，重启即丢
+
+# 查询（gateway 实例上）
+gw.user_usage("alice")              # 累计：calls / prompt+completion tokens / 成本 / 最近活跃时间
+gw.usage_log("alice", limit=50)     # 最近明细（不传 user 看全部，管理员视角）
+gw.usage_range(start_ts, end_ts)    # 某时间区间（如「本月烧了多少」）
+gw.top_users(limit=50)              # 全用户排行（按 token 降序，后台看板用）
+gw.metrics()["usage_persisted"]     # True 表示已落盘，重启后历史仍在
+```
+
+> 不配置 `usage_db` 也能跑，但用量只在内存累计，重启即丢——这正是改之前的老问题。
+
+#### 网页上直接看用量
+
+用量不只有 Python API，网页端已经内建两个入口，开箱即用：
+
+| 入口 | 位置 | 看到什么 |
+|------|------|----------|
+| **我的用量** | 主页 `http://localhost:8080` 右上角 📊 按钮 | 弹窗展示当前账号的调用次数 / token 总量 / 输入输出拆分 / 累计成本，以及最近 100 条调用明细（时间、模型、任务、耗时、成本），支持「今日 / 近 7 天 / 近 30 天 / 全部」切换 |
+| **Token 用量看板** | 管理后台 `/admin` → 📊 Token 用量 Tab | 全站汇总 + **用户排行榜**（谁烧的 token 最多）+ 全量调用明细，同样支持时间范围切换 |
+
+主页右上角的 👤 chip 可以切换「用量归属账号」（存 localStorage），提问时随请求上报，token 就记到该账号名下——这样多人共用一个部署时，每个人查到的是自己的账单。
+
+对应后端接口：
+
+```
+GET /api/usage/me?user=alice&range=today|7d|30d|all&limit=100   # 单用户（公开）
+GET /api/admin/usage/top?range=7d&limit=100                     # 全用户排行（需管理员 Token）
+```
 
 > 完整改造说明（架构图 / 配置字段详解 / 路由策略 / 踩坑细节）见 [`LLM_GATEWAY_README.md`](LLM_GATEWAY_README.md)。
 

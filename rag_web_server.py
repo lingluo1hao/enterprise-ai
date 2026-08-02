@@ -55,9 +55,10 @@ class LangGraphEngine:
         # 兼容角色切换中的 skill_registry.get_skill() 调用
         self.skill_registry = type("SR", (), {"get_skill": lambda self, name: None})()
 
-    def query(self, question, user_role=None):
+    def query(self, question, user_role=None, user=None):
         role = user_role or self.user_role
-        return self.app.query(question, role=role, session_id="web_session")
+        return self.app.query(question, role=role, session_id="web_session",
+                              user=user)
 
     def check_unfinished_tasks(self, session_id="web_session"):
         """查询指定会话的未完成任务（断点检测）"""
@@ -268,6 +269,8 @@ def api_query():
 
     question = data.get("question", "").strip()
     user_role = data.get("role", orchestrator.user_role)
+    # 用量归因用户：优先用客户端上报的真实用户名，没有则退回角色（user/admin/guest）
+    user = data.get("username") or user_role
 
     err = validate_input(question, MAX_QUESTION_LEN, "问题")
     if err:
@@ -280,7 +283,7 @@ def api_query():
         if auth_result:
             return auth_result
 
-    result = orchestrator.query(question, user_role=user_role)
+    result = orchestrator.query(question, user_role=user_role, user=user)
     _audit_log("query", target=question[:80], username=user_role)
     return jsonify({"answer": result, "role": orchestrator.user_role})
 
@@ -299,6 +302,8 @@ def api_query_stream():
 
     question = data.get("question", "").strip()
     user_role = data.get("role", orchestrator.user_role)
+    # 用量归因用户：优先用客户端上报的真实用户名，没有则退回角色（user/admin/guest）
+    user = data.get("username") or user_role
 
     err = validate_input(question, MAX_QUESTION_LEN, "问题")
     if err:
@@ -338,7 +343,7 @@ def api_query_stream():
             def run_query():
                 try:
                     result_holder["answer"] = orchestrator.query(
-                        question, user_role=user_role
+                        question, user_role=user_role, user=user
                     )
                 except Exception as e:
                     import traceback
@@ -702,6 +707,153 @@ def admin_categories():
     return jsonify({"categories": pm.get_categories()})
 
 
+# ======================================================================
+# Token 用量查询 API —— 让「网关记了多少 token」在网页上直接看得见
+# ======================================================================
+
+def _gateway_or_none():
+    """拿全局网关单例；网关未启用时返回 None，接口降级而不是 500。"""
+    try:
+        from llm_gateway import get_gateway
+        return get_gateway()
+    except Exception:
+        return None
+
+
+def _range_start_ts(rng: str) -> float:
+    """把前端传的 today / 7d / 30d / all 翻译成起始时间戳。"""
+    now = time.time()
+    if rng == "today":
+        lt = time.localtime(now)
+        return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                            0, 0, 0, 0, 0, -1))
+    if rng == "7d":
+        return now - 7 * 86400
+    if rng == "30d":
+        return now - 30 * 86400
+    return 0.0
+
+
+def _summarize(rows):
+    """对明细做一次聚合，供前端统计卡直接渲染。"""
+    p = sum(r["prompt_tokens"] for r in rows)
+    c = sum(r["completion_tokens"] for r in rows)
+    return {
+        "calls": len(rows),
+        "prompt_tokens": p,
+        "completion_tokens": c,
+        "total_tokens": p + c,
+        "cost_usd": round(sum(r["cost_usd"] for r in rows), 6),
+        "avg_latency_s": round(
+            sum(r["latency_s"] for r in rows) / len(rows), 3) if rows else 0.0,
+    }
+
+
+@app.route("/api/usage/me")
+def api_usage_me():
+    """
+    当前用户的 token 用量（网页「我的用量」面板数据源）。
+
+    参数：user=用户名  range=today|7d|30d|all  limit=明细条数
+    """
+    gw = _gateway_or_none()
+    if gw is None:
+        return jsonify({"error": "LLM 网关未启用，无法查询用量"}), 503
+
+    user = (request.args.get("user") or "").strip() or DEFAULT_ROLE
+    rng = request.args.get("range", "all")
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+    except (TypeError, ValueError):
+        limit = 50
+
+    lifetime = gw.user_usage(user)          # 全周期累计（不受 range 影响）
+    if rng == "all":
+        rows = gw.usage_log(user, limit)
+        window = {
+            "calls": lifetime["calls"],
+            "prompt_tokens": lifetime["prompt_tokens"],
+            "completion_tokens": lifetime["completion_tokens"],
+            "total_tokens": lifetime["total_tokens"],
+            "cost_usd": lifetime["cost_usd"],
+            "avg_latency_s": round(
+                sum(r["latency_s"] for r in rows) / len(rows), 3) if rows else 0.0,
+        }
+    else:
+        all_rows = gw.usage_range(_range_start_ts(rng), time.time(), user)
+        window = _summarize(all_rows)
+        rows = all_rows[:limit]
+
+    m = gw.metrics()
+    return jsonify({
+        "user": user,
+        "range": rng,
+        "lifetime": lifetime,
+        "window": window,
+        "rows": rows,
+        "persisted": m.get("usage_persisted", False),
+        "db": m.get("usage_db", ""),
+    })
+
+
+@app.route("/api/admin/usage/top")
+def api_admin_usage_top():
+    """全用户 token 排行 + 最近明细（管理后台看板，需要管理员 Token）。"""
+    auth_result = _require_admin_token()
+    if auth_result:
+        return auth_result
+
+    gw = _gateway_or_none()
+    if gw is None:
+        return jsonify({"error": "LLM 网关未启用，无法查询用量"}), 503
+
+    rng = request.args.get("range", "all")
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+    except (TypeError, ValueError):
+        limit = 50
+
+    if rng == "all":
+        users = gw.top_users(50)
+        rows = gw.usage_log(None, limit)
+        window = {
+            "calls": sum(u["calls"] for u in users),
+            "prompt_tokens": sum(u["prompt_tokens"] for u in users),
+            "completion_tokens": sum(u["completion_tokens"] for u in users),
+            "total_tokens": sum(u["total_tokens"] for u in users),
+            "cost_usd": round(sum(u["cost_usd"] for u in users), 6),
+            "avg_latency_s": round(
+                sum(r["latency_s"] for r in rows) / len(rows), 3) if rows else 0.0,
+        }
+    else:
+        all_rows = gw.usage_range(_range_start_ts(rng), time.time(), None)
+        agg = {}
+        for r in all_rows:
+            a = agg.setdefault(r["user"], {
+                "user": r["user"], "calls": 0, "prompt_tokens": 0,
+                "completion_tokens": 0, "total_tokens": 0,
+                "cost_usd": 0.0, "last_active_ts": 0.0})
+            a["calls"] += 1
+            a["prompt_tokens"] += r["prompt_tokens"]
+            a["completion_tokens"] += r["completion_tokens"]
+            a["total_tokens"] += r["total_tokens"]
+            a["cost_usd"] = round(a["cost_usd"] + r["cost_usd"], 6)
+            a["last_active_ts"] = max(a["last_active_ts"], r["ts"])
+        users = sorted(agg.values(), key=lambda x: x["total_tokens"], reverse=True)
+        window = _summarize(all_rows)
+        rows = all_rows[:limit]
+
+    m = gw.metrics()
+    return jsonify({
+        "range": rng,
+        "users": users,
+        "window": window,
+        "rows": rows,
+        "persisted": m.get("usage_persisted", False),
+        "db": m.get("usage_db", ""),
+    })
+
+
 # ---- 管理后台页面 ----
 
 @app.route("/admin")
@@ -801,6 +953,55 @@ _ADMIN_PAGE = r"""
 
   /* ===== Prompt List ===== */
   .toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:12px;flex-wrap:wrap}
+
+  /* ===== Token 用量看板 ===== */
+  .toolbar h2{font-size:17px;font-weight:600}
+  .toolbar p.sub{font-size:12px;color:var(--text-2);margin-top:2px}
+  .range-btn{
+    padding:5px 14px;border-radius:16px;font-size:12px;cursor:pointer;
+    border:1.5px solid var(--border);background:var(--surface);color:var(--text-2);
+    transition:all .15s;user-select:none
+  }
+  .range-btn:hover{border-color:var(--primary);color:var(--primary)}
+  .range-btn.active{background:var(--primary);border-color:var(--primary);color:#fff}
+  .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+  .stat-card{
+    background:var(--surface);border:1px solid var(--border);
+    border-radius:var(--radius);padding:14px 16px
+  }
+  .stat-card .label{font-size:11px;color:var(--text-2);margin-bottom:6px}
+  .stat-card .value{font-size:22px;font-weight:700;font-family:var(--font-mono,monospace)}
+  .stat-card .sub{font-size:11px;color:var(--text-3);margin-top:4px}
+  .stat-card.primary{background:var(--primary-light);border-color:var(--primary)}
+  .stat-card.primary .value{color:var(--primary)}
+  .stat-card.success{background:#f0fdf4;border-color:#16a34a}
+  .stat-card.success .value{color:#16a34a}
+  .stat-card.warning{background:#fffbeb;border-color:#d97706}
+  .stat-card.warning .value{color:#d97706}
+  .usage-section-title{font-size:13px;font-weight:600;margin:16px 0 10px;color:var(--text-2)}
+  .usage-table{width:100%;border-collapse:collapse;font-size:12px;background:var(--surface)}
+  .usage-table th{
+    text-align:left;padding:8px 10px;background:#f5f6fa;color:var(--text-2);
+    font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap;
+    position:sticky;top:0;z-index:1
+  }
+  .usage-table td{
+    padding:8px 10px;border-bottom:1px solid var(--border);
+    font-family:var(--font-mono,monospace);white-space:nowrap
+  }
+  .usage-table tr:hover td{background:#f5f6fa}
+  .usage-table .num{text-align:right}
+  .tag-task{
+    display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;
+    background:var(--primary-light);color:var(--primary)
+  }
+  .rank-badge{
+    display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+    border-radius:50%;background:var(--border);color:var(--text-2);font-size:11px;font-weight:700
+  }
+  .rank-badge.top1{background:#fef3c7;color:#b45309}
+  .usage-empty{text-align:center;padding:36px 12px;color:var(--text-3);font-size:13px}
+  .table-wrap{max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm)}
   .search-box{
     padding:8px 14px;border:1.5px solid var(--border);border-radius:var(--radius-sm);
     font-size:13px;outline:none;width:240px
@@ -964,6 +1165,7 @@ _ADMIN_PAGE = r"""
   <div class="tabs">
     <div class="tab active" data-tab="prompts" onclick="switchTab('prompts')">📝 提示词管理</div>
     <div class="tab" data-tab="qa" onclick="switchTab('qa')">💬 在线问答</div>
+    <div class="tab" data-tab="usage" onclick="switchTab('usage')">📊 Token 用量</div>
   </div>
   <div class="app-content">
     <!-- Prompt Management Tab -->
@@ -1008,6 +1210,25 @@ _ADMIN_PAGE = r"""
           <textarea class="qa-input" id="qaInput" rows="2" placeholder="输入你的问题，按 Enter 发送..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askQA()}"></textarea>
           <button class="qa-send-btn" id="qaSendBtn" onclick="askQA()">发送</button>
         </div>
+      </div>
+    </div>
+    <!-- Token 用量 Tab -->
+    <div id="tabUsage" class="tab-panel">
+      <div class="toolbar">
+        <div>
+          <h2>Token 用量看板</h2>
+          <p class="sub">网关记录的每一次模型调用，按用户聚合。数据源：SQLite 持久化，重启不丢。</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <div class="range-btn active" data-range="today" onclick="setAdminRange('today')">今日</div>
+          <div class="range-btn" data-range="7d" onclick="setAdminRange('7d')">近 7 天</div>
+          <div class="range-btn" data-range="30d" onclick="setAdminRange('30d')">近 30 天</div>
+          <div class="range-btn" data-range="all" onclick="setAdminRange('all')">全部</div>
+          <button class="btn btn-sm btn-outline" onclick="loadAdminUsage()">🔄 刷新</button>
+        </div>
+      </div>
+      <div id="adminUsageContent" style="overflow-y:auto;flex:1">
+        <div class="usage-empty">加载中…</div>
       </div>
     </div>
   </div>
@@ -1164,6 +1385,135 @@ function switchTab(name) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
   document.getElementById(`tab${name.charAt(0).toUpperCase() + name.slice(1)}`).classList.add('active');
+  if (name === 'usage') loadAdminUsage();
+}
+
+// ===== Token 用量看板 =====
+let adminUsageRange = 'today';
+
+function setAdminRange(r) {
+  adminUsageRange = r;
+  document.querySelectorAll('.range-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.range === r));
+  loadAdminUsage();
+}
+
+function uFmt(n) { return (n || 0).toLocaleString('en-US'); }
+
+function uTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+async function loadAdminUsage() {
+  const box = document.getElementById('adminUsageContent');
+  box.innerHTML = '<div class="usage-empty">加载中…</div>';
+  try {
+    const res = await fetch(`/api/admin/usage/top?range=${adminUsageRange}&limit=100`, {
+      headers: {'Authorization': 'Bearer ' + token}
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      box.innerHTML = `<div class="usage-empty">❌ ${data.error || '查询失败'}</div>`;
+      return;
+    }
+    renderAdminUsage(box, data);
+  } catch(e) {
+    box.innerHTML = '<div class="usage-empty">❌ 网络异常，无法获取用量</div>';
+  }
+}
+
+function renderAdminUsage(box, data) {
+  const w = data.window || {};
+  const users = data.users || [];
+  const rows = data.rows || [];
+
+  const cards = `
+    <div class="stat-grid">
+      <div class="stat-card primary">
+        <div class="label">调用次数</div>
+        <div class="value">${uFmt(w.calls)}</div>
+        <div class="sub">${users.length} 个用户</div>
+      </div>
+      <div class="stat-card success">
+        <div class="label">Token 总量</div>
+        <div class="value">${uFmt(w.total_tokens)}</div>
+        <div class="sub">入 ${uFmt(w.prompt_tokens)} / 出 ${uFmt(w.completion_tokens)}</div>
+      </div>
+      <div class="stat-card warning">
+        <div class="label">累计成本</div>
+        <div class="value" style="font-size:18px">$${(w.cost_usd||0).toFixed(4)}</div>
+        <div class="sub">按配置单价估算</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">平均耗时</div>
+        <div class="value" style="font-size:18px">${(w.avg_latency_s||0).toFixed(2)}s</div>
+        <div class="sub">${data.persisted ? '已持久化 · ' + (data.db||'') : '仅内存'}</div>
+      </div>
+    </div>`;
+
+  let userTable;
+  if (!users.length) {
+    userTable = '<div class="usage-empty">该时间范围内没有任何调用记录</div>';
+  } else {
+    const trs = users.map((u, i) => `
+      <tr>
+        <td><span class="rank-badge ${i===0?'top1':''}">${i+1}</span></td>
+        <td><b>${u.user}</b></td>
+        <td class="num">${uFmt(u.calls)}</td>
+        <td class="num">${uFmt(u.prompt_tokens)}</td>
+        <td class="num">${uFmt(u.completion_tokens)}</td>
+        <td class="num"><b>${uFmt(u.total_tokens)}</b></td>
+        <td class="num">$${(u.cost_usd||0).toFixed(5)}</td>
+        <td>${uTime(u.last_active_ts)}</td>
+      </tr>`).join('');
+    userTable = `
+      <div class="table-wrap">
+        <table class="usage-table">
+          <thead><tr>
+            <th>#</th><th>用户</th><th class="num">调用</th>
+            <th class="num">输入</th><th class="num">输出</th><th class="num">合计</th>
+            <th class="num">成本</th><th>最近活跃</th>
+          </tr></thead>
+          <tbody>${trs}</tbody>
+        </table>
+      </div>`;
+  }
+
+  let logTable;
+  if (!rows.length) {
+    logTable = '<div class="usage-empty">暂无明细</div>';
+  } else {
+    const trs = rows.map(r => `
+      <tr>
+        <td>${uTime(r.ts)}</td>
+        <td><b>${r.user}</b></td>
+        <td style="color:var(--text-2)">${r.model || '—'}</td>
+        <td><span class="tag-task">${r.task || 'default'}</span></td>
+        <td class="num">${uFmt(r.prompt_tokens)}</td>
+        <td class="num">${uFmt(r.completion_tokens)}</td>
+        <td class="num"><b>${uFmt(r.total_tokens)}</b></td>
+        <td class="num">${(r.latency_s||0).toFixed(2)}s</td>
+        <td class="num">$${(r.cost_usd||0).toFixed(5)}</td>
+      </tr>`).join('');
+    logTable = `
+      <div class="table-wrap">
+        <table class="usage-table">
+          <thead><tr>
+            <th>时间</th><th>用户</th><th>模型</th><th>任务</th>
+            <th class="num">输入</th><th class="num">输出</th><th class="num">合计</th>
+            <th class="num">耗时</th><th class="num">成本</th>
+          </tr></thead>
+          <tbody>${trs}</tbody>
+        </table>
+      </div>`;
+  }
+
+  box.innerHTML = cards +
+    '<div class="usage-section-title">🏆 用户排行（按 Token 消耗）</div>' + userTable +
+    `<div class="usage-section-title">🧾 调用明细（最近 ${rows.length} 条）</div>` + logTable;
 }
 
 // ===== Prompts =====
@@ -1352,7 +1702,8 @@ async function askQA() {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + token
       },
-      body: JSON.stringify({question, role: 'admin'})
+      body: JSON.stringify({question, role: 'admin',
+                            username: (currentUser && currentUser.username) || 'admin'})
     });
     const data = await res.json();
     document.getElementById(loadingId).querySelector('.qa-bubble').textContent = data.answer || data.error || '无响应';
@@ -1522,12 +1873,100 @@ _HTML_PAGE = r"""
   .btn-send:disabled{background:var(--border);cursor:not-allowed;transform:none}
   .input-hint{font-size:11px;color:var(--text-3);margin-top:8px;text-align:center}
 
+  /* ===== 用量入口（Header）===== */
+  .user-chip{
+    display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;
+    font-size:13px;border:1.5px solid var(--border);background:var(--surface);
+    cursor:pointer;user-select:none;transition:all .2s;color:var(--text-2)
+  }
+  .user-chip:hover{background:var(--bg);color:var(--text)}
+  .btn-usage{
+    display:flex;align-items:center;gap:6px;padding:6px 14px;border-radius:20px;
+    font-size:13px;font-weight:500;cursor:pointer;border:1.5px solid var(--primary);
+    background:var(--primary-light);color:var(--primary);transition:all .2s
+  }
+  .btn-usage:hover{background:var(--primary);color:#fff}
+
+  /* ===== Modal ===== */
+  .modal-mask{
+    position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:100;
+    display:none;align-items:center;justify-content:center;padding:24px;
+    backdrop-filter:blur(2px)
+  }
+  .modal-mask.show{display:flex}
+  .modal{
+    background:var(--surface);border-radius:16px;box-shadow:var(--shadow-lg);
+    width:100%;max-width:880px;max-height:88vh;display:flex;flex-direction:column;
+    animation:slideIn .25s ease;overflow:hidden
+  }
+  .modal-head{
+    padding:18px 24px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;justify-content:space-between
+  }
+  .modal-head h3{font-size:17px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .modal-close{
+    border:none;background:transparent;font-size:22px;line-height:1;cursor:pointer;
+    color:var(--text-3);padding:4px 8px;border-radius:6px
+  }
+  .modal-close:hover{background:var(--bg);color:var(--text)}
+  .modal-body{padding:20px 24px 24px;overflow-y:auto}
+
+  /* ===== 用量统计卡 ===== */
+  .usage-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+  .range-btn{
+    padding:5px 14px;border-radius:16px;font-size:12px;cursor:pointer;
+    border:1.5px solid var(--border);background:var(--surface);color:var(--text-2);transition:all .15s
+  }
+  .range-btn:hover{border-color:var(--primary);color:var(--primary)}
+  .range-btn.active{background:var(--primary);border-color:var(--primary);color:#fff}
+  .usage-db-tag{
+    margin-left:auto;font-size:11px;color:var(--text-3);font-family:var(--font-mono);
+    background:var(--bg);padding:4px 10px;border-radius:12px
+  }
+  .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+  .stat-card{
+    background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);
+    padding:14px 16px
+  }
+  .stat-card .label{font-size:11px;color:var(--text-2);margin-bottom:6px}
+  .stat-card .value{font-size:22px;font-weight:700;color:var(--text);font-family:var(--font-mono)}
+  .stat-card .sub{font-size:11px;color:var(--text-3);margin-top:4px}
+  .stat-card.primary{background:var(--primary-light);border-color:var(--primary)}
+  .stat-card.primary .value{color:var(--primary)}
+  .stat-card.success{background:var(--success-light);border-color:var(--success)}
+  .stat-card.success .value{color:var(--success)}
+  .stat-card.warning{background:var(--warning-light);border-color:var(--warning)}
+  .stat-card.warning .value{color:var(--warning)}
+
+  .usage-section-title{font-size:13px;font-weight:600;margin:4px 0 10px;color:var(--text-2)}
+  .usage-table{width:100%;border-collapse:collapse;font-size:12px}
+  .usage-table th{
+    text-align:left;padding:8px 10px;background:var(--bg);color:var(--text-2);
+    font-weight:600;border-bottom:1px solid var(--border);white-space:nowrap;
+    position:sticky;top:0
+  }
+  .usage-table td{
+    padding:8px 10px;border-bottom:1px solid var(--border);
+    font-family:var(--font-mono);color:var(--text);white-space:nowrap
+  }
+  .usage-table tr:hover td{background:var(--bg)}
+  .usage-table .num{text-align:right}
+  .tag-task{
+    display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;
+    background:var(--primary-light);color:var(--primary);font-family:inherit
+  }
+  .tag-model{color:var(--text-2)}
+  .usage-empty{text-align:center;padding:36px 12px;color:var(--text-3);font-size:13px}
+  .table-wrap{max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm)}
+
   /* ===== Responsive ===== */
   @media (max-width:640px){
     .header{padding:10px 16px}
     .header h1{font-size:16px}
     .suggestions{flex-direction:column;align-items:stretch}
     .suggestion{text-align:center}
+    .stat-grid{grid-template-columns:repeat(2,1fr)}
+    .user-chip span.uname{max-width:70px;overflow:hidden;text-overflow:ellipsis}
   }
 </style>
 </head>
@@ -1541,6 +1980,12 @@ _HTML_PAGE = r"""
   </div>
   <div class="header-right">
     <a href="/admin" style="text-decoration:none;color:var(--primary);font-size:13px;font-weight:500;margin-right:8px">⚙️ 系统管理</a>
+    <div class="user-chip" id="userChip" onclick="changeUser()" title="点击切换用量归属账号">
+      <span>👤</span><span class="uname" id="userLabel">guest</span>
+    </div>
+    <div class="btn-usage" onclick="openUsage()" title="查看我的 Token 使用记录">
+      <span>📊</span><span>我的用量</span>
+    </div>
     <div class="status-indicator">
       <div class="status-dot"></div>
       <span>服务就绪</span>
@@ -1551,6 +1996,28 @@ _HTML_PAGE = r"""
     </div>
   </div>
 </header>
+
+<!-- Token 用量弹窗 -->
+<div class="modal-mask" id="usageModal" onclick="if(event.target===this)closeUsage()">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>📊 我的 Token 用量 <span style="font-size:12px;font-weight:400;color:var(--text-2)">— <span id="usageUser">guest</span></span></h3>
+      <button class="modal-close" onclick="closeUsage()">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="usage-toolbar">
+        <div class="range-btn active" data-range="today" onclick="setRange('today')">今日</div>
+        <div class="range-btn" data-range="7d" onclick="setRange('7d')">近 7 天</div>
+        <div class="range-btn" data-range="30d" onclick="setRange('30d')">近 30 天</div>
+        <div class="range-btn" data-range="all" onclick="setRange('all')">全部</div>
+        <div class="usage-db-tag" id="usageDbTag">—</div>
+      </div>
+      <div id="usageContent">
+        <div class="usage-empty">加载中…</div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <!-- Main Chat -->
 <div class="main">
@@ -1586,11 +2053,146 @@ _HTML_PAGE = r"""
 // ============================================================
 let currentRole = 'user';
 let isQuerying = false;
+// 用量归属账号：决定 token 记到谁头上，也决定「我的用量」查谁
+let currentUser = localStorage.getItem('rag_user') || 'guest';
+let usageRange = 'today';
+
+// ============================================================
+// 用量归属账号
+// ============================================================
+function renderUser() {
+  document.getElementById('userLabel').textContent = currentUser;
+  document.getElementById('usageUser').textContent = currentUser;
+}
+
+function changeUser() {
+  const name = prompt('设置用量归属账号（token 会记到这个名字下）:', currentUser);
+  if (name === null) return;
+  const v = name.trim().slice(0, 32);
+  if (!v) return;
+  currentUser = v;
+  localStorage.setItem('rag_user', v);
+  renderUser();
+}
+
+// ============================================================
+// 「我的用量」弹窗
+// ============================================================
+function openUsage() {
+  document.getElementById('usageModal').classList.add('show');
+  loadUsage();
+}
+
+function closeUsage() {
+  document.getElementById('usageModal').classList.remove('show');
+}
+
+function setRange(r) {
+  usageRange = r;
+  document.querySelectorAll('.range-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.range === r));
+  loadUsage();
+}
+
+function fmtNum(n) {
+  return (n || 0).toLocaleString('en-US');
+}
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+async function loadUsage() {
+  const box = document.getElementById('usageContent');
+  box.innerHTML = '<div class="usage-empty">加载中…</div>';
+  try {
+    const url = `/api/usage/me?user=${encodeURIComponent(currentUser)}&range=${usageRange}&limit=100`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!resp.ok) {
+      box.innerHTML = `<div class="usage-empty">❌ ${data.error || '查询失败'}</div>`;
+      return;
+    }
+    document.getElementById('usageDbTag').textContent =
+      data.persisted ? `已持久化 · ${data.db}` : '仅内存（重启即丢）';
+    renderUsage(box, data);
+  } catch (e) {
+    box.innerHTML = '<div class="usage-empty">❌ 网络异常，无法获取用量</div>';
+  }
+}
+
+function renderUsage(box, data) {
+  const w = data.window || {};
+  const lt = data.lifetime || {};
+  const cards = `
+    <div class="stat-grid">
+      <div class="stat-card primary">
+        <div class="label">调用次数</div>
+        <div class="value">${fmtNum(w.calls)}</div>
+        <div class="sub">累计 ${fmtNum(lt.calls)} 次</div>
+      </div>
+      <div class="stat-card success">
+        <div class="label">Token 总量</div>
+        <div class="value">${fmtNum(w.total_tokens)}</div>
+        <div class="sub">累计 ${fmtNum(lt.total_tokens)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">输入 / 输出</div>
+        <div class="value" style="font-size:16px">${fmtNum(w.prompt_tokens)} / ${fmtNum(w.completion_tokens)}</div>
+        <div class="sub">prompt / completion</div>
+      </div>
+      <div class="stat-card warning">
+        <div class="label">累计成本</div>
+        <div class="value" style="font-size:18px">$${(w.cost_usd || 0).toFixed(4)}</div>
+        <div class="sub">平均耗时 ${(w.avg_latency_s || 0).toFixed(2)}s</div>
+      </div>
+    </div>`;
+
+  const rows = data.rows || [];
+  let table;
+  if (!rows.length) {
+    table = '<div class="usage-empty">该时间范围内没有调用记录<br><span style="font-size:12px">提问几次后再回来看看 👀</span></div>';
+  } else {
+    const trs = rows.map(r => `
+      <tr>
+        <td>${fmtTime(r.ts)}</td>
+        <td class="tag-model">${r.model || '—'}</td>
+        <td><span class="tag-task">${r.task || 'default'}</span></td>
+        <td class="num">${fmtNum(r.prompt_tokens)}</td>
+        <td class="num">${fmtNum(r.completion_tokens)}</td>
+        <td class="num"><b>${fmtNum(r.total_tokens)}</b></td>
+        <td class="num">${(r.latency_s || 0).toFixed(2)}s</td>
+        <td class="num">$${(r.cost_usd || 0).toFixed(5)}</td>
+      </tr>`).join('');
+    table = `
+      <div class="table-wrap">
+        <table class="usage-table">
+          <thead><tr>
+            <th>时间</th><th>模型</th><th>任务</th>
+            <th class="num">输入</th><th class="num">输出</th><th class="num">合计</th>
+            <th class="num">耗时</th><th class="num">成本</th>
+          </tr></thead>
+          <tbody>${trs}</tbody>
+        </table>
+      </div>`;
+  }
+
+  box.innerHTML = cards +
+    `<div class="usage-section-title">调用明细（最近 ${rows.length} 条）</div>` + table;
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeUsage();
+});
 
 // ============================================================
 // 初始化
 // ============================================================
 document.addEventListener('DOMContentLoaded', () => {
+  renderUser();
   fetch('/api/health')
     .then(r => r.json())
     .then(data => {
@@ -1696,7 +2298,7 @@ async function sendQuestion() {
     const resp = await fetch('/api/query/stream', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question, role: currentRole})
+      body: JSON.stringify({question, role: currentRole, username: currentUser})
     });
 
     const reader = resp.body.getReader();

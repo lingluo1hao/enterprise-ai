@@ -81,6 +81,41 @@ for chunk in llm.stream_chat("你是助手", "讲讲 MCP", task="generate"):
     print(chunk, end="", flush=True)
 ```
 
+### 4. Token 用量持久化与按用户查询
+
+真实 token 不能只打日志——进程重启就丢，也无法区分用户。配置 `usage_db` 后，每次调用的真实 token 数会落盘到 SQLite（纯标准库 `sqlite3`，零新增依赖）。
+
+`user` 标识从 Web 层（真实用户名/角色）经 Agent 一路透传到 `chat()`，所以天然支持「某用户查自己历史用量」：
+
+```python
+# llm_gateway.yaml
+usage_db: ./llm_usage.db   # 非空落盘；留空则仅进程内累计，重启即丢
+
+# 查询（gateway 实例上）
+gw.user_usage("alice")              # 累计：calls / prompt+completion tokens / 成本 / 最近活跃时间
+gw.usage_log("alice", limit=50)     # 最近明细（不传 user 看全部，管理员视角）
+gw.usage_range(start_ts, end_ts)    # 某时间区间（如「本月烧了多少」）
+gw.top_users(limit=50)              # 全用户排行（按 token 降序，后台看板用）
+gw.metrics()["usage_persisted"]     # True=已落盘，重启后历史仍在
+```
+
+> 不配置 `usage_db` 也能跑，但用量只在内存累计，重启即丢。
+> 注意：流式调用（`stream_chat`）的 token 是估算值（Ollama 的 usage 在末帧，当前流式实现未抓真实数），日志里标了 `(est)`；非流式是真实值。
+
+#### 网页入口（无需写代码）
+
+| 入口 | 位置 | 内容 |
+|------|------|------|
+| **我的用量** | 主页右上角 📊 | 当前账号的调用数 / token 总量 / 输入输出拆分 / 成本 + 最近 100 条明细，支持 今日 / 7天 / 30天 / 全部 |
+| **Token 用量看板** | `/admin` → 📊 Token 用量 | 全站汇总 + 用户排行榜 + 全量明细（需管理员 Token） |
+
+主页 👤 chip 可切换用量归属账号（存 localStorage），提问时随请求上报。对应接口：
+
+```
+GET /api/usage/me?user=alice&range=today|7d|30d|all&limit=100   # 单用户（公开）
+GET /api/admin/usage/top?range=7d&limit=100                     # 全用户排行（管理员）
+```
+
 ---
 
 ## 四、配置说明（`llm_gateway.yaml`）
@@ -144,6 +179,10 @@ max_retries: 1           # 同一模型内重试次数，之后才切 fallback
 retry_backoff: 0.5       # 指数退避基数，实际等待 = backoff * 2^n * 抖动
 degraded_reply: "抱歉，当前模型服务繁忙，请稍后重试。（网关已尝试全部备选模型）"
 reload_interval: 10.0    # 配置热重载检查间隔
+
+# ---- Token 用量持久化（按用户查历史）----
+usage_db: ./llm_usage.db  # 非空 → 落盘 SQLite，支持按用户/按时间查历史用量；
+                          # 留空 → 仅进程内累计，重启即丢
 ```
 
 > 注意：熔断参数（`fail_threshold` / `recovery_sec`）和限流参数（`rpm` / `tpm`）都是
@@ -163,7 +202,7 @@ reload_interval: 10.0    # 配置热重载检查间隔
 python test_llm_gateway.py
 ```
 
-32 项断言全部通过，覆盖：
+43 项断言全部通过，覆盖：
 
 | # | 验证项 | 关键实测结果 |
 |---|---|---|
@@ -177,6 +216,7 @@ python test_llm_gateway.py
 | 8 | 多模型路由 | 轻/重任务解析出不同链，未知任务回退默认链 |
 | 9 | 配置热重载 | 改配置后新模型生效、路由链同步更新 |
 | 10 | **全局配额只扣一次** | 3 模型 fallback 真实扣减 **1.00**（修复前为 3.00） |
+| 11 | Token 用量持久化 + 按用户查询 | 落盘 SQLite 重启可查；`alice`/`bob` 用量隔离；`usage_log`/`usage_range` 正确；`chat_detailed(user=...)` 写入用户；`usage_persisted=True`；`top_users` 按 token 降序聚合；异常 latency 被钳制、不污染看板 |
 
 > 第 10 项是改造过程中发现并修复的缺陷：原实现把全局令牌获取放在 fallback 循环**内**，
 > 一次请求试 3 个模型就扣 3 个全局令牌，会让全局限流比配置值严格 3 倍。

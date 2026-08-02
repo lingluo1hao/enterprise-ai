@@ -50,6 +50,7 @@ import json
 import time
 import queue
 import random
+import sqlite3
 import threading
 import http.client
 from abc import ABC, abstractmethod
@@ -145,6 +146,10 @@ class GatewayConfig:
     degraded_reply: str = ""
     # 配置热重载检查间隔（秒）
     reload_interval: float = 10.0
+    # Token 用量持久化：SQLite 文件路径（标准库自带，零依赖）。
+    # 留空 = 仅进程内内存累计（重启即丢，但 metrics() 仍可用）；
+    # 设路径（如 ./llm_usage.db）= 落盘，支持按用户/按时间查询历史用量。
+    usage_db: str = ""
 
     def chain_for(self, task: str) -> List[str]:
         """按任务类型取模型链，未命中则回退到默认链"""
@@ -259,7 +264,7 @@ def load_config(path: str = "") -> GatewayConfig:
     for key in ("global_rpm", "global_tpm", "acquire_timeout",
                 "pool_size_per_host", "pool_idle_timeout",
                 "max_retries", "retry_backoff", "degraded_reply",
-                "reload_interval"):
+                "reload_interval", "usage_db"):
         if key in data and data[key] is not None:
             setattr(cfg, key, data[key])
     return cfg
@@ -915,6 +920,209 @@ class CostTracker:
 
 
 # ============================================================================
+# 第四点五部分：用量持久化（SQLite，标准库自带，零依赖）
+# ============================================================================
+
+class UsageStore:
+    """
+    Token 用量持久化 —— 让「用户查自己历史用量」成为可能。
+
+    为什么不用内存 dict：进程一重启就没了，且无法按用户/时间检索。
+    为什么不用 MySQL/Redis：网关坚持纯标准库，sqlite3 是 Python 自带，
+    一个文件落盘即可支撑「按用户聚合 + 按时间区间查询」，完全够用。
+
+    - db_path 为空字符串或 None → 用内存表（进程内可查，重启即丢）
+    - db_path 为文件路径        → 落盘 SQLite，重启后历史仍在，跨进程可查
+    """
+
+    def __init__(self, db_path: str = ""):
+        self._mem: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._conn = None
+        self._db_path = (db_path or "").strip()
+        if self._db_path:
+            # 目录不存在先建，避免直接崩
+            parent = os.path.dirname(os.path.abspath(self._db_path))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS usage_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,                 -- 调用时间戳
+                    user TEXT NOT NULL DEFAULT 'anonymous',
+                    model TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '',
+                    task TEXT NOT NULL DEFAULT 'default',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    latency_s REAL NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0
+                )"""
+            )
+            self._conn.commit()
+
+    # -- 写入 --------------------------------------------------------------
+    def record(self, user: str, model: str, provider: str, task: str,
+               prompt_tokens: int, completion_tokens: int,
+               latency_s: float, cost_usd: float) -> None:
+        total = prompt_tokens + completion_tokens
+        # 防御：latency 只可能是「秒」，出现天文数字必然是把时间戳当耗时传了，
+        # 与其让看板显示 1785606461s，不如记 0 并留给日志排查
+        try:
+            latency_s = float(latency_s)
+        except (TypeError, ValueError):
+            latency_s = 0.0
+        if latency_s < 0 or latency_s > 86400:
+            latency_s = 0.0
+        row = {
+            "ts": time.time(), "user": user or "anonymous", "model": model,
+            "provider": provider, "task": task or "default",
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": total, "latency_s": latency_s, "cost_usd": cost_usd,
+        }
+        with self._lock:
+            if self._conn is not None:
+                self._conn.execute(
+                    """INSERT INTO usage_log
+                       (ts, user, model, provider, task,
+                        prompt_tokens, completion_tokens, total_tokens,
+                        latency_s, cost_usd)
+                       VALUES (:ts, :user, :model, :provider, :task,
+                               :prompt_tokens, :completion_tokens, :total_tokens,
+                               :latency_s, :cost_usd)""", row)
+                self._conn.commit()
+            else:
+                self._mem.append(row)
+
+    # -- 读取：单用户聚合 ------------------------------------------------
+    def user_usage(self, user: str) -> Dict[str, Any]:
+        """某用户的累计用量（调用次数 / token / 成本 / 最近一次时间）"""
+        user = user or "anonymous"
+        calls = total_p = total_c = 0
+        cost = 0.0
+        last_ts = 0.0
+        if self._conn is not None:
+            cur = self._conn.execute(
+                """SELECT COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+                          SUM(cost_usd), MAX(ts)
+                   FROM usage_log WHERE user = ?""", (user,))
+            row = cur.fetchone()
+            if row and row[0]:
+                calls, total_p, total_c, cost, last_ts = row
+        else:
+            with self._lock:
+                rows = [r for r in self._mem if r["user"] == user]
+            calls = len(rows)
+            total_p = sum(r["prompt_tokens"] for r in rows)
+            total_c = sum(r["completion_tokens"] for r in rows)
+            cost = sum(r["cost_usd"] for r in rows)
+            last_ts = max((r["ts"] for r in rows), default=0.0)
+        return {
+            "user": user, "calls": calls or 0,
+            "prompt_tokens": total_p or 0, "completion_tokens": total_c or 0,
+            "total_tokens": (total_p or 0) + (total_c or 0),
+            "cost_usd": round(cost or 0.0, 6),
+            "last_active_ts": last_ts or 0.0,
+        }
+
+    # -- 读取：明细列表 --------------------------------------------------
+    def usage_log(self, user: str = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """最近用量明细；user 为 None 时返回全部用户（管理员视角）"""
+        if self._conn is not None:
+            if user:
+                cur = self._conn.execute(
+                    """SELECT ts, user, model, provider, task,
+                              prompt_tokens, completion_tokens, total_tokens,
+                              latency_s, cost_usd
+                       FROM usage_log WHERE user = ?
+                       ORDER BY ts DESC LIMIT ?""", (user, limit))
+            else:
+                cur = self._conn.execute(
+                    """SELECT ts, user, model, provider, task,
+                              prompt_tokens, completion_tokens, total_tokens,
+                              latency_s, cost_usd
+                       FROM usage_log ORDER BY ts DESC LIMIT ?""", (limit,))
+            keys = ["ts", "user", "model", "provider", "task",
+                    "prompt_tokens", "completion_tokens", "total_tokens",
+                    "latency_s", "cost_usd"]
+            return [dict(zip(keys, r)) for r in cur.fetchall()]
+        with self._lock:
+            rows = [r for r in self._mem if user is None or r["user"] == user]
+        rows = sorted(rows, key=lambda r: r["ts"], reverse=True)[:limit]
+        return rows
+
+    # -- 读取：全用户排行（管理员视角）------------------------------------
+    def top_users(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """按 token 消耗从多到少列出所有用户，用于后台「谁在烧钱」看板。"""
+        if self._conn is not None:
+            cur = self._conn.execute(
+                """SELECT user, COUNT(*), SUM(prompt_tokens), SUM(completion_tokens),
+                          SUM(total_tokens), SUM(cost_usd), MAX(ts)
+                   FROM usage_log GROUP BY user
+                   ORDER BY SUM(total_tokens) DESC LIMIT ?""", (limit,))
+            rows = cur.fetchall()
+        else:
+            with self._lock:
+                agg: Dict[str, Dict[str, Any]] = {}
+                for r in self._mem:
+                    a = agg.setdefault(r["user"], {
+                        "calls": 0, "p": 0, "c": 0, "t": 0, "cost": 0.0, "last": 0.0})
+                    a["calls"] += 1
+                    a["p"] += r["prompt_tokens"]
+                    a["c"] += r["completion_tokens"]
+                    a["t"] += r["total_tokens"]
+                    a["cost"] += r["cost_usd"]
+                    a["last"] = max(a["last"], r["ts"])
+            rows = sorted(
+                [(u, a["calls"], a["p"], a["c"], a["t"], a["cost"], a["last"])
+                 for u, a in agg.items()],
+                key=lambda x: x[4], reverse=True)[:limit]
+        return [{
+            "user": r[0], "calls": r[1] or 0,
+            "prompt_tokens": r[2] or 0, "completion_tokens": r[3] or 0,
+            "total_tokens": r[4] or 0, "cost_usd": round(r[5] or 0.0, 6),
+            "last_active_ts": r[6] or 0.0,
+        } for r in rows]
+
+    # -- 读取：时间区间 --------------------------------------------------
+    def usage_range(self, start_ts: float, end_ts: float,
+                    user: str = None) -> List[Dict[str, Any]]:
+        """某时间区间内的用量明细（用于「这个月我烧了多少」）"""
+        if self._conn is not None:
+            if user:
+                cur = self._conn.execute(
+                    """SELECT ts, user, model, provider, task,
+                              prompt_tokens, completion_tokens, total_tokens,
+                              latency_s, cost_usd
+                       FROM usage_log
+                       WHERE ts >= ? AND ts <= ? AND user = ?
+                       ORDER BY ts DESC""", (start_ts, end_ts, user))
+            else:
+                cur = self._conn.execute(
+                    """SELECT ts, user, model, provider, task,
+                              prompt_tokens, completion_tokens, total_tokens,
+                              latency_s, cost_usd
+                       FROM usage_log
+                       WHERE ts >= ? AND ts <= ?
+                       ORDER BY ts DESC""", (start_ts, end_ts))
+            keys = ["ts", "user", "model", "provider", "task",
+                    "prompt_tokens", "completion_tokens", "total_tokens",
+                    "latency_s", "cost_usd"]
+            return [dict(zip(keys, r)) for r in cur.fetchall()]
+        with self._lock:
+            return [r for r in self._mem
+                    if start_ts <= r["ts"] <= end_ts
+                    and (user is None or r["user"] == user)]
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+
+# ============================================================================
 # 第五部分：网关主体
 # ============================================================================
 
@@ -965,6 +1173,9 @@ class LLMGateway:
         self._build_runtimes()
         self._remember_mtime()
 
+        # 用量持久化：文件落盘或进程内内存，热重载不重建（保留历史）
+        self._usage_store = UsageStore(self.cfg.usage_db)
+
         # 兼容原 OllamaLLM 的统计字段，避免上层读这些属性时报错
         self.call_count = 0
         self.total_time = 0.0
@@ -976,6 +1187,10 @@ class LLMGateway:
                   f"{list(self._runtimes)}")
             print(f"[Gateway] 默认链: {self.cfg.default_chain} | "
                   f"路由任务: {list(self.cfg.routing)}")
+            if self.cfg.usage_db:
+                print(f"[Gateway] Token 用量持久化已开启 -> {self.cfg.usage_db}")
+            else:
+                print("[Gateway] Token 用量仅进程内累计（未配置 usage_db，重启即丢）")
 
     # -- 初始化与热重载 ----------------------------------------------------
     def _build_runtimes(self) -> None:
@@ -1120,17 +1335,20 @@ class LLMGateway:
 
     # -- 统一出口：非流式 ---------------------------------------------------
     def chat(self, system_prompt: str, user_prompt: str,
-             task: str = "default", **_ignored) -> str:
+             task: str = "default", user: str = "anonymous",
+             **_ignored) -> str:
         """
         与原 `BaseLLM.chat` 完全同签名，可直接替换 OllamaLLM。
 
         `task` 是新增的可选参数，用来启用多模型路由；
         不传就走 default_chain，因此**老代码零改动**。
+        `user` 把 token 用量归因到具体用户，支撑「查自己历史用量」。
         """
-        return self.chat_detailed(system_prompt, user_prompt, task).text
+        return self.chat_detailed(system_prompt, user_prompt, task, user).text
 
     def chat_detailed(self, system_prompt: str, user_prompt: str,
-                      task: str = "default") -> LLMResponse:
+                      task: str = "default",
+                      user: str = "anonymous") -> LLMResponse:
         """和 chat 相同，但返回包含 token 用量与耗时的完整结果"""
         self.maybe_reload()
         chain = self.resolve_chain(task)
@@ -1174,9 +1392,20 @@ class LLMGateway:
                 self._global_tpm.try_acquire(real - est)
                 rt.tpm_bucket.try_acquire(real - est)
 
-            self.cost.record(name, rt.cfg, resp)
+            cost = self.cost.record(name, rt.cfg, resp)
             self.call_count += 1
             self.total_time += time.time() - started
+            # 持久化用量（落盘或内存），支撑「按用户/按时间查历史」
+            self._usage_store.record(
+                user=user, model=name, provider=rt.cfg.provider, task=task,
+                prompt_tokens=resp.prompt_tokens,
+                completion_tokens=resp.completion_tokens,
+                latency_s=resp.latency, cost_usd=cost)
+            if self._verbose:
+                print(f"[Gateway] ✓ {name} | user={user} task={task} | "
+                      f"tokens: prompt={resp.prompt_tokens} "
+                      f"completion={resp.completion_tokens} "
+                      f"total={resp.total_tokens} | {resp.latency:.2f}s")
             return resp
 
         # 全链失败 —— 要么降级，要么抛异常，绝不静默返回空串
@@ -1190,7 +1419,8 @@ class LLMGateway:
 
     # -- 统一出口：流式 -----------------------------------------------------
     def stream_chat(self, system_prompt: str, user_prompt: str,
-                    task: str = "default") -> Iterator[str]:
+                    task: str = "default",
+                    user: str = "anonymous") -> Iterator[str]:
         """
         流式输出。和非流式共用同一套路由 / 限流 / 熔断逻辑，
         真正做到「一个出口，按需切换」。
@@ -1218,7 +1448,11 @@ class LLMGateway:
                 errors.append(reason)
                 continue
 
+            # 注意：started 是「是否已吐字」的布尔标志，不是时间戳。
+            # 计时必须另用 t0，否则 time.time() - started 会把 True 当 1 秒减，
+            # 结果把一个绝对时间戳写进 latency（曾经踩过这个坑）。
             started = False
+            t0 = time.time()
             out_chars = 0
             try:
                 for piece in rt.provider.stream(system_prompt, user_prompt):
@@ -1237,11 +1471,20 @@ class LLMGateway:
             rt.breaker.on_success()
             # 流式下 Ollama 的 usage 分散在末帧，这里用估算值记账，
             # 保证成本统计不因为走流式就出现黑洞
-            self.cost.record(name, rt.cfg, LLMResponse(
+            _comp_est = _estimate_tokens("x" * out_chars)
+            cost = self.cost.record(name, rt.cfg, LLMResponse(
                 text="", prompt_tokens=est,
-                completion_tokens=_estimate_tokens("x" * out_chars),
+                completion_tokens=_comp_est,
                 model=rt.cfg.model, provider=rt.cfg.provider))
+            self._usage_store.record(
+                user=user, model=name, provider=rt.cfg.provider, task=task,
+                prompt_tokens=est, completion_tokens=_comp_est,
+                latency_s=time.time() - t0, cost_usd=cost)
             self.call_count += 1
+            if self._verbose:
+                print(f"[Gateway] ✓ {name} (stream) | user={user} task={task} | "
+                      f"tokens(est): prompt={est} "
+                      f"completion={_comp_est} total={est + _comp_est}")
             return
 
         if self.cfg.degraded_reply:
@@ -1273,9 +1516,35 @@ class LLMGateway:
             "default_chain": default_chain,
             "pool": self.pool.stats(),
             "usage": self.cost.snapshot(),
+            "usage_db": self.cfg.usage_db or "",
+            "usage_persisted": bool(self.cfg.usage_db),
             "global_rpm": self._global_rpm.snapshot(),
             "global_tpm": self._global_tpm.snapshot(),
         }
+
+    # -- 用量查询：让「用户查自己历史 token」成为可能 ----------------------
+    def user_usage(self, user: str) -> Dict[str, Any]:
+        """某用户累计用量（无则全 0）。user 默认 'anonymous'。"""
+        return self._usage_store.user_usage(user)
+
+    def usage_log(self, user: str = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        最近用量明细。
+
+        - user=None（管理员视角）→ 全部用户
+        - user='alice'          → 只该用户
+        - limit                  → 返回条数上限
+        """
+        return self._usage_store.usage_log(user, limit)
+
+    def usage_range(self, start_ts: float, end_ts: float,
+                    user: str = None) -> List[Dict[str, Any]]:
+        """某时间区间内的用量明细（如「这个月我烧了多少 token」）"""
+        return self._usage_store.usage_range(start_ts, end_ts, user)
+
+    def top_users(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """全用户 token 排行（管理后台看板用）"""
+        return self._usage_store.top_users(limit)
 
     def health(self) -> Dict[str, str]:
         """各模型熔断状态速览：closed=健康 / open=已隔离"""

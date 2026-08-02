@@ -373,6 +373,92 @@ def test_global_quota_once():
 
 
 # ---------------------------------------------------------------------------
+def test_usage_persistence():
+    """Token 用量持久化 + 按用户查询（不依赖 Ollama，纯本地 SQLite 验证）"""
+    section("11. Token 用量持久化 + 按用户查询")
+    tmp = tempfile.gettempdir()
+    db = os.path.join(tmp, f"_test_usage_{int(time.time() * 1000)}.db")
+    if os.path.exists(db):
+        os.remove(db)
+    try:
+        # 11.1 落盘 + 重启可查 + 按用户隔离
+        store = G.UsageStore(db)
+        store.record("alice", "qwen2.5:1.5b", "ollama", "grade", 10, 20, 0.3, 0.0001)
+        store.record("alice", "qwen2:7b", "ollama", "generate", 30, 50, 0.8, 0.0005)
+        store.record("bob", "qwen2:7b", "ollama", "generate", 25, 40, 0.7, 0.0004)
+        ua = store.user_usage("alice")
+        check("按用户聚合(alice=2次/110tok)",
+              ua["calls"] == 2 and ua["total_tokens"] == 110, str(ua))
+        ub = store.user_usage("bob")
+        check("按用户隔离(bob 不含 alice)", ub["calls"] == 1, str(ub))
+        store2 = G.UsageStore(db)  # 模拟进程重启
+        check("重启后仍可查历史", store2.user_usage("alice")["calls"] == 2)
+
+        # 11.2 明细 + 时间区间
+        now = time.time()
+        store.record("carol", "qwen2:7b", "ollama", "generate", 5, 5, 0.1, 0.0001)
+        log = store.usage_log(user="alice")
+        check("usage_log 返回用户明细", len(log) == 2 and "total_tokens" in log[0],
+              f"len={len(log)}")
+        rng = store.usage_range(now - 1, now + 1)
+        check("usage_range 按时间筛选", len(rng) >= 1, f"hits={len(rng)}")
+
+        # 11.3 内存模式（未配置 usage_db）也能聚合但不落盘
+        mem = G.UsageStore("")
+        mem.record("x", "m", "p", "t", 1, 2, 0.1, 0.0)
+        check("内存模式可聚合", mem.user_usage("x")["calls"] == 1)
+
+        # 11.4 Gateway 整合：chat 写入 user
+        gw = G.LLMGateway(config_path="", verbose=False)
+        gw._usage_store = G.UsageStore(db)
+
+        def fake_call(rt, sp, up):
+            return G.LLMResponse(text="ok", prompt_tokens=12, completion_tokens=8,
+                                 model=rt.cfg.model, provider=rt.cfg.provider,
+                                 latency=0.2)
+
+        gw._call_one = fake_call
+        try:
+            gw.chat_detailed("你是助手", "hi", task="generate", user="dave")
+            ud = gw.user_usage("dave")
+            check("gateway.chat_detailed 写入 user",
+                  ud["calls"] == 1 and ud["total_tokens"] == 20, str(ud))
+        finally:
+            gw.close()
+
+        # 11.5 配置 usage_db 后指标标记持久化
+        gw2 = G.LLMGateway(config_path="", verbose=False)
+        gw2.cfg.usage_db = db
+        gw2._usage_store = G.UsageStore(db)
+        check("配置 usage_db 后 usage_persisted=True",
+              gw2.metrics()["usage_persisted"] is True)
+        gw2.close()
+
+        # 11.6 全用户排行（后台看板数据源）
+        tops = store.top_users(10)
+        names = [t["user"] for t in tops]
+        check("top_users 按 token 降序",
+              names and tops == sorted(tops, key=lambda x: x["total_tokens"],
+                                       reverse=True),
+              str(names))
+        alice_row = next((t for t in tops if t["user"] == "alice"), None)
+        check("top_users 聚合值正确(alice=2次/110tok)",
+              alice_row is not None and alice_row["calls"] == 2
+              and alice_row["total_tokens"] == 110, str(alice_row))
+
+        # 11.7 latency 防御：把时间戳误当耗时传进来，必须被拦成 0
+        store.record("eve", "m", "p", "t", 1, 1, time.time(), 0.0)
+        eve_log = store.usage_log("eve", 1)
+        check("异常 latency 被清零（防时间戳污染）",
+              eve_log and eve_log[0]["latency_s"] == 0.0, str(eve_log))
+    finally:
+        try:
+            os.remove(db)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 def main():
     print("=" * 74)
     print("LLM Gateway 端到端验证")
@@ -390,6 +476,7 @@ def main():
         test_routing(gw)
         test_hot_reload()
         test_global_quota_once()
+        test_usage_persistence()
 
         section("最终指标快照")
         m = gw.metrics()
