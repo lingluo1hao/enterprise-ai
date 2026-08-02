@@ -6,7 +6,7 @@
 ![Ollama](https://img.shields.io/badge/Ollama-qwen2:7b-000000?labelColor=555555&style=flat-square&logo=ollama&logoColor=white)
 ![LLM Gateway](https://img.shields.io/badge/LLM_Gateway-Multi--Model_Routing-FF6F61?labelColor=555555&style=flat-square)
 ![Flask](https://img.shields.io/badge/Flask-Web-000000?labelColor=555555&style=flat-square&logo=flask&logoColor=white)
-![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector-FF6F61?labelColor=555555&style=flat-square&logoColor=white)
+![Milvus](https://img.shields.io/badge/Milvus-Vector-FF6F61?labelColor=555555&style=flat-square&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-Cache-DC382D?labelColor=555555&style=flat-square&logo=redis&logoColor=white)
 ![MySQL](https://img.shields.io/badge/MySQL-Memory-4479A1?labelColor=555555&style=flat-square&logo=mysql&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-FastMCP-9A7BFF?labelColor=555555&style=flat-square&logoColor=white)
@@ -20,11 +20,11 @@
 
 本项目是一个面向企业文档的智能问答系统，能够对 PDF 文档进行向量化存储，并通过自然语言提问快速返回准确答案。核心已从 LangChain 迁移至 **LangGraph StateGraph**，实现了精细条件分支、多轮检索反馈循环、多智能体协作和多轮对话。
 
-后端使用本地部署的 **Ollama** 大模型进行推理，数据存储在 **ChromaDB** 向量数据库中，支持 **Redis 两级智能缓存**加速重复问题，并通过 **MySQL 多层记忆**实现对话历史持久化和任务断点重续。系统同时提供了命令行交互界面和 Web 图形界面。
+后端使用本地部署的 **Ollama** 大模型进行推理，向量库默认使用虚拟机上的 **Milvus** standalone（ChromaDB 作为不可用时的自动回退），支持 **Redis 两级智能缓存**加速重复问题，并通过 **MySQL 多层记忆**实现对话历史持久化和任务断点重续。系统同时提供了命令行交互界面和 Web 图形界面。
 
 ## 核心特性
 
-- **真实环境，无 Mock**：直接连接本地 ChromaDB 向量数据库与 Ollama 大模型。
+- **真实环境，无 Mock**：直接连接 Milvus 向量库（ChromaDB 兜底）与 Ollama 大模型。
 - **企业级 LLM 网关（LLM Gateway）**：所有 LLM 调用经统一网关出口，支持多模型路由（小模型接管分类/打分/改写/压缩等高频任务，大模型负责生成/规划）、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载（改 yaml 不重启）。业务代码 16 个调用点零改动接入，可一键回退单模型直连。
 - **LangGraph 状态机驱动**：显式 StateGraph 替代手写 ReAct 循环，14 个节点 + 条件边精细路由。
 - **三路智能分支**：简单查询走「多轮检索」、复杂问题走「多智能体协作」、闲聊直接回答。
@@ -73,6 +73,8 @@ enterprise-ai/
 ├── screenshots/            # 项目截图
 ├── .env                    # 环境变量（MySQL/Redis/Ollama 密码等敏感配置，不提交 Git）
 ├── .env.example            # 环境变量模板（可提交 Git，部署时复制为 .env）
+├── deploy/                 # 【部署】docker-compose 编排（MySQL / Milvus standalone 等）
+├── UPGRADE_PLAN_MEMORY_KB.md # 【记忆系统升级】分阶段改造方案（含 P0 落地记录与验证）
 ├── .gitignore              # Git 排除规则（含 .env / chroma_db/ / logs/）
 └── README.md               # 本文件
 ```
@@ -83,14 +85,14 @@ enterprise-ai/
 |------|------|
 | `langgraph_rag_agent.py` | **核心引擎**，含 LangGraphRAGApp 类、AgentState 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。 |
 | `advanced_rag_agent.py` | 基础组件库，提供 OllamaLLM、VectorStoreManager、CacheManager、AccessControlFilter、DocSearchSkill 等可复用类。同时保留原 LangChain 版 RAGOrchestrator 实现（兼容旧模式）。 |
-| `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 3 张表：`chat_messages`（对话历史）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）。支持连接池、线程安全、自动降级。 |
+| `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 4 张表：`chat_messages`（对话历史，按 `user_id`+`session_id` 隔离）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）、`chat_summaries`（对话摘要落库，进程重启不丢）。`save_message`/`save_checkpoint` 使用单条 SQL 原子取号（修复并发撞号）。支持连接池、线程安全、自动降级。 |
 | `prompt_manager.py` | **提示词工程管理模块**，含 PromptManager（11 个提示词模板的 CRUD + 动态加载）和 AuthManager（管理员 salt:sha256 密码认证）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务。 |
 | `audit_logger.py` | **审计日志模块**，JSON Lines 结构化日志。覆盖 login/logout/query/query_stream/save_prompt/delete_prompt/import_defaults 7 类操作，字段含 timestamp/ip/username/action/target/result/detail。自动轮转（500KB/3 备份）。 |
 | `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。 |
 | `llm_gateway.py` | **企业级 LLM 网关**，统一所有 LLM 调用的出口。内含多模型路由、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载。纯标准库实现，零第三方依赖。 |
 | `llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
-| `docs/` | 存放企业 PDF 文档，首次运行时会自动构建向量索引到 `chroma_db/`。 |
-| `chroma_db/` | ChromaDB 持久化目录，保存文档切片与向量。 |
+| `docs/` | 存放企业 PDF 文档，首次运行时会自动构建向量索引（默认写入 Milvus，ChromaDB 兜底）。 |
+| `chroma_db/` | ChromaDB 持久化目录（仅在 `VECTOR_BACKEND=chroma` 或 Milvus 不可用时使用），保存文档切片与向量。 |
 
 ## 技术架构
 
@@ -148,7 +150,7 @@ LLM Gateway（llm_gateway.yaml：多模型路由 / 限流 / 熔断 / 连接池 /
     └─ deepseek-chat / qwen-plus    ← 云端备选，主模型挂了顶上
     ▼
 Ollama（192.168.200.128:11434 / qwen2:7b 等）
-ChromaDB（本地 ./chroma_db）
+Milvus（192.168.200.128:19530，默认向量库；ChromaDB 兜底）
 Redis（192.168.200.128:6379）
 MySQL（192.168.200.128:3306 / rag_agent）
 ```
@@ -160,7 +162,7 @@ MySQL（192.168.200.128:3306 / rag_agent）
 | `load_history` | 加载当前会话的对话历史 |
 | `classify` | 问题分类（simple/complex/chitchat）+ 上下文消解（追问补全） |
 | `query_rewrite` | 查询改写：第 1 轮正常改写，后续轮换角度改写 |
-| `retrieve` | ChromaDB 向量检索 + 权限过滤 |
+| `retrieve` | 向量库检索（Milvus/Chroma）+ 权限过滤 |
 | `grade_docs` | LLM 批量评分文档相关性 |
 | `rerank_mmr` | MMR 重排序（过滤不相关 + 去冗余） |
 | `generate_simple` | 基于检索文档生成答案 |
@@ -194,24 +196,50 @@ source venv/bin/activate
 
 ### 2. 安装 Python 依赖
 
+所有第三方依赖均可一键安装。推荐先激活虚拟环境（见步骤 1），再执行下面整段命令（当前运行**必需**的全部依赖）：
+
 ```bash
-# 核心依赖（LangChain + LangGraph + ChromaDB + Ollama + Redis + MySQL）
-pip install langchain langchain-community langgraph chromadb redis pymysql dbutils
-
-# Web 服务（Flask + CORS 跨域支持）
-pip install flask flask-cors
-
-# 文档处理 + Embedding 模型
-pip install pypdf sentence-transformers
-
-# MCP 生态（mcp_server.py 依赖 fastmcp，mcp_client_example.py 依赖 mcp）
-pip install fastmcp mcp
-
-# 配置解析（llm_gateway.yaml 需要 pyyaml 才能加载你改的路由/限流；缺失则回退内置默认值）
-pip install pyyaml
+pip install langchain langchain-community langgraph \
+            chromadb "pymilvus~=2.5.0" redis pymysql dbutils \
+            flask flask-cors \
+            pypdf sentence-transformers \
+            fastmcp mcp \
+            pyyaml
 ```
 
+> **Milvus 客户端版本**：服务端为 Milvus **v2.5.0**，`pymilvus` 必须锁定 **2.5.x**（命令中已写 `pymilvus~=2.5.0`），**勿用 3.x**——3.0 把 BM25 函数类 `FunctionSchema` 改名为 `Function`，且与 2.5 服务端有兼容风险。混合检索（sparse BM25 + dense 向量 + RRF 融合）依赖 2.5.x 的 `Function` / `FunctionType.BM25` API。
+>
+> **Embedding 依赖版本**：`sentence-transformers` 建议使用 **<4**（实测 `5.6.0` 在 Windows + torch 2.13 下构造 `SentenceTransformerEmbeddings` 时**必触发 Segmentation fault**，已降级到 `3.3.1` 稳定）；`numpy` 须保持 **2.x**（torch 2.13 是针对 numpy 2.x 编译的，强降 numpy 1.x 会破坏 torch ABI 反而 segfault）。
+>
+> 上面的命令可整段复制一次性执行。下表列出每个包的用途与必需性，方便按需裁剪。外部服务（Ollama / Redis / MySQL）的安装见 §3–§6，不在此列。
+
+| 分类 | 包名 | 用途 | 必需性 |
+|------|------|------|--------|
+| 核心 RAG | `langchain` / `langchain-community` | 向量检索、文档加载器等 LangChain 基础组件 | 必需 |
+| 核心 RAG | `langgraph` | LangGraph 状态图引擎（核心对话 / 多智能体流程） | 必需 |
+| 向量库 | `pymilvus` | **默认向量后端 Milvus**（standalone，192.168.200.128:19530）的连接客户端 | 必需（默认后端） |
+| 向量库 | `chromadb` | 本地向量库持久化，**Milvus 不可用时的自动回退后端** | 必需（兜底） |
+| 缓存 | `redis` + `dbutils` | Redis 连接池与两级问答缓存 | 必需（开启缓存时） |
+| 持久化 | `pymysql` + `dbutils` | MySQL 连接池（对话历史 / 断点 / 任务队列） | 必需（开启断点重续时） |
+| Web | `flask` + `flask-cors` | Web 服务与跨域支持 | 必需（使用 Web 时） |
+| 文档处理 | `pypdf` | PDF 文本抽取 | 必需（使用 `docs/` 时） |
+| Embedding | `sentence-transformers` | BGE 等 embedding 模型（自动带 `numpy` 等传递依赖） | 必需 |
+| MCP | `fastmcp` | MCP Server 把 Skill 暴露为 Tools / Resource / Prompt | 可选（使用 MCP 时） |
+| MCP | `mcp` | MCP 客户端 SDK（外部调用测试） | 可选（使用 MCP 时） |
+| 配置 | `pyyaml` | 解析 `llm_gateway.yaml`（缺失则网关回退内置默认） | 推荐 |
+
 > **零依赖说明**：企业级 LLM 网关（`llm_gateway.py`，统一多模型路由 / 限流 / 熔断 / 连接池 / Token 计费 / 热重载）的核心逻辑完全基于 **Python 标准库**实现；但读取你编辑的 `llm_gateway.yaml` 配置需要 `pyyaml`（轻量、已并入上方安装命令）。**若未安装 `pyyaml`，网关会自动回退到内置默认配置，你在 `llm_gateway.yaml` 里的路由/限流/熔断改动将不生效**。MCP 改造所需的 `fastmcp` / `mcp` 也已合并进上方命令；若暂时不用 MCP 或网关，跳过对应部分不影响核心问答功能。
+
+#### 后续阶段（P2 摄取管线）可选依赖
+
+P1 混合检索（sparse BM25 + dense 向量 + RRF 融合）**已在代码中落地**：基于 Milvus 原生 BM25 函数（`Function` / `FunctionType.BM25`）自动从 `content` 生成稀疏向量，无需 `rank_bm25` / `jieba`。如需独立的 Python BM25 做二次重排序，可再装这两个包。
+
+```bash
+# P2 摄取管线：多格式文档解析（PDF / Word / HTML 等）
+pip install pymupdf unstructured
+```
+
+**关于 Milvus（`pymilvus`）**：向量库服务端 **Milvus standalone 已在虚拟机 `192.168.200.128` 部署完成**（端口 19530，编排见 `deploy/docker-compose-milvus.yaml`，已端到端验证可用）。应用代码已在 P3 改造中完成接入并**默认 `milvus`**；`VectorStoreManager` 统一封装 Milvus / ChromaDB 两种后端，由 `VECTOR_BACKEND` 切换，Milvus 不可用时自动回退 ChromaDB 并打印警告。`pymilvus` 已是**必需依赖**，版本须锁定 **2.5.x**（见上方说明）。混合检索（Hybrid Search）默认开启，可用 `HYBRID_SEARCH=false` 关闭。验收与回滚说明见 `UPGRADE_PLAN_MEMORY_KB.md` §6。
 
 ### 3. 搭建 Ollama 服务
 
@@ -308,7 +336,7 @@ mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"
 
 ### 6. 准备文档
 
-将企业 PDF 文档放入 `docs/` 目录下。首次运行时会自动读取并构建 ChromaDB 向量索引。
+将企业 PDF 文档放入 `docs/` 目录下。首次运行时会自动读取并构建向量索引（默认写入 Milvus，ChromaDB 兜底）。
 
 ### 7. 修改配置
 
@@ -338,6 +366,12 @@ REDIS_HOST="192.168.200.128"
 REDIS_PORT="6379"
 REDIS_PASSWORD="你的 Redis 密码"
 REDIS_DB="0"
+
+# --- 向量库后端（P3：Milvus / ChromaDB 双后端）---
+VECTOR_BACKEND="milvus"                       # milvus=默认向量库；chroma=本地兜底/回滚
+MILVUS_URI="http://192.168.200.128:19530"     # Milvus standalone 地址（与 deploy 编排一致）
+MILVUS_COLLECTION="rag_docs"                 # 文档向量集合名
+HYBRID_SEARCH="true"                          # 混合检索：sparse BM25 + dense 向量 + RRF 融合；false=仅 dense
 ```
 
 > 系统启动时自动从 `.env` 加载配置，`os.getenv()` 读取。所有配置项都有合理默认值，`.env` 缺失也不影响启动，但请务必填写真实密码以确保各服务正常连接。
@@ -380,7 +414,7 @@ python advanced_rag_agent.py "问题" --admin --fast
 
 ### 方式三：Web 界面（适合非技术人员）
 
-> 注意：在 Windows 上请使用 PowerShell 或 CMD 启动，Git Bash 中 ChromaDB 底层依赖可能异常退出。
+> 注意：在 Windows 上请使用 PowerShell 或 CMD 启动（Milvus 走 HTTP/gRPC 与 Shell 无关；若回退到 ChromaDB 本地模式，Git Bash 下其底层依赖可能异常退出）。
 
 ```bash
 # 默认使用 LangGraph 引擎，默认端口 8080
@@ -695,7 +729,7 @@ DOC_ACCESS_RULES = {
 | 普通用户（user） | 仅公开文档（如 Jimi IoT 个人定位终端通讯协议） | 聊天页 `/` |
 | 特权用户（admin） | 全部文档（含 JM-S509 指令表） | 管理后台 `/admin` → 在线问答 |
 
-权限过滤发生在 ChromaDB 检索之后：普通用户检索到受限文档片段时会被自动丢弃。同时 Redis 缓存也按角色隔离，避免 admin 的完整答案通过缓存泄漏给普通用户。
+权限过滤：Milvus 后端在检索时通过 `expr` **下推** `access_level`（先过滤再算距离），ChromaDB 后端则在检索后过滤；两种后端最终都再由 `AccessControlFilter` 兜底。普通用户检索到受限文档片段时会被自动丢弃。同时 Redis 缓存也按角色隔离，避免 admin 的完整答案通过缓存泄漏给普通用户。
 
 ## 缓存机制
 
@@ -704,11 +738,11 @@ DOC_ACCESS_RULES = {
 1. **精确匹配**：对问题做标准化处理后计算 SHA256，完全相同的提问直接返回（<1ms）。
 2. **语义匹配**：将问题转为 BGE embedding，扫描 Redis 中历史缓存，余弦相似度大于阈值（默认 0.80）即命中。
 
-语义命中时会自动补写一条精确匹配键，方便下次更快命中。缓存键包含角色标识，确保权限隔离。
+语义命中时会自动补写一条精确匹配键，方便下次更快命中。缓存键包含角色标识，确保权限隔离。此外，命中缓存时会自动将本轮问答补录进对话历史（修复此前「缓存命中导致历史空洞」的缺陷，详见 UPGRADE_PLAN_MEMORY_KB.md §3.7.2）。
 
 ## 三层记忆架构
 
-系统采用三层记忆架构，解决服务重启后对话丢失和任务中断无法恢复的问题：
+系统采用三层记忆架构，解决服务重启后对话丢失和任务中断无法恢复的问题。所有持久化记录均带 `user_id`（无身份上下文时落 `anonymous`），实现多用户数据隔离，避免串户。
 
 | 层级 | 存储介质 | 速度 | 持久性 | 用途 |
 |------|----------|------|--------|------|
@@ -723,6 +757,7 @@ DOC_ACCESS_RULES = {
 | `chat_messages` | 对话历史持久化，每条 user/assistant 消息一行，按 `session_id` 隔离不同会话 |
 | `task_checkpoints` | 断点快照，每个 LangGraph 节点执行后自动保存 `state` 的 JSON 序列化 |
 | `task_queue` | 任务队列，记录任务生命周期：`pending → running → completed/failed/interrupted` |
+| `chat_summaries` | 对话摘要表（P0 新增）：长对话压缩后的摘要落库，重启后仍可回放；`covers_to` 标记摘要覆盖到的消息序号、`msg_count` 记录覆盖条数 |
 
 ### 断点重续流程
 
@@ -751,10 +786,20 @@ DOC_ACCESS_RULES = {
 
 | 接口 | 方法 | 作用 |
 |------|------|------|
-| `/api/tasks/unfinished?session_id=web_session` | GET | 查询指定会话的未完成任务列表 |
+| `/api/tasks/unfinished?session_id=web:{role}` | GET | 查询指定角色会话的未完成任务列表（role 为 `user`/`admin`，实际 session_id 形如 `web:user`、`web:admin`） |
 | `/api/tasks/resume` | POST | 从断点恢复执行（body: `{"task_id": "xxx"}`） |
 
 > **容错策略**：如果 MySQL 不可用，系统自动降级为内存模式（与旧版行为一致），打印警告但不阻断服务。所有数据库操作都有 try-except 兜底。
+
+### P0 记忆系统止血改造要点（2026-08-02）
+
+针对三层记忆「各自为政」导致的多类数据正确性问题，本次对 `memory_store.py` / `langgraph_rag_agent.py` / `rag_web_server.py` 做了止血改造（详细方案与验证见 [UPGRADE_PLAN_MEMORY_KB.md](UPGRADE_PLAN_MEMORY_KB.md) §3.7）：
+
+- **身份贯通（user_id）**：`chat_messages`/`task_checkpoints`/`task_queue` 三表新增 `user_id` 列与复合索引；存量库通过 `_create_tables` 内联的幂等 `ALTER` 自动补齐；`get_unfinished_tasks` 等接口按 `user_id` 过滤，杜绝任务/历史串户。
+- **原子取号**：`save_message`/`save_checkpoint` 改用单条 `INSERT ... SELECT COALESCE(MAX(...))+1` 取号，修复高并发下 `MAX()+1` 撞号问题。
+- **摘要落库**：新增 `chat_summaries` 表，`load_messages` 优先带最近摘要再拼接原文，长对话压缩结果进程重启不丢。
+- **缓存命中历史补录**：`langgraph_rag_agent.py` 新增 `_append_history`，缓存命中不再直接 return，而是先补录本轮问答，修复对话历史空洞。
+- **会话按角色派生**：`rag_web_server.py` 新增 `_derive_session_id(role)`，将以 `web_session` 写死的会话改为 `web:user` / `web:admin` 分桶，前端 JS 同步。
 
 ## 性能提示
 
@@ -775,7 +820,7 @@ DOC_ACCESS_RULES = {
 
 ### 2. 启动 Web 服务后无法访问
 
-- **在 Windows 上必须用 PowerShell 或 CMD 启动**，Git Bash 中 ChromaDB 底层依赖会异常退出
+- **在 Windows 上必须用 PowerShell 或 CMD 启动**（回退到 ChromaDB 本地模式时，Git Bash 中其底层依赖会异常退出；Milvus 走网络不受此限）
 - 确认端口未被占用：`netstat -ano | findstr :8080`
 
 ### 3. 连接 Ollama 失败
@@ -801,7 +846,7 @@ DOC_ACCESS_RULES = {
 - MySQL 不可用不影响核心问答功能，系统会自动降级为内存模式
 - 断点恢复仅在 LangGraph 引擎模式下可用（`python rag_web_server.py` 默认即为 LangGraph）
 
-### 6. ChromaDB 向量库未构建
+### 6. 向量库未构建（Milvus / ChromaDB）
 
 - 首次运行会自动扫描 `docs/` 目录并构建索引，耐心等待即可
 - 如果 `docs/` 为空，系统会提示找不到文档
@@ -814,8 +859,12 @@ DOC_ACCESS_RULES = {
 
 ### 8. 运行时 segfault / 闪退
 
-- 换用 PowerShell 或 CMD 启动，不要用 Git Bash
-- 确保 Python 3.10 环境，部分依赖不兼容 Python 3.12+
+- **已代码级根治**：`advanced_rag_agent.py` 顶部（import torch 之前）已内置把 `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `NUMEXPR_NUM_THREADS` / `VECLIB_MAXIMUM_THREADS` 全部限制为 `1`，并关闭 `TOKENIZERS_PARALLELISM`。Windows + torch 2.13 多线程会触发 Segmentation fault，**加了这段后即可正常启动，无需手动设环境变量**。
+- 若仍崩，按以下顺序排查：
+  1. 检查 `sentence-transformers` 版本：必须是 **<4**（实测 `5.x` 在 Windows + torch 2.13 下构造 Embedding 必 segfault，降到 `3.3.1` 稳定）。
+  2. 检查 `numpy`：须为 **2.x**，**切勿降到 1.x**——torch 2.13 针对 numpy 2.x 编译，强降 numpy 会破坏 torch ABI 反而 segfault。
+  3. 确保运行在 **Python 3.10** 环境（本项目约定 `conda env: py310`）；部分依赖在 3.12+ 上有兼容问题。
+  4. 启动方式：推荐 PowerShell / CMD；回退到 ChromaDB 本地模式时 Git Bash 底层依赖可能异常退出（Milvus 走网络不受此限）。
 
 ### 9. LangGraph 模式 vs 旧版模式如何选择？
 

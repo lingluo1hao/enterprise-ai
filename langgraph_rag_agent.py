@@ -246,7 +246,7 @@ class LangGraphRAGApp:
 
         执行顺序：
         1. 连接 Ollama LLM（复用 advanced_rag_agent 的 OllamaLLM 类）
-        2. 加载 ChromaDB 向量数据库（复用 VectorStoreManager）
+        2. 加载向量数据库（复用 VectorStoreManager，默认 Milvus，Chroma 兜底）
         3. 初始化 Redis 缓存 + 内存对话历史存储
         4. 构建 LangGraph 状态图（注册节点 + 连线 + 条件边）
 
@@ -266,7 +266,8 @@ class LangGraphRAGApp:
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
 
         # 2. 向量数据库（复用现有 VectorStoreManager）
-        # VectorStoreManager 封装了 ChromaDB 的初始化、文档索引、向量检索。
+        # VectorStoreManager 封装了 Milvus / ChromaDB 的初始化、文档索引、向量检索，
+        # 后端由 VECTOR_BACKEND 决定（默认 milvus，不可用时回退 chroma）。
         # init_vector_store() 会扫描 docs/ 目录，首次运行时自动构建索引。
         print("\n[2/3] 加载向量数据库...")
         self.vector_db = VectorStoreManager.init_vector_store()
@@ -1294,8 +1295,9 @@ class LangGraphRAGApp:
         all_results = []
         seen = set()  # 去重集合：记录已经见过的文档内容摘要
         for q in queries:
-            # ChromaDB 相似度检索：返回 (Document, 距离分数) 的列表
-            results = self.vector_db.similarity_search_with_score(q, k=RETRIEVE_TOP_K)
+            # 向量库相似度检索（Chroma/Milvus 统一接口）：返回 (Document, 距离分数) 的列表
+            # filter_role 透传给 Milvus 后端做 access_level 权限下推；Chroma 仍由下方兜底过滤
+            results = self.vector_db.similarity_search_with_score(q, k=RETRIEVE_TOP_K, filter_role=role)
             # 根据用户角色过滤无权限文档
             results = AccessControlFilter.filter_results(results, role)
             for doc, score in results:

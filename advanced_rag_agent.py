@@ -40,7 +40,7 @@
   │       ▼                                                          │
   │  ┌──────────────────────────────┐                                │
   │  │ 查询重写 → 多跳检索 → 重排序   │  智能 RAG 内部流程              │
-  │  │     （ChromaDB 向量检索）      │                                │
+  │  │     （向量库检索：Milvus / Chroma） │                            │
   │  └──────────────────────────────┘                                │
   │             │                                                    │
   │             ▼                                                    │
@@ -110,6 +110,15 @@ _load_dotenv()
 
 # HF_ENDPOINT 指向国内镜像，加速 embedding 模型下载
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+# Windows + torch 多线程在部分 CPU 上会触发 Segmentation fault，
+# 必须在任何 torch/transformers 代码加载前把各类数值库线程数限制在 1。
+# （实测 py310 + torch 2.13 + sentence-transformers 在构造 Embedding 时必崩，
+#   限定 OMP/MKL/OpenBLAS 等线程数后稳定。用 setdefault 以保留用户显式覆盖能力。）
+for _t in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_t, "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # 屏蔽 LangChain 的弃用警告，让输出更干净
 import warnings
@@ -554,53 +563,265 @@ def create_llm(verbose: bool = True):
 
 class VectorStoreManager:
     """
-    向量数据库管理器 — 封装 ChromaDB 的初始化和检索
+    向量数据库管理器 —— 统一封装 ChromaDB / Milvus 两种后端（方案 P3）
 
-    如果 ./chroma_db 已存在则直接加载，否则从 docs/ 构建。
-    使用 BAAI/bge-small-zh-v1.5 作为 embedding 模型（中文优化）。
+    后端由环境变量 VECTOR_BACKEND 决定，默认 "milvus"：
+      - "milvus"：连接虚拟机 192.168.200.128 上的 Milvus standalone（默认向量库）
+      - "chroma"：本地嵌入式 ChromaDB（兜底 / 回滚，读路径完全一致）
+
+    Milvus 不可用时自动回退 ChromaDB 并打印醒目警告，保证服务不中断。
+    对外暴露与 Chroma 一致的接口 similarity_search_with_score(query, k)，
+    上层 Agent 代码无需感知后端差异。
     """
 
-    @staticmethod
-    def init_vector_store():
-        """
-        初始化 ChromaDB 向量数据库
-
-        返回: Chroma 实例，可用于 similarity_search
-        """
-        from langchain_chroma import Chroma
+    def __init__(self, backend: str = None):
+        self.backend = (backend or os.getenv("VECTOR_BACKEND", "milvus")).lower()
+        self.db = None            # Chroma 后端实例
+        self.client = None        # MilvusClient 实例
+        self.collection = os.getenv("MILVUS_COLLECTION", "rag_docs")
+        # 混合检索开关：sparse BM25 + dense 向量 + RRF 融合（方案 P1 核心）
+        self.hybrid = (os.getenv("HYBRID_SEARCH", "true").lower() != "false")
+        # embedding 函数与 Chroma 路径完全一致，保证向量空间统一
         from langchain_community.embeddings import SentenceTransformerEmbeddings
+        self._embed = SentenceTransformerEmbeddings(model_name=EMBED_MODEL)
 
-        # 加载 embedding 模型（首次会下载，之后从缓存加载）
-        print(f"[VectorStore] 加载 embedding 模型: {EMBED_MODEL}")
-        embedding = SentenceTransformerEmbeddings(model_name=EMBED_MODEL)
-
-        if os.path.exists(DB_PATH):
-            # 已有向量库，直接加载
-            print(f"[VectorStore] 加载已有向量数据库: {DB_PATH}")
-            db = Chroma(persist_directory=DB_PATH, embedding_function=embedding)
-
-            # 验证数据库是否有效
+        if self.backend == "milvus":
             try:
-                test_results = db.similarity_search("测试", k=1)
+                from pymilvus import MilvusClient
+                uri = os.getenv("MILVUS_URI", "http://192.168.200.128:19530")
+                print(f"[VectorStore] 连接 Milvus: {uri} (collection={self.collection})")
+                self.client = MilvusClient(uri=uri)
+                self._ensure_collection()
+                if self._milvus_count() == 0:
+                    print(f"[VectorStore] Milvus 集合为空，从 {DOC_FOLDER} 构建索引...")
+                    self._build_milvus()
+                else:
+                    print(f"[VectorStore] 加载已有 Milvus 集合（{self._milvus_count()} 条）")
+                try:
+                    self.client.load_collection(self.collection)
+                except Exception as e:
+                    print(f"[VectorStore] 提示: load_collection 跳过 ({e})")
+            except Exception as e:
+                print(f"[VectorStore] ⚠ Milvus 初始化失败: {e}")
+                print(f"[VectorStore] ⚠ 自动回退到 ChromaDB 兜底（VECTOR_BACKEND=chroma）")
+                self.backend = "chroma"
+
+        if self.backend == "chroma":
+            self.db = self._init_chroma()
+
+    # ------------------------------------------------------------------ #
+    # Chroma 后端
+    # ------------------------------------------------------------------ #
+    def _init_chroma(self):
+        from langchain_chroma import Chroma
+        if os.path.exists(DB_PATH):
+            print(f"[VectorStore] 加载已有向量数据库: {DB_PATH}")
+            db = Chroma(persist_directory=DB_PATH, embedding_function=self._embed)
+            try:
+                db.similarity_search("测试", k=1)
                 print(f"[VectorStore] 向量数据库正常，包含文档片段")
             except Exception as e:
                 print(f"[VectorStore] ⚠ 向量数据库可能损坏: {e}")
                 raise
-
             return db
         else:
-            # 首次运行，需要从 docs/ 构建
             print(f"[VectorStore] 首次运行，从 {DOC_FOLDER} 构建向量数据库...")
-            return VectorStoreManager._build_vector_store(embedding)
+            return self._build_chroma()
 
-    @staticmethod
-    def _build_vector_store(embedding):
-        """从 docs/ 目录构建向量数据库"""
+    def _build_chroma(self):
         from langchain_community.document_loaders import PyPDFLoader, TextLoader
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         from langchain_chroma import Chroma
+        raw_docs = self._load_raw_docs()
+        if not raw_docs:
+            raise Exception(f"{DOC_FOLDER} 文件夹内没有可识别文档！")
+        split_docs = self._split(raw_docs)
+        db = Chroma.from_documents(
+            documents=split_docs, embedding=self._embed, persist_directory=DB_PATH
+        )
+        print(f"[VectorStore] 向量数据库构建完成")
+        return db
 
-        # 1. 读取原始文档
+    # ------------------------------------------------------------------ #
+    # Milvus 后端
+    # ------------------------------------------------------------------ #
+    def _ensure_collection(self):
+        """集合不存在则按 dense + sparse(BM25) 混合 schema 创建并建立索引。
+
+        若已存在旧版集合（缺 sparse 字段），自动 drop 重建以启用混合检索。
+        """
+        from pymilvus import FieldSchema, CollectionSchema, DataType, Function, FunctionType
+        # 维度动态探测，避免硬编码与模型不符
+        dim = len(self._embed.embed_query("维度探测"))
+
+        # 兼容旧集合：缺少 sparse 字段则重建（BM25 混合检索需要 content 开启 analyzer）
+        if self.client.has_collection(self.collection):
+            try:
+                desc = self.client.describe_collection(self.collection)
+                existing = [f.get("name") for f in desc.get("fields", [])]
+                if "sparse" in existing:
+                    return
+                print(f"[VectorStore] 检测到旧版集合(无 sparse 字段)，重建以支持混合检索...")
+            except Exception:
+                pass
+            self.client.drop_collection(self.collection)
+
+        fields = [
+            # content 必须开启 analyzer（且中文分词），BM25 函数才能基于它生成 sparse 向量
+            FieldSchema("content", DataType.VARCHAR, max_length=8192,
+                        enable_analyzer=True, analyzer_params={"type": "chinese"}),
+            FieldSchema("chunk_id", DataType.VARCHAR, is_primary=True, max_length=64),
+            FieldSchema("dense", DataType.FLOAT_VECTOR, dim=dim),
+            # sparse 为 BM25 函数输出，插入时由 Milvus 根据 content 自动计算
+            FieldSchema("sparse", DataType.SPARSE_FLOAT_VECTOR, is_function_output=True),
+            FieldSchema("file_path", DataType.VARCHAR, max_length=512),
+            FieldSchema("file_name", DataType.VARCHAR, max_length=255),
+            FieldSchema("access_level", DataType.VARCHAR, max_length=16),
+            FieldSchema("chunk_index", DataType.INT64),
+            FieldSchema("user_id", DataType.VARCHAR, max_length=64),
+        ]
+        # BM25 函数：content -> sparse（Milvus 原生稀疏检索，中文已配置 analyzer）
+        bm25 = Function(
+            name="bm25",
+            input_field_names=["content"],
+            output_field_names=["sparse"],
+            function_type=FunctionType.BM25,
+        )
+        schema = CollectionSchema(fields, enable_dynamic_field=True, functions=[bm25])
+        self.client.create_collection(collection_name=self.collection, schema=schema)
+        index_params = self.client.prepare_index_params()
+        index_params.add_index(field_name="dense", index_type="AUTOINDEX", metric_type="COSINE")
+        index_params.add_index(field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="BM25")
+        self.client.create_index(self.collection, index_params)
+        print(f"[VectorStore] 已创建 Milvus 集合 {self.collection} (dim={dim}, hybrid={'on' if self.hybrid else 'off'})")
+
+    def _milvus_count(self) -> int:
+        try:
+            stats = self.client.get_collection_stats(self.collection)
+            if isinstance(stats, dict):
+                rc = stats.get("row_count", stats.get("num_entities"))
+                if rc is not None:
+                    return int(rc)
+        except Exception:
+            pass
+        return 0
+
+    def _build_milvus(self):
+        """从 docs/ 构建 Milvus 索引（upsert，幂等可重复执行）"""
+        import hashlib
+        from langchain_core.documents import Document
+        raw_docs = self._load_raw_docs()
+        if not raw_docs:
+            raise Exception(f"{DOC_FOLDER} 文件夹内没有可识别文档！")
+        split_docs = self._split(raw_docs)
+        print(f"  分片完成: {len(split_docs)} 个片段")
+
+        entities = []
+        for i, doc in enumerate(split_docs):
+            content = doc.page_content
+            src = doc.metadata.get("source", "")
+            cid = hashlib.md5((content + src).encode("utf-8")).hexdigest()
+            vec = self._embed.embed_documents([content])[0]
+            entities.append({
+                "chunk_id": cid,
+                "content": content[:8192],
+                "dense": vec,
+                "file_path": src,
+                "file_name": os.path.basename(src),
+                "access_level": doc.metadata.get("access_level", "public"),
+                "chunk_index": i,
+                "user_id": "anonymous",   # 知识库文档为全局可见
+            })
+        # 分批 upsert，避免单次包过大；主键相同自动覆盖（幂等）
+        batch = 200
+        for s in range(0, len(entities), batch):
+            self.client.upsert(self.collection, entities[s:s + batch])
+        self.client.flush(self.collection)
+        print(f"[VectorStore] Milvus 索引构建完成，共 {len(entities)} 条")
+
+    def _parse_hits(self, hits):
+        """把 Milvus 命中列表转成 (id, Document, distance) 三元组列表"""
+        from langchain_core.documents import Document
+        out = []
+        for hit in hits:
+            entity = getattr(hit, "entity", {}) or {}
+            meta = {
+                "source": entity.get("file_path", ""),
+                "file_name": entity.get("file_name", ""),
+                "access_level": entity.get("access_level", "public"),
+                "chunk_index": entity.get("chunk_index", 0),
+            }
+            out.append((
+                hit.id,
+                Document(page_content=entity.get("content", ""), metadata=meta),
+                float(getattr(hit, "distance", 0.0)),
+            ))
+        return out
+
+    @staticmethod
+    def _rrf_fuse(dense_list, sparse_list, k, rrf_k=60):
+        """Reciprocal Rank Fusion：把 dense 与 sparse 两路召回按排名融合。
+
+        fused 分数越高越相关；返回按相关性降序排列的 (Document, distance)，
+        distance 用 -fused 表示（与 COSINE「越小越相似」语义一致，便于下游直接取前 k）。
+        """
+        score = {}
+        docs = {}
+        for rank, (hid, doc, _) in enumerate(dense_list):
+            score[hid] = score.get(hid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            docs.setdefault(hid, doc)
+        for rank, (hid, doc, _) in enumerate(sparse_list):
+            score[hid] = score.get(hid, 0.0) + 1.0 / (rrf_k + rank + 1)
+            docs.setdefault(hid, doc)
+        ranked = sorted(score.keys(), key=lambda h: score[h], reverse=True)
+        return [(docs[h], -score[h]) for h in ranked[:k]]
+
+    def _milvus_search(self, query, k, filter_role, user_id):
+        """混合检索：dense 向量 + sparse BM25 双路召回，RRF 融合。
+
+        - access_level 权限下推（expr 先于距离计算过滤）：admin 不过滤；
+          user 只看 public 或自己上传的。
+        - HYBRID_SEARCH=false 时仅做 dense。
+        """
+        # 权限下推
+        expr = ""
+        if filter_role != ROLE_ADMIN:
+            expr = f'(access_level == "public") or (user_id == "{user_id}")'
+        fields = ["content", "file_name", "file_path", "access_level", "chunk_index"]
+        top = max(k * 2, 8)  # 召回更多候选供 RRF 融合
+
+        # 1) dense 向量召回
+        qvec = self._embed.embed_query(query)
+        dense_hits = self.client.search(
+            collection_name=self.collection,
+            data=[qvec], anns_field="dense", limit=top,
+            filter=expr, output_fields=fields,
+        )[0]
+        dense_list = self._parse_hits(dense_hits)
+
+        if not self.hybrid:
+            dense_list.sort(key=lambda x: x[2])
+            return [(doc, dist) for (_, doc, dist) in dense_list[:k]]
+
+        # 2) sparse BM25 召回（失败则回退纯 dense）
+        try:
+            sparse_hits = self.client.search(
+                collection_name=self.collection,
+                data=[query], anns_field="sparse", limit=top,
+                filter=expr, output_fields=fields,
+            )[0]
+            sparse_list = self._parse_hits(sparse_hits)
+            return self._rrf_fuse(dense_list, sparse_list, k)
+        except Exception as e:
+            print(f"[VectorStore] ⚠ BM25 稀疏召回失败，回退纯 dense: {e}")
+            dense_list.sort(key=lambda x: x[2])
+            return [(doc, dist) for (_, doc, dist) in dense_list[:k]]
+
+    # ------------------------------------------------------------------ #
+    # 公共：文档加载 / 分片 / 统一检索接口
+    # ------------------------------------------------------------------ #
+    def _load_raw_docs(self):
+        from langchain_community.document_loaders import PyPDFLoader, TextLoader
         raw_docs = []
         for filename in os.listdir(DOC_FOLDER):
             file_path = os.path.join(DOC_FOLDER, filename)
@@ -612,7 +833,6 @@ class VectorStoreManager:
                 else:
                     continue
                 docs = loader.load()
-                # 给每个文档打上访问权限标签（用于 ChromaDB 原生元数据过滤）
                 access_level = AccessControlFilter.get_access_level(file_path)
                 for doc in docs:
                     doc.metadata["access_level"] = access_level
@@ -620,45 +840,40 @@ class VectorStoreManager:
                 print(f"  ✅ 载入: {filename} (权限: {access_level})")
             except Exception as e:
                 print(f"  ❌ 读取失败 {filename}: {e}")
+        return raw_docs
 
-        if not raw_docs:
-            raise Exception(f"{DOC_FOLDER} 文件夹内没有可识别文档！")
-
-        # 2. 智能分片
-        text_splitter = RecursiveCharacterTextSplitter(
+    def _split(self, raw_docs):
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        return RecursiveCharacterTextSplitter(
             separators=SEPARATORS,
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             length_function=len,
-            strip_whitespace=True
-        )
-        split_docs = text_splitter.split_documents(raw_docs)
-        print(f"  分片完成: {len(raw_docs)} 个原始文档 → {len(split_docs)} 个片段")
+            strip_whitespace=True,
+        ).split_documents(raw_docs)
 
-        # 3. 写入向量库
-        db = Chroma.from_documents(
-            documents=split_docs,
-            embedding=embedding,
-            persist_directory=DB_PATH
-        )
-        print(f"[VectorStore] 向量数据库构建完成")
-        return db
+    def similarity_search_with_score(self, query: str, k: int = 4,
+                                     filter_role: str = None,
+                                     user_id: str = "anonymous") -> List[Tuple[Any, float]]:
+        """
+        统一向量检索接口，返回 [(Document, distance), ...]，distance 越小越相似。
+        Milvus 后端会按 filter_role 下推 access_level 权限过滤；
+        Chroma 后端忽略 filter_role，由上层 AccessControlFilter 兜底。
+        """
+        if self.backend == "milvus":
+            return self._milvus_search(query, k, filter_role, user_id)
+        return self.db.similarity_search_with_score(query, k=k)
 
     @staticmethod
-    def search(db, query: str, k: int = 4) -> List[Tuple[Any, float]]:
-        """
-        向量相似度检索
+    def init_vector_store() -> "VectorStoreManager":
+        """工厂方法：返回 VectorStoreManager 实例（兼容旧调用点）"""
+        return VectorStoreManager()
 
-        :param db: ChromaDB 实例
-        :param query: 搜索文本
-        :param k: 返回结果数
-        :return: [(Document, distance), ...]  distance 越小越相似
-        """
-        # similarity_search_with_score 返回 (Document, float) 列表
-        # Document 有 page_content 和 metadata 属性
-        # float 是 L2 距离（越小越相似，0 = 完全相同）
-        results = db.similarity_search_with_score(query, k=k)
-        return results
+    @staticmethod
+    def search(db, query: str, k: int = 4, filter_role: str = None,
+               user_id: str = "anonymous") -> List[Tuple[Any, float]]:
+        """兼容旧静态调用：VectorStoreManager.search(self.db, q, k)"""
+        return db.similarity_search_with_score(query, k=k, filter_role=filter_role, user_id=user_id)
 
 
 # ============================================================================
@@ -672,7 +887,7 @@ class VectorStoreManager:
 #  │  DocSearchSkill.execute(query)                                    │
 #  │     │                                                             │
 #  │     ▼                                                             │
-#  │  ChromaDB 向量检索（top_k=5）                                      │
+#  │  向量库向量检索（top_k=5，Milvus 或 Chroma，按 VECTOR_BACKEND）       │
 #  │     │                                                             │
 #  │     ▼                                                             │
 #  │  AccessControlFilter.filter_results(results, user_role)           │
@@ -823,7 +1038,7 @@ class DocSearchSkill(BaseSkill):
     def __init__(self, llm: BaseLLM, vector_db, fast_mode: bool = False,
                  user_role: str = DEFAULT_ROLE):
         self.llm = llm          # 用于查询重写
-        self.db = vector_db     # ChromaDB 实例
+        self.db = vector_db     # VectorStoreManager 实例（Milvus/Chroma 统一接口）
         self.fast_mode = fast_mode  # True=跳过查询重写，直接检索
         self.user_role = user_role  # 当前用户角色，用于文档访问权限过滤
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
@@ -1047,7 +1262,7 @@ class DocSearchSkill(BaseSkill):
 
         for q in queries:
             try:
-                results = VectorStoreManager.search(self.db, q, k=top_k)
+                results = self.db.similarity_search_with_score(q, k=top_k, filter_role=self.user_role)
                 for doc, distance in results:
                     # 用内容前50字符作为去重键
                     key = doc.page_content[:50]
