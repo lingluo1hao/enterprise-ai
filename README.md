@@ -607,7 +607,19 @@ GET /api/usage/me?user=alice&range=today|7d|30d|all&limit=100   # 单用户（�
 GET /api/admin/usage/top?range=7d&limit=100                     # 全用户排行（需管理员 Token）
 ```
 
-> 完整改造说明（架构图 / 配置字段详解 / 路由策略 / 踩坑细节）见 [`LLM_GATEWAY_README.md`](LLM_GATEWAY_README.md)。
+#### 为什么用 SQLite 而不是现成的 MySQL？
+
+本项目明明已经跑着 MySQL（`memory_store.py` 存对话历史和断点快照），用量却另起一个 SQLite 文件——这是**刻意的边界隔离**，不是没数据库可用：
+
+- **保住网关的零依赖契约**：`llm_gateway.py` 只依赖标准库，才能被 Agent / MCP Server / 单测任意端搬走复用。引入 `pymysql` 就把网关绑死在本项目基础设施上了。
+- **故障域隔离**：MySQL 挂了业务记忆降级是可接受的；但计量系统不该跟着一起死——**账本要活到最后**，那是排障时唯一还能看的东西。
+- **写入模型压根用不上 MySQL**：单进程、纯 INSERT 追加、一次 LLM 调用才写一条（而调用本身耗时 0.5~3s），写库那 0.1ms 完全被淹没。库文件跑一段时间才 12KB。
+- **查询全是标准 SQL**：`SUM` / `GROUP BY user` / `WHERE ts BETWEEN` / `ORDER BY LIMIT`，换 MySQL 收益为零。
+- **降低他人上手门槛**：开源项目，不该让人为了看一眼 token 先装一个数据库。
+
+天花板也说清楚：**网关多实例部署（如 K8s 多副本）、写入超千 QPS、需要和业务库联表计费**——任一条成立就该迁 MySQL。为此所有 DB 操作都收敛在 `UsageStore` 一个类里，真要换**只改这一个类**，16 处调用点和前端一行都不用动。
+
+> 完整改造说明（架构图 / 配置字段详解 / 路由策略 / 选型权衡 / 踩坑细节）见 [`LLM_GATEWAY_README.md`](LLM_GATEWAY_README.md)。
 
 ## 系统管理后台
 
