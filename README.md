@@ -45,7 +45,7 @@
 
 ![项目演示动画](screenshots/demo.gif)
 
-> 上图 GIF 展示了完整的一次问答流程：用户在 Web 界面输入问题 → 系统从 Redis 缓存检查开始，依次执行 `load_history / classify / query_rewrite / retrieve / grade_docs / rerank_mmr / generate_simple / respond / save_history` → 最终返回答案并持久化历史。最后展示了 MySQL 断点重续的工作机制。
+> 上图 GIF 为真实页面录屏制作：管理员在 `/admin` 后台管理提示词、使用「管理员在线问答」调试知识库效果、查看全站 **Token 用量看板**（调用次数 / Token 消耗 / 累计成本 / 平均耗时 / 用户排行榜 / 每次调用明细）；普通用户在首页进行企业知识库问答并点击「我的用量」查询个人历史 Token 消耗。所有用量数据通过 SQLite 持久化落盘，重启不丢。
 
 ## 项目结构
 
