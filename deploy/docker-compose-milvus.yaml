@@ -1,0 +1,92 @@
+# docker-compose-milvus.yaml
+# 部署位置：虚拟机 /data/milvus/docker-compose-milvus.yaml
+# 所有挂载目录均位于 /data/milvus 下（etcd / minio / milvus 各自独立子目录）
+#
+# 操作顺序（在虚拟机 192.168.200.128 上）：
+#   1) mkdir -p /data/milvus/{etcd,minio,data}
+#   2) 把本文件放到 /data/milvus/docker-compose-milvus.yaml
+#   3) cd /data/milvus && docker compose up -d
+#   4) docker compose ps            # 三个容器均 healthy
+#   5) docker compose logs -f milvus # 观察启动日志
+#
+# 注：Milvus 走独立桥接网络 milvus-network，与现有 MySQL 的 nacos-network 互不连通；
+#    应用（宿主机）通过已发布的 19530(gRPC) / 9091(HTTP) 端口连接，无须跨网络。
+#
+# 镜像使用官方源（docker.io / quay.io）。虚拟机本身无外网，由宿主机 Clash 代理拉取。
+#   前置：宿主机 Clash Party「监听地址」改 0.0.0.0，并跑 deploy/setup-docker-proxy.sh。
+#
+# 关于国内镜像源：docker.m.daocloud.io 实测已失效（拉取返回 403 Forbidden），勿用。
+#   若想试其它镜像站，把下面三个 image 加前缀，例如：
+#     etcd   -> quay.1ms.run/coreos/etcd:v3.5.14   （quay.io 镜像，未实测可用性）
+#     minio  -> docker.1ms.run/minio/minio:RELEASE.2024-05-28
+#     milvus -> docker.1ms.run/milvusdb/milvus:v2.5.0
+#   但这类公共镜像站可用性波动大、无法提前验证，稳妥起见仍推荐「宿主机代理」方案。
+#   离线兜底：能联网机器 docker pull + docker save + scp + 虚拟机 docker load。
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    container_name: milvus-etcd
+    restart: always
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+    volumes:
+      - /data/milvus/etcd:/etcd
+    command: >-
+      etcd -advertise-client-urls=http://etcd:2379
+      -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 8s
+      retries: 10
+    networks:
+      - milvus-network
+
+  minio:
+    image: minio/minio:RELEASE.2024-05-28
+    container_name: milvus-minio
+    restart: always
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - /data/milvus/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 8s
+      retries: 10
+    networks:
+      - milvus-network
+
+  milvus:
+    image: milvusdb/milvus:v2.5.0
+    container_name: milvus-standalone
+    restart: always
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - /data/milvus/data:/var/lib/milvus
+    ports:
+      - "19530:19530"   # gRPC（Python 客户端连这个）
+      - "9091:9091"     # HTTP / healthz
+    depends_on:
+      - etcd
+      - minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    networks:
+      - milvus-network
+
+networks:
+  milvus-network:
+    driver: bridge

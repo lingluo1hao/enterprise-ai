@@ -194,19 +194,22 @@ class MySQLMemoryStore:
         cursor = conn.cursor()
 
         # 表 1: 对话历史
-        # session_id 隔离不同用户/会话
+        # user_id 隔离不同用户（P0 止血：原表无 user_id，所有人历史混在一起）
+        # session_id 隔离不同会话
         # role 区分 user/assistant/system（压缩后的摘要）
         # content 存储消息原文
         # msg_order 记录消息顺序（用于按序加载）
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+                user_id     VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
                 session_id  VARCHAR(128)  NOT NULL,
                 role        VARCHAR(20)   NOT NULL,
                 content     TEXT          NOT NULL,
                 msg_order   INT           NOT NULL DEFAULT 0,
                 created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_session (session_id, msg_order)
+                INDEX idx_user_session (user_id, session_id, msg_order),
+                INDEX idx_user_time (user_id, created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
@@ -218,13 +221,14 @@ class MySQLMemoryStore:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS task_checkpoints (
                 id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+                user_id         VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
                 thread_id       VARCHAR(128)  NOT NULL,
                 session_id      VARCHAR(128)  NOT NULL,
                 node_name       VARCHAR(64)   NOT NULL,
                 state_json      LONGTEXT      NOT NULL,
                 checkpoint_order INT          NOT NULL DEFAULT 0,
                 created_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_thread (thread_id, checkpoint_order)
+                INDEX idx_user_thread (user_id, thread_id, checkpoint_order)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
@@ -238,6 +242,7 @@ class MySQLMemoryStore:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS task_queue (
                 id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+                user_id     VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
                 task_id     VARCHAR(128)  NOT NULL UNIQUE,
                 session_id  VARCHAR(128)  NOT NULL,
                 query       TEXT          NOT NULL,
@@ -247,9 +252,58 @@ class MySQLMemoryStore:
                 error_msg   TEXT,
                 created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                INDEX idx_session_status (session_id, status)
+                INDEX idx_user_status (user_id, status, created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+
+        # 表 4: 对话历史摘要（P0 止血：压缩摘要落库，重启不丢）
+        # embedding 列 P3 阶段填充，用于跨会话语义召回
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_summaries (
+                id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+                user_id      VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
+                session_id   VARCHAR(128) NOT NULL,
+                summary      TEXT         NOT NULL,
+                covers_from  BIGINT       NOT NULL DEFAULT 0,
+                covers_to    BIGINT       NOT NULL DEFAULT 0,
+                msg_count    INT          NOT NULL DEFAULT 0,
+                importance   TINYINT      NOT NULL DEFAULT 3,
+                embedding    LONGBLOB     NULL,
+                created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_session (user_id, session_id, covers_to),
+                INDEX idx_importance (user_id, importance DESC, created_at DESC)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+        # ---- 兼容存量库：若 user_id 列不存在则补齐（幂等）----
+        # 表 1
+        try:
+            cursor.execute(
+                "ALTER TABLE chat_messages "
+                "ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous' AFTER id, "
+                "ADD INDEX idx_user_session (user_id, session_id, msg_order), "
+                "ADD INDEX idx_user_time (user_id, created_at)"
+            )
+        except Exception:
+            pass  # 列已存在则忽略（Duplicate column）
+        # 表 2
+        try:
+            cursor.execute(
+                "ALTER TABLE task_checkpoints "
+                "ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous' AFTER id, "
+                "ADD INDEX idx_user_thread (user_id, thread_id, checkpoint_order)"
+            )
+        except Exception:
+            pass
+        # 表 3
+        try:
+            cursor.execute(
+                "ALTER TABLE task_queue "
+                "ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous' AFTER id, "
+                "ADD INDEX idx_user_status (user_id, status, created_at)"
+            )
+        except Exception:
+            pass
 
         cursor.close()
         conn.close()
@@ -258,7 +312,7 @@ class MySQLMemoryStore:
     # 对话历史 CRUD
     # ========================================================================
 
-    def save_message(self, session_id: str, role: str, content: str):
+    def save_message(self, session_id: str, role: str, content: str, user_id: str = "anonymous"):
         """
         保存一条对话消息到 MySQL。
 
@@ -269,6 +323,7 @@ class MySQLMemoryStore:
             session_id: 会话标识符
             role: 消息角色（user / assistant / system）
             content: 消息内容
+            user_id: 用户标识（P0 止血，默认 anonymous）
         """
         if not self.available:
             # 降级：写入内存
@@ -283,32 +338,32 @@ class MySQLMemoryStore:
         try:
             conn = self._get_conn()
             cursor = conn.cursor()
-            # 获取当前 session 的最大 msg_order，新消息 order + 1
+            # 原子取号：单条 SQL 同时完成「取最大 order + 插入」，
+            # 避免 SELECT MAX + INSERT 两步非原子导致并发撞号（P0 止血 3.5）
             cursor.execute(
-                "SELECT MAX(msg_order) FROM chat_messages WHERE session_id = %s",
-                (session_id,),
-            )
-            max_order = cursor.fetchone()[0] or 0
-            cursor.execute(
-                "INSERT INTO chat_messages (session_id, role, content, msg_order) "
-                "VALUES (%s, %s, %s, %s)",
-                (session_id, role, content, max_order + 1),
+                "INSERT INTO chat_messages (user_id, session_id, role, content, msg_order) "
+                "SELECT %s, %s, %s, %s, COALESCE(MAX(msg_order), 0) + 1 "
+                "FROM chat_messages WHERE user_id = %s AND session_id = %s",
+                (user_id, session_id, role, content, user_id, session_id),
             )
             cursor.close()
             conn.close()
         except Exception as e:
             print(f"  [MySQLMemoryStore] save_message 失败: {e}")
 
-    def load_messages(self, session_id: str, limit: int = 50) -> List[Dict]:
+    def load_messages(self, session_id: str, limit: int = 50, user_id: str = "anonymous") -> List[Dict]:
         """
         从 MySQL 加载对话历史。
 
         作用：替代旧的 self._history_store.get(session_id, [])。
         从 MySQL 读取该会话的所有消息，按 msg_order 排序。
+        P0 止血 3.4：优先带出「最新摘要」，再拼接 covers_to 之后的原始消息，
+        这样重启后压缩摘要不丢（原来摘要只存内存，重启即失）。
 
         参数：
             session_id: 会话标识符
             limit: 最多加载多少条（默认 50，避免超长历史拖慢加载）
+            user_id: 用户标识（与写入时一致）
         返回：
             [{"role": "user", "content": "..."}, ...] 格式的消息列表
         """
@@ -321,10 +376,38 @@ class MySQLMemoryStore:
         try:
             conn = self._get_conn()
             cursor = conn.cursor()
+            # 1) 取最新一条摘要（P0 止血）
+            summary = None
+            try:
+                cursor.execute(
+                    "SELECT summary FROM chat_summaries "
+                    "WHERE user_id = %s AND session_id = %s "
+                    "ORDER BY covers_to DESC LIMIT 1",
+                    (user_id, session_id),
+                )
+                srow = cursor.fetchone()
+                if srow:
+                    summary = srow[0]
+            except Exception:
+                summary = None
+
+            # 2) 取摘要覆盖之后的原始消息（covers_to 之后的 chat_messages.id）
+            covers_to = 0
+            if summary:
+                cursor.execute(
+                    "SELECT covers_to FROM chat_summaries "
+                    "WHERE user_id = %s AND session_id = %s "
+                    "ORDER BY covers_to DESC LIMIT 1",
+                    (user_id, session_id),
+                )
+                crow = cursor.fetchone()
+                covers_to = crow[0] if crow else 0
+
             cursor.execute(
                 "SELECT role, content FROM chat_messages "
-                "WHERE session_id = %s ORDER BY msg_order DESC LIMIT %s",
-                (session_id, limit),
+                "WHERE user_id = %s AND session_id = %s AND id > %s "
+                "ORDER BY msg_order DESC LIMIT %s",
+                (user_id, session_id, covers_to, limit),
             )
             rows = cursor.fetchall()
             cursor.close()
@@ -334,12 +417,14 @@ class MySQLMemoryStore:
                 {"role": row[0], "content": row[1]}
                 for row in reversed(rows)
             ]
+            if summary:
+                messages = [{"role": "system", "content": summary}] + messages
             return messages
         except Exception as e:
             print(f"  [MySQLMemoryStore] load_messages 失败: {e}")
             return []
 
-    def clear_messages(self, session_id: str):
+    def clear_messages(self, session_id: str, user_id: str = "anonymous"):
         """清空指定会话的所有对话历史"""
         if not self.available:
             self._fallback_history.pop(session_id, None)
@@ -348,7 +433,8 @@ class MySQLMemoryStore:
             conn = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(
-                "DELETE FROM chat_messages WHERE session_id = %s", (session_id,)
+                "DELETE FROM chat_messages WHERE user_id = %s AND session_id = %s",
+                (user_id, session_id),
             )
             cursor.close()
             conn.close()
@@ -365,6 +451,7 @@ class MySQLMemoryStore:
         session_id: str,
         node_name: str,
         state: Dict[str, Any],
+        user_id: str = "anonymous",
     ):
         """
         保存一个 LangGraph 断点快照。
@@ -377,6 +464,7 @@ class MySQLMemoryStore:
             session_id: 会话 ID
             node_name: 刚执行完的节点名称（如 "classify", "retrieve"）
             state: LangGraph 的 AgentState 字典
+            user_id: 用户标识（P0 止血）
         """
         if not self.available:
             if thread_id not in self._fallback_checkpoints:
@@ -396,17 +484,14 @@ class MySQLMemoryStore:
 
             conn = self._get_conn()
             cursor = conn.cursor()
-            # 获取当前 thread 的最大 checkpoint_order
-            cursor.execute(
-                "SELECT MAX(checkpoint_order) FROM task_checkpoints WHERE thread_id = %s",
-                (thread_id,),
-            )
-            max_order = cursor.fetchone()[0] or 0
+            # 原子取号（P0 止血 3.5）：单条 SQL 避免并发撞号
             cursor.execute(
                 "INSERT INTO task_checkpoints "
-                "(thread_id, session_id, node_name, state_json, checkpoint_order) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (thread_id, session_id, node_name, state_json, max_order + 1),
+                "(user_id, thread_id, session_id, node_name, state_json, checkpoint_order) "
+                "SELECT %s, %s, %s, %s, %s, COALESCE(MAX(checkpoint_order), 0) + 1 "
+                "FROM task_checkpoints WHERE user_id = %s AND thread_id = %s",
+                (user_id, thread_id, session_id, node_name, state_json,
+                 user_id, thread_id),
             )
             cursor.close()
             conn.close()
@@ -465,7 +550,8 @@ class MySQLMemoryStore:
     # ========================================================================
 
     def create_task(
-        self, session_id: str, query: str, role: str = "user"
+        self, session_id: str, query: str, role: str = "user",
+        user_id: str = "anonymous",
     ) -> str:
         """
         创建一个新任务，返回 task_id。
@@ -478,6 +564,7 @@ class MySQLMemoryStore:
             session_id: 会话 ID
             query: 用户问题
             role: 用户角色
+            user_id: 用户标识（P0 止血，防止 A 用户恢复 B 用户的任务）
         返回：
             task_id（UUID 格式，全局唯一）
         """
@@ -498,9 +585,10 @@ class MySQLMemoryStore:
             conn = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO task_queue (task_id, session_id, query, role, status) "
-                "VALUES (%s, %s, %s, %s, 'running')",
-                (task_id, session_id, query, role),
+                "INSERT INTO task_queue "
+                "(user_id, task_id, session_id, query, role, status) "
+                "VALUES (%s, %s, %s, %s, %s, 'running')",
+                (user_id, task_id, session_id, query, role),
             )
             cursor.close()
             conn.close()
@@ -546,7 +634,7 @@ class MySQLMemoryStore:
         except Exception as e:
             print(f"  [MySQLMemoryStore] update_task_status 失败: {e}")
 
-    def get_unfinished_tasks(self, session_id: str) -> List[Dict]:
+    def get_unfinished_tasks(self, session_id: str, user_id: str = "anonymous") -> List[Dict]:
         """
         查询指定会话的所有未完成任务（status=running 或 interrupted）。
 
@@ -561,6 +649,7 @@ class MySQLMemoryStore:
 
         参数：
             session_id: 会话 ID
+            user_id: 用户标识（P0 止血：防止 A 用户恢复 B 用户的任务）
         返回：
             [{"task_id": "...", "query": "...", "created_at": "...", "status": "..."}, ...]
         """
@@ -576,9 +665,10 @@ class MySQLMemoryStore:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT task_id, query, created_at, status "
-                "FROM task_queue WHERE session_id = %s AND status IN ('running', 'interrupted') "
+                "FROM task_queue WHERE user_id = %s AND session_id = %s "
+                "AND status IN ('running', 'interrupted') "
                 "ORDER BY created_at DESC",
-                (session_id,),
+                (user_id, session_id),
             )
             rows = cursor.fetchall()
             cursor.close()
@@ -590,6 +680,65 @@ class MySQLMemoryStore:
         except Exception as e:
             print(f"  [MySQLMemoryStore] get_unfinished_tasks 失败: {e}")
             return []
+
+    # ========================================================================
+    # 对话摘要 CRUD（P0 止血 3.4：压缩摘要落库，重启不丢）
+    # ========================================================================
+
+    def get_last_message_id(self, session_id: str, user_id: str = "anonymous") -> int:
+        """
+        返回指定会话最后一条 chat_messages.id，用于记录摘要覆盖到的位置。
+        """
+        if not self.available:
+            return 0
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT MAX(id) FROM chat_messages WHERE user_id = %s AND session_id = %s",
+                (user_id, session_id),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            return int(row[0]) if row and row[0] is not None else 0
+        except Exception:
+            return 0
+
+    def save_summary(
+        self,
+        user_id: str,
+        session_id: str,
+        summary: str,
+        covers_to: int,
+        msg_count: int,
+        importance: int = 3,
+    ):
+        """
+        保存一条对话历史摘要（压缩产物）。
+
+        参数：
+            user_id / session_id: 归属
+            summary: 摘要文本（形如 "历史摘要: ..."）
+            covers_to: 该摘要覆盖到的最后一条 chat_messages.id
+            msg_count: 被压缩掉的原始消息条数
+            importance: 1-5 重要性打分（P3 跨会话召回时用于加权）
+        """
+        if not self.available:
+            return
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO chat_summaries "
+                "(user_id, session_id, summary, covers_from, covers_to, msg_count, importance) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (user_id, session_id, summary, 0, covers_to, msg_count, importance),
+            )
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            print(f"  [MySQLMemoryStore] save_summary 失败: {e}")
 
     def get_task_by_id(self, task_id: str) -> Optional[Dict]:
         """根据 task_id 查询单个任务详情"""

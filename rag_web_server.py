@@ -44,6 +44,16 @@ from advanced_rag_agent import (
 )
 
 
+def _derive_session_id(user_id: str = "anonymous", role: str = "user") -> str:
+    """会话 ID 按身份派生，避免所有人共用一份历史（P0 止血 3.2）。
+
+    当前 Web 端无 username 体系，用 role 区分（web:user / web:admin）。
+    user_id 仅作签名占位，将来接入登录后传入真实用户名即可。
+    """
+    safe_role = "".join(c if c.isalnum() or c in "-_" else "_" for c in (role or "user"))[:16]
+    return f"web:{safe_role}"
+
+
 class LangGraphEngine:
     """适配器：让 LangGraphRAGApp 兼容 rag_web_server 的 RAGOrchestrator 接口"""
 
@@ -57,8 +67,8 @@ class LangGraphEngine:
 
     def query(self, question, user_role=None, user=None):
         role = user_role or self.user_role
-        return self.app.query(question, role=role, session_id="web_session",
-                              user=user)
+        return self.app.query(question, role=role,
+                              session_id=_derive_session_id(role), user=user)
 
     def check_unfinished_tasks(self, session_id="web_session"):
         """查询指定会话的未完成任务（断点检测）"""
@@ -2204,7 +2214,7 @@ document.addEventListener('DOMContentLoaded', () => {
     .catch(() => console.warn('Health check failed'));
 
   // ===== 断点重续：页面加载时检查未完成任务 =====
-  fetch('/api/tasks/unfinished?session_id=web_session')
+  fetch('/api/tasks/unfinished?session_id=web_' + (currentRole || 'user'))
     .then(r => r.json())
     .then(data => {
       if (data.count && data.count > 0) {
@@ -2219,7 +2229,7 @@ document.addEventListener('DOMContentLoaded', () => {
           fetch('/api/tasks/resume', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({task_id: task.task_id, session_id: 'web_session'})
+            body: JSON.stringify({task_id: task.task_id, session_id: 'web_' + (currentRole || 'user')})
           })
           .then(r => r.json())
           .then(result => {

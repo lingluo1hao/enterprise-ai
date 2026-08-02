@@ -347,6 +347,7 @@ class LangGraphRAGApp:
                     session_id=state.get("session_id", "default"),
                     node_name=node_name,
                     state=merged_state,
+                    user_id=self.user,
                 )
                 print(f"  [checkpoint] {node_name} → 已保存断点到 MySQL")
 
@@ -696,6 +697,48 @@ class LangGraphRAGApp:
         return {"answer": answer}
 
     # ========================================================================
+    # 对话历史统一写入（P0 止血 3.3：缓存命中与正常路径共用，杜绝历史空洞）
+    # ========================================================================
+
+    def _append_history(self, session_id, question, answer, user_id="anonymous", cached=False):
+        """
+        把一轮问答写入 Layer 1（内存）+ Layer 2（MySQL）。
+
+        关键：缓存命中路径也必须调用本方法（P0 止血 3.3）。
+        原本缓存命中直接 return，跳过 node_save_history，导致该轮永不入库——
+        用户问 A（未命中）→ 问 B（命中）→ 问 C 时引用「刚才的 B」，历史里却没有 B。
+
+        压缩发生时，摘要同时落库 chat_summaries（P0 止血 3.4），重启不丢。
+        """
+        ctx = self._active_context.get(session_id, [])
+        ctx = ctx + [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+
+        # 超过窗口则压缩，压缩产物落库
+        max_msgs = HISTORY_MAX_TURNS * 2
+        if len(ctx) > max_msgs:
+            old_count = len(ctx)
+            ctx = self._compress_history(ctx)
+            if self.memory_store.available:
+                summary_text = ctx[0]["content"] if ctx and ctx[0].get("role") == "system" else ""
+                covers_to = self.memory_store.get_last_message_id(session_id, user_id)
+                if summary_text:
+                    self.memory_store.save_summary(
+                        user_id, session_id, summary_text, covers_to, old_count, importance=3
+                    )
+
+        # Layer 2: 写入 MySQL（持久化，重启不丢）
+        if self.memory_store.available:
+            self.memory_store.save_message(session_id, "user", question, user_id=user_id)
+            self.memory_store.save_message(session_id, "assistant", answer, user_id=user_id)
+
+        # Layer 1: 写入内存（加速后续读取）
+        self._active_context[session_id] = ctx
+        return ctx
+
+    # ========================================================================
     # 第 14 号节点：save_history — 保存对话历史
     # ========================================================================
 
@@ -720,28 +763,15 @@ class LangGraphRAGApp:
             state 中的所有相关字段
         输出：
             {"messages": [...]} — 更新后的对话历史
+
+        注意：实际写入统一走 self._append_history（与缓存命中路径共用，P0 止血 3.3）。
         """
         session_id = state.get("session_id", "default")
-        messages = list(state.get("messages", []))
         query = state["query"]
         answer = state.get("answer", "")
 
-        # 追加本轮对话：先用户问题，再助手回复
-        # 两段式存储是为了后续 format_history 能区分角色
-        messages.append({"role": "user", "content": query})
-        messages.append({"role": "assistant", "content": answer})
-
-        # 检查是否需要压缩
-        max_msgs = HISTORY_MAX_TURNS * 2
-        if len(messages) > max_msgs:
-            messages = self._compress_history(messages)
-
-        # Layer 2: 写入 MySQL（持久化，重启不丢）
-        self.memory_store.save_message(session_id, "user", query)
-        self.memory_store.save_message(session_id, "assistant", answer)
-
-        # Layer 1: 写入内存（加速后续读取）
-        self._active_context[session_id] = messages
+        # 统一走 _append_history：本轮问答写 L1 + L2，超窗压缩并落库摘要
+        messages = self._append_history(session_id, query, answer, user_id=self.user)
         print(f"  [save_history] 已保存到 MySQL + 内存，历史 {len(messages)} 条消息")
         return {"messages": messages}
 
@@ -1878,6 +1908,9 @@ class LangGraphRAGApp:
         if cached:
             print(f"\n[Cache] 命中缓存，直接返回（耗时 {time.time() - total_start:.1f}s）")
             print(f"\n{'─' * 70}\n{cached}\n{'─' * 70}")
+            # P0 止血 3.3：缓存只跳过「推理」，不跳过「记忆」。
+            # 否则命中缓存的这一轮永不入库，对话历史出现空洞（模型看不到刚问过的内容）。
+            self._append_history(session_id, question, cached, user_id=self.user, cached=True)
             return cached
 
         # ---- 第二步：创建任务记录（Layer 2: MySQL task_queue）----
@@ -1885,7 +1918,7 @@ class LangGraphRAGApp:
         # 如果后续执行中断，这条记录的 status 会保持 running，
         # 下次用户登录时可以通过 check_unfinished_tasks() 检测到。
         self.current_task_id = self.memory_store.create_task(
-            session_id=session_id, query=question, role=role
+            session_id=session_id, query=question, role=role, user_id=self.user
         )
         print(f"  [任务] 已创建任务 {self.current_task_id}（status=running）")
 
