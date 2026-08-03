@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?labelColor=555555&style=flat-square&logo=python&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-1C3C3C?labelColor=555555&style=flat-square&logo=langchain&logoColor=white)
 ![LangChain](https://img.shields.io/badge/LangChain-RAG-1C3C3C?labelColor=555555&style=flat-square&logo=langchain&logoColor=white)
-![Ollama](https://img.shields.io/badge/Ollama-qwen2:7b%2F1.5b-000000?labelColor=555555&style=flat-square&logo=ollama&logoColor=white)
+![Ollama](https://img.shields.io/badge/Ollama-qwen2:7b%2F1.5b%2Fbge--m3-000000?labelColor=555555&style=flat-square&logo=ollama&logoColor=white)
 ![LLM Gateway](https://img.shields.io/badge/LLM_Gateway-Multi--Model_Routing-FF6F61?labelColor=555555&style=flat-square)
 ![Flask](https://img.shields.io/badge/Flask-Web-000000?labelColor=555555&style=flat-square&logo=flask&logoColor=white)
 ![Milvus](https://img.shields.io/badge/Milvus-Vector-FF6F61?labelColor=555555&style=flat-square&logoColor=white)
@@ -26,7 +26,7 @@
 
 - **真实环境，无 Mock**：直接连接 Milvus 向量库（ChromaDB 兜底）与 Ollama 大模型。
 - **企业级 LLM 网关（LLM Gateway）**：所有 LLM 调用经统一网关出口，支持多模型路由（小模型接管分类/打分/改写/压缩等高频任务，大模型负责生成/规划）、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载（改 yaml 不重启）。业务代码 16 个调用点零改动接入，可一键回退单模型直连。
-- **LangGraph 状态机驱动**：显式 StateGraph 替代手写 ReAct 循环，14 个节点 + 条件边精细路由。
+- **LangGraph 状态机驱动**：显式 StateGraph 替代手写 ReAct 循环，13 个节点 + 条件边精细路由。
 - **三路智能分支**：简单查询走「多轮检索」、复杂问题走「多智能体协作」、闲聊直接回答。
 - **多轮检索反馈循环**：query_rewrite → retrieve → grade_docs，不相关自动换角度重新检索（最多 3 轮）。
 - **多智能体协作**：Planner 拆解子任务 → Researcher 并行检索 → Reviewer 审查把关 → Writer 汇总成稿。
@@ -64,7 +64,7 @@ enterprise-ai/
 ├── llm_gateway.py         # 【LLM 网关】统一 LLM 出口：多模型路由/限流/熔断/连接池/Token 计费/热重载（纯标准库）
 ├── llm_gateway.yaml       # 【LLM 网关】模型注册表 + 路由表 + 限流熔断配置（支持热切换）
 ├── LLM_GATEWAY_README.md  # 【LLM 网关】改造说明（架构/路由/踩坑/验证）
-├── test_llm_gateway.py    # 【LLM 网关】网关端到端测试（32 项断言）
+├── test_llm_gateway.py    # 【LLM 网关】网关端到端测试（运行 `python -m pytest test_llm_gateway.py -q` 查看真实断言数）
 ├── test_llm_gateway_models.py # 【LLM 网关】小模型 vs 大模型任务对比验证
 ├── bench_routing_speed.py # 【LLM 网关】路由改版前后时延基准
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
@@ -145,8 +145,9 @@ langgraph_rag_agent.py — StateGraph 状态图引擎
     ▼
 LLM Gateway（llm_gateway.yaml：多模型路由 / 限流 / 熔断 / 连接池 / 热重载）
     │
-    ├─ local-small  (qwen2.5:1.5b)  ← 分类/打分/改写/压缩等高频小任务
-    ├─ local-qwen   (qwen2:7b)      ← 生成/规划等核心任务
+    ├─ local-small  (qwen2.5:1.5b)  ← 分类/打分/改写/压缩等高频小任务（确定性 temp=0）
+    ├─ local-qwen   (qwen2:7b)      ← classify/plan/review/react 等路由决策（确定性 temp=0）
+    ├─ local-qwen-gen (qwen2:7b)    ← generate/write/synthesize/direct 答案生成（temp=0.3，更自然）
     └─ deepseek-chat / qwen-plus    ← 云端备选，主模型挂了顶上
     ▼
 Ollama（192.168.200.128:11434 / qwen2:7b 等）
@@ -155,7 +156,7 @@ Redis（192.168.200.128:6379）
 MySQL（192.168.200.128:3306 / rag_agent）
 ```
 
-### LangGraph 图节点一览（共 14 个节点）
+### LangGraph 图节点一览（共 13 个节点）
 
 | 节点 | 作用 |
 |------|------|
@@ -223,7 +224,7 @@ pip install langchain langchain-community langgraph \
 | 持久化 | `pymysql` + `dbutils` | MySQL 连接池（对话历史 / 断点 / 任务队列） | 必需（开启断点重续时） |
 | Web | `flask` + `flask-cors` | Web 服务与跨域支持 | 必需（使用 Web 时） |
 | 文档处理 | `pypdf` | PDF 文本抽取 | 必需（使用 `docs/` 时） |
-| Embedding | `sentence-transformers` | BGE 等 embedding 模型（自动带 `numpy` 等传递依赖） | 必需 |
+| Embedding | `sentence-transformers` | 仅 `EMBED_BACKEND=local` 时本地 torch 加载 BGE 等模型（自动带 `numpy` 等传递依赖）；默认 `ollama` 模式不装也能跑 | 可选 |
 | MCP | `fastmcp` | MCP Server 把 Skill 暴露为 Tools / Resource / Prompt | 可选（使用 MCP 时） |
 | MCP | `mcp` | MCP 客户端 SDK（外部调用测试） | 可选（使用 MCP 时） |
 | 配置 | `pyyaml` | 解析 `llm_gateway.yaml`（缺失则网关回退内置默认） | 推荐 |
@@ -243,7 +244,7 @@ pip install pymupdf unstructured
 
 ### 3. 搭建 Ollama 服务
 
-Ollama 是一个本地大模型运行平台。安装后可直接在本地运行 `qwen2:7b` 等开源模型。
+Ollama 是一个本地大模型运行平台。安装后可直接在本地运行 `qwen2:7b` 等开源**生成模型**，以及 **`bge-m3` embedding 模型**（向量化文档/问题用，检索链路必需）。
 
 **安装 Ollama：**
 
@@ -261,7 +262,11 @@ ollama pull qwen2:7b
 # 拉取轻量模型 qwen2.5:1.5b（约 1GB，网关用于分类/打分/改写/压缩等高频小任务）
 ollama pull qwen2.5:1.5b
 
-# 验证模型已加载
+# 拉取 embedding 模型 bge-m3（约 1.2GB，dim=1024；用于文档/问题向量化，中文多语质量优于 nomic）
+# ⚠️ 必须拉取！否则检索会失败——之前“未给出正确定位模式”的根因就是 VM 上没 pull bge-m3
+ollama pull bge-m3
+
+# 验证模型已加载（应输出 qwen2:7b、qwen2.5:1.5b、bge-m3 三条）
 ollama list
 ```
 
@@ -584,15 +589,20 @@ MCP 改造**不降级任何安全机制**：所有 Tool 调用都必须先过 `B
 
 ```yaml
 routing:
-  classify:   [local-qwen]                # 是否走 RAG，判错后果严重，死守 7b
-  grade:      [local-small, local-qwen]    # 文档相关性打分，下放 1.5b
-  rewrite:    [local-small, local-qwen]    # 查询改写，下放 1.5b
-  compress:   [local-small, local-qwen]    # 历史压缩，下放 1.5b
-  generate:   [local-qwen, deepseek-chat, qwen-plus]  # 论述题走大模型，云端兜底
-  write/plan/review/...: [local-qwen, deepseek-chat]   # 同论述题
+  classify:   [local-qwen]                # 路由决策，确定性 temp=0，判错后果严重，死守 7b
+  grade:      [local-small, local-qwen]    # 文档相关性打分，下放 1.5b（temp=0）
+  rewrite:    [local-small, local-qwen]    # 查询改写，下放 1.5b（temp=0）
+  compress:   [local-small, local-qwen]    # 历史压缩，下放 1.5b（temp=0）
+  generate:   [local-qwen-gen, deepseek-chat, qwen-plus]  # 答案生成，放开 temp=0.3 更自然
+  write:      [local-qwen-gen, deepseek-chat, qwen-plus]  # 同 generate
+  synthesize: [local-qwen-gen, deepseek-chat, qwen-plus]  # 同 generate
+  direct:     [local-qwen-gen, deepseek-chat, qwen-plus]  # 闲聊直答，同 generate
+  plan:       [local-qwen, deepseek-chat]  # 规划，确定性 temp=0
+  review:     [local-qwen, deepseek-chat]  # 审查，确定性 temp=0
+  react:      [local-qwen, deepseek-chat]  # 反应式兜底，确定性 temp=0
 ```
 
-> **实测结论**：`qwen2.5:1.5b` 在 `grade` / `rewrite` / `compress` 上质量与 7b 相当、速度更快，已下放小模型；`classify` 在"是否需要联网搜索"上仍会把"是"判成"否"，错不起，继续走 7b。
+> **实测结论**：`qwen2.5:1.5b` 在 `grade` / `rewrite` / `compress` 上质量与 7b 相当、速度更快，已下放小模型；`classify` 负责区分 simple/complex/chitchat，误判（如把多问句复合问题错分 simple）会导致漏检，故仍由 7b 死守，且代码层对多问句问题强制走 complex 分支兜底。
 
 ### 如何开关 / 回退
 
@@ -616,7 +626,7 @@ export USE_LLM_GATEWAY=true
 
 ### 验证结果
 
-- `test_llm_gateway.py`：**43 项端到端断言全通过**（连接池复用、真实 Token、限流、熔断恢复、fallback、流式、成本，以及 Token 用量持久化 + 按用户/按时间查询 + 全用户排行）。
+- `test_llm_gateway.py`：**端到端断言全部通过**（连接池复用、真实 Token、限流、熔断恢复、fallback、流式、成本，以及 Token 用量持久化 + 按用户/按时间查询 + 全用户排行）。
 - 路由改版基准 `bench_routing_speed.py`：一次 RAG 回合（classify→rewrite→grade→compress）时延 **1.18s vs 全 7b 的 2.64s，提速约 2.23x（快 55%）**。
 
 ### Token 用量持久化与按用户查询
@@ -764,7 +774,7 @@ DOC_ACCESS_RULES = {
 | **Layer 2** | MySQL `192.168.200.128:3306` | ~1-5ms | **重启不丢** | 对话历史 + 断点快照 + 任务队列 |
 | **Layer 3** | Redis `192.168.200.128:6379` | <1ms | 重启不丢 | Q&A 缓存（精确 + 语义） |
 
-### MySQL 三张表说明
+### MySQL 业务表说明（对话/断点相关，全库共 6 张）
 
 | 表名 | 作用 |
 |------|------|
@@ -846,7 +856,7 @@ DOC_ACCESS_RULES = {
   curl http://192.168.200.128:11434/api/tags  # 测试 API 是否可达
   ```
 - 如果 Ollama 在本机，把 `OLLAMA_URL` 改为 `http://127.0.0.1:11434`
-- 首次使用需先拉取模型：`ollama pull qwen2:7b`
+- 首次使用需先拉取模型：`ollama pull qwen2:7b` 与 `ollama pull bge-m3`（**embedding 模型 bge-m3 必拉，否则检索失败**）
 
 ### 4. 连接 Redis 失败 / 缓存不生效
 
@@ -877,7 +887,7 @@ DOC_ACCESS_RULES = {
 > **本项目已从设计上消除该类崩溃**：Embedding 只提供 **Ollama 模式**（`EMBED_BACKEND=ollama`，默认），由虚拟机上的 Ollama 提供 bge-m3，主 web 进程**完全不加载 torch**，因此历史上「本地 SentenceTransformer + fork 多 worker 触发 OpenMP/MKL Segmentation fault」这一类问题已不存在，无需任何线程数保险丝。
 
 - 若仍遇进程崩溃，按以下顺序排查（与 Embedding 无关的常见原因）：
-  1. 确保运行在 **Python 3.10** 环境（本项目约定 `conda env: py310`）；部分依赖在 3.12+ 上有兼容问题。
+  1. 确保运行在 **Python 3.10** 环境（本项目约定 `conda env: pythonspace`）；部分依赖在 3.12+ 上有兼容问题。
   2. 启动方式：推荐 PowerShell / CMD；若向量库回退到 ChromaDB 本地模式，Git Bash 底层依赖可能异常退出（Milvus 走网络不受此限）。
   3. **Linux / 虚拟机（如 Rocky Linux 10）部署**：Web server 若用 `gunicorn` / `uvicorn` 的 fork 多 worker，注意子进程 fork 后再 import 重型库可能不稳定，稳妥做法用 `gunicorn --preload`（父进程先 import 应用再 fork）或限制 worker 数；多 worker 用 `--workers N` 横向扩展并发。
 

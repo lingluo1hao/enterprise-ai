@@ -105,8 +105,9 @@ class ModelConfig:
     api_key_env: str = ""                  # 从哪个环境变量取 key（不写死密钥）
     tier: str = "large"                    # small | large，仅作标注与可读性
     timeout: float = 120.0                 # 单次请求超时（秒）
-    temperature: float = 0.1
+    temperature: float = 0.0
     max_tokens: int = 0                    # 0 = 不限制
+    seed: int = 42                         # 固定随机种子，让 classify/rewrite/grade 可复现
     # 成本：美元 / 每百万 token。本地 Ollama 填 0
     price_in_per_1m: float = 0.0
     price_out_per_1m: float = 0.0
@@ -532,7 +533,7 @@ class OllamaProvider(BaseProvider):
     """
 
     def _payload(self, system_prompt: str, user_prompt: str, stream: bool) -> bytes:
-        opts: Dict[str, Any] = {"temperature": self.cfg.temperature}
+        opts: Dict[str, Any] = {"temperature": self.cfg.temperature, "seed": self.cfg.seed}
         if self.cfg.max_tokens > 0:
             opts["num_predict"] = self.cfg.max_tokens
         body = {
@@ -610,6 +611,7 @@ class OpenAICompatProvider(BaseProvider):
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": self.cfg.temperature,
+            "seed": self.cfg.seed,
             "stream": stream,
         }
         if self.cfg.max_tokens > 0:

@@ -603,6 +603,14 @@ class LangGraphRAGApp:
         query = state["query"]
         messages = state.get("messages", [])
 
+        # —— 确定性修复：多问句问题强制走 complex 且跳过历史消解 ——
+        # 同一问题在「有/无历史」两种状态下会被 LLM 消解出不同 query，
+        # 导致两次检索结果不一致。多问号问题几乎都是自包含复杂问题，
+        # 直接判定 complex 并用原始 query，消除历史依赖带来的随机性。
+        if query.count("？") >= 2 or query.count("?") >= 2:
+            print(f"  [classify] 类型=complex（多问句强制，跳过 LLM 消解）")
+            return {"query_type": "complex", "resolved_query": query}
+
         # 构建最近 4 轮对话历史的文本摘要
         history_text = self._format_history(messages, max_turns=4)
 

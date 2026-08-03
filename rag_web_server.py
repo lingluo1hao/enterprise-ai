@@ -1418,6 +1418,7 @@ _ADMIN_PAGE = r"""
       <span>👤</span>
       <span class="name" id="displayName"></span>
       <a href="/admin" style="color:var(--primary);text-decoration:none;font-size:13px">🔧 提示词管理</a>
+      <button class="btn btn-sm btn-outline" onclick="changePassword()">🔑 修改密码</button>
       <button class="btn btn-sm btn-outline" onclick="doLogout()">退出</button>
     </div>
   </div>
@@ -1438,7 +1439,6 @@ _ADMIN_PAGE = r"""
         </div>
         <div style="display:flex;gap:8px">
           <button class="btn btn-sm btn-outline" onclick="importDefaults()">🔄 恢复默认</button>
-          <button class="btn btn-sm btn-outline" onclick="changePassword()">🔑 修改密码</button>
         </div>
       </div>
       <div class="prompt-list" id="promptList"></div>

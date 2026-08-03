@@ -27,11 +27,32 @@ models:
     base_url: http://192.168.200.128:11434
     tier: large
     timeout: 120.0
-    temperature: 0.1
+    temperature: 0.0
+    seed: 42            # 固定随机种子，分类/生成可复现（根治两次结果不一致）
     rpm: 60             # 每分钟最多 60 次调用
     tpm: 150000         # 每分钟最多 15 万 token
     fail_threshold: 3   # 连续失败 3 次触发熔断
     recovery_sec: 30.0  # 熔断 30 秒后半开探测
+    price_in_per_1m: 0.0
+    price_out_per_1m: 0.0
+    enabled: true
+
+  # ---- 生成专用别名：与 local-qwen 同底座(qwen2:7b)，但温度放开到 0.3 ----
+  # 只给最终答案生成(generate/write/synthesize/direct)用，句子更自然不死板；
+  # Ollama 按模型名(qwen2:7b)缓存权重，不会重复占用显存。
+  # 路由/决策节点(classify/grade/rewrite/compress/plan/review/react)仍走 local-qwen/local-small，保持 temp=0 确定性。
+  local-qwen-gen:
+    provider: ollama
+    model: qwen2:7b
+    base_url: http://192.168.200.128:11434
+    tier: large
+    timeout: 120.0
+    temperature: 0.3    # 生成放开温度，答案更自然（仍带 seed=42 保证可复现）
+    seed: 42
+    rpm: 60
+    tpm: 150000
+    fail_threshold: 3
+    recovery_sec: 30.0
     price_in_per_1m: 0.0
     price_out_per_1m: 0.0
     enabled: true
@@ -46,6 +67,7 @@ models:
     tier: small
     timeout: 60.0
     temperature: 0.0    # 分类打分要确定性，温度拉到 0
+    seed: 42            # 固定种子，确保可复现
     rpm: 200            # 小模型便宜，配额给大一些
     tpm: 300000
     fail_threshold: 3
@@ -137,10 +159,10 @@ routing:
   rewrite:    [local-small, local-qwen]
   compress:   [local-small, local-qwen]
 
-  generate:   [local-qwen, deepseek-chat, qwen-plus]
-  write:      [local-qwen, deepseek-chat, qwen-plus]
-  synthesize: [local-qwen, deepseek-chat, qwen-plus]
-  direct:     [local-qwen, deepseek-chat, qwen-plus]
+  generate:   [local-qwen-gen, deepseek-chat, qwen-plus]
+  write:      [local-qwen-gen, deepseek-chat, qwen-plus]
+  synthesize: [local-qwen-gen, deepseek-chat, qwen-plus]
+  direct:     [local-qwen-gen, deepseek-chat, qwen-plus]
   plan:       [local-qwen, deepseek-chat]
   review:     [local-qwen, deepseek-chat]
   react:      [local-qwen, deepseek-chat]

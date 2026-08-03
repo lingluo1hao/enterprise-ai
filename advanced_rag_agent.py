@@ -459,7 +459,9 @@ class OllamaLLM(BaseLLM):
         self._llm = ChatOllama(
             model=model,
             base_url=base_url,
-            temperature=0.1  # 低温度 = 更确定性的输出，适合 Agent 推理
+            temperature=0,
+            seed=42
+            # temperature=0.1  # 低温度 = 更确定性的输出，适合 Agent 推理
         )
         # 调用统计：帮助用户理解时间花在哪里
         self.call_count = 0
