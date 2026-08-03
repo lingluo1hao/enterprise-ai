@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?labelColor=555555&style=flat-square&logo=python&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-1C3C3C?labelColor=555555&style=flat-square&logo=langchain&logoColor=white)
 ![LangChain](https://img.shields.io/badge/LangChain-RAG-1C3C3C?labelColor=555555&style=flat-square&logo=langchain&logoColor=white)
-![Ollama](https://img.shields.io/badge/Ollama-qwen2:7b-000000?labelColor=555555&style=flat-square&logo=ollama&logoColor=white)
+![Ollama](https://img.shields.io/badge/Ollama-qwen2:7b%2F1.5b-000000?labelColor=555555&style=flat-square&logo=ollama&logoColor=white)
 ![LLM Gateway](https://img.shields.io/badge/LLM_Gateway-Multi--Model_Routing-FF6F61?labelColor=555555&style=flat-square)
 ![Flask](https://img.shields.io/badge/Flask-Web-000000?labelColor=555555&style=flat-square&logo=flask&logoColor=white)
 ![Milvus](https://img.shields.io/badge/Milvus-Vector-FF6F61?labelColor=555555&style=flat-square&logoColor=white)
@@ -85,7 +85,7 @@ enterprise-ai/
 |------|------|
 | `langgraph_rag_agent.py` | **核心引擎**，含 LangGraphRAGApp 类、AgentState 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。 |
 | `advanced_rag_agent.py` | 基础组件库，提供 OllamaLLM、VectorStoreManager、CacheManager、AccessControlFilter、DocSearchSkill 等可复用类。同时保留原 LangChain 版 RAGOrchestrator 实现（兼容旧模式）。 |
-| `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 4 张表：`chat_messages`（对话历史，按 `user_id`+`session_id` 隔离）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）、`chat_summaries`（对话摘要落库，进程重启不丢）。`save_message`/`save_checkpoint` 使用单条 SQL 原子取号（修复并发撞号）。支持连接池、线程安全、自动降级。 |
+| `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 4 张表：`chat_messages`（对话历史，按 `user_id` 外键→admin_users.id + `session_id` 隔离，列 `speaker_role`=消息说话方 user/assistant/system）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）、`chat_summaries`（对话摘要落库，进程重启不丢）。`save_message`/`save_checkpoint` 使用单条 SQL 原子取号（修复并发撞号）。支持连接池、线程安全、自动降级。 |
 | `prompt_manager.py` | **提示词工程管理模块**，含 PromptManager（11 个提示词模板的 CRUD + 动态加载）和 AuthManager（管理员 salt:sha256 密码认证）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务。 |
 | `audit_logger.py` | **审计日志模块**，JSON Lines 结构化日志。覆盖 login/logout/query/query_stream/save_prompt/delete_prompt/import_defaults 7 类操作，字段含 timestamp/ip/username/action/target/result/detail。自动轮转（500KB/3 备份）。 |
 | `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。 |
@@ -209,7 +209,7 @@ pip install langchain langchain-community langgraph \
 
 > **Milvus 客户端版本**：服务端为 Milvus **v2.5.0**，`pymilvus` 必须锁定 **2.5.x**（命令中已写 `pymilvus~=2.5.0`），**勿用 3.x**——3.0 把 BM25 函数类 `FunctionSchema` 改名为 `Function`，且与 2.5 服务端有兼容风险。混合检索（sparse BM25 + dense 向量 + RRF 融合）依赖 2.5.x 的 `Function` / `FunctionType.BM25` API。
 >
-> **Embedding 依赖版本**：`sentence-transformers` 建议使用 **<4**（实测 `5.6.0` 在 Windows + torch 2.13 下构造 `SentenceTransformerEmbeddings` 时**必触发 Segmentation fault**，已降级到 `3.3.1` 稳定）；`numpy` 须保持 **2.x**（torch 2.13 是针对 numpy 2.x 编译的，强降 numpy 1.x 会破坏 torch ABI 反而 segfault）。
+> **Embedding 走 Ollama（无本地 torch 依赖）**：项目只提供 Ollama embedding 模式（`EMBED_BACKEND=ollama`，默认），由虚拟机上的 Ollama 提供 bge-m3，主进程**不加载 torch**，因此**无需安装 `sentence-transformers` / `torch`** 即可完成向量化。
 >
 > 上面的命令可整段复制一次性执行。下表列出每个包的用途与必需性，方便按需裁剪。外部服务（Ollama / Redis / MySQL）的安装见 §3–§6，不在此列。
 
@@ -323,7 +323,13 @@ docker run -d --name mysql8 \
   --collation-server=utf8mb4_unicode_ci
 ```
 
-系统首次连接时会自动创建 `rag_agent` 数据库和 6 张表（`chat_messages`、`task_checkpoints`、`task_queue`、`prompt_templates`、`admin_users`、`prompt_categories`），无需手动建表。
+**建表职责统一由 `init_db.sql` 负责（单一权威源），服务启动不再自动建表。** 启动服务前请先执行仓库根目录的 **`init_db.sql`** 一次性建库 + 建表（含表/字段中文注释）+ 写入种子账号（默认 `admin/admin123`，以及两个普通用户 `reader/reader123`、`viewer/viewer123`，`role='user'`）：
+
+```bash
+mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 < init_db.sql
+```
+
+> 若未初始化就直接启动服务，`memory_store` 会在日志中明确提示「缺失表：xxx，请先执行 init_db.sql」，并降级为内存模式（对话历史不落库，仅当前进程有效），不会崩溃。
 
 **验证连接：**
 
@@ -367,30 +373,55 @@ REDIS_PORT="6379"
 REDIS_PASSWORD="你的 Redis 密码"
 REDIS_DB="0"
 
+# --- 登录 Token（存 Redis，必须配置上面的 Redis）---
+# Token 有效期（秒），默认 7 天；过期后需重新登录
+AUTH_TOKEN_TTL="604800"
+
 # --- 向量库后端（P3：Milvus / ChromaDB 双后端）---
 VECTOR_BACKEND="milvus"                       # milvus=默认向量库；chroma=本地兜底/回滚
 MILVUS_URI="http://192.168.200.128:19530"     # Milvus standalone 地址（与 deploy 编排一致）
 MILVUS_COLLECTION="rag_docs"                 # 文档向量集合名
 HYBRID_SEARCH="true"                          # 混合检索：sparse BM25 + dense 向量 + RRF 融合；false=仅 dense
+
+# --- Embedding 后端（P4：本地 torch / Ollama 二选一）---
+EMBED_BACKEND="ollama"                         # 仅提供 Ollama 模式：走 VM Ollama HTTP 的 bge-m3（主进程零 torch，根治 segfault，吞吐更高）
+OLLAMA_BASE_URL="http://192.168.200.128:11434" # 仅 EMBED_BACKEND=ollama 时生效
+OLLAMA_EMBED_MODEL="bge-m3"                      # 仅 ollama 时生效；VM 执行 ollama pull bge-m3（1.2G，建议走代理加速），dim=1024，中文多语质量优于 nomic
 ```
 
 > 系统启动时自动从 `.env` 加载配置，`os.getenv()` 读取。所有配置项都有合理默认值，`.env` 缺失也不影响启动，但请务必填写真实密码以确保各服务正常连接。
 
 ## 使用方式
 
-### 方式一：命令行交互（LangGraph 引擎，适合调试）
+> ⚠️ **生产环境请使用下方「方式一：Web 界面」。** 下面的命令行交互为**开发者本地调试**用途，**不经过账号密码 / token 校验体系**：其中的 `--admin` 只是一个零认证的本地角色开关，与 Web 端「账号密码登录 → 服务端签发 token → 每次请求凭 token 校验」的真实管理员权限**毫无关系**，切勿将其视为生产权限入口。
+
+### 方式一：Web 界面（推荐，需账号密码登录）
+
+> 注意：在 Windows 上请使用 PowerShell 或 CMD 启动（Milvus 走 HTTP/gRPC 与 Shell 无关；若回退到 ChromaDB 本地模式，Git Bash 下其底层依赖可能异常退出）。
 
 ```bash
-# 普通用户（默认）
-python langgraph_rag_agent.py
+# 默认使用 LangGraph 引擎（断点恢复可用），默认端口 8080
+python rag_web_server.py
 
-# 特权用户
-python langgraph_rag_agent.py --admin
+# 指定端口
+python rag_web_server.py --port 9090
 
-# 直接提问
-python langgraph_rag_agent.py "JM-S509 的定位方式有哪些？" --admin
+# 关闭 LangGraph 引擎（旧版非状态图模式，断点恢复不可用）
+python rag_web_server.py --no-langgraph
+```
 
-# 快速模式（跳过查询重写，速度更快）
+启动后访问 `http://<服务器IP>:8080`，使用已注册的**账号密码**登录（登录成功后服务端签发 token，后续请求凭 token 校验身份与权限），即可在网页内提问。
+
+### 方式二：命令行交互（开发者调试，非生产）
+
+仅用于本地快速验证「检索 → 生成」链路，**不接入 Web 服务、不校验 token、无账号体系**。
+
+```bash
+# LangGraph 引擎（当前主引擎）
+python langgraph_rag_agent.py                                  # 交互模式
+python langgraph_rag_agent.py "JM-S509 的定位方式有哪些？" --admin   # 直接提问（--admin 为本地特权开关，无认证）
+
+# 快速模式（跳过 classify 的 LLM 调用，用规则分类）
 python langgraph_rag_agent.py "通讯协议端口是多少？" --fast
 ```
 
@@ -398,36 +429,19 @@ python langgraph_rag_agent.py "通讯协议端口是多少？" --fast
 
 | 命令 | 作用 |
 |------|------|
-| `/admin` 或 `/特权` | 切换为特权用户 |
+| `/admin` 或 `/特权` | 切换为特权用户（本地开关，**无认证**） |
 | `/user` 或 `/普通` | 切换为普通用户 |
 | `/history` 或 `/历史` | 查看当前会话历史 |
 | `/clear` 或 `/清空` | 清空当前会话历史 |
 | `exit` / `quit` / `退出` | 退出程序 |
 
-### 方式二：命令行交互（旧版兼容）
+### 方式三：命令行交互 · 旧版引擎（仅兼容回溯）
+
+`advanced_rag_agent.py` 是迁移到 LangGraph 之前的旧版 ReAct + Planning 引擎，仍可作为调试入口运行，但**非当前生产引擎**，不推荐常规使用。
 
 ```bash
-# 仍可使用旧版 advanced_rag_agent.py
 python advanced_rag_agent.py
 python advanced_rag_agent.py "问题" --admin --fast
-```
-
-### 方式三：Web 界面（适合非技术人员）
-
-> 注意：在 Windows 上请使用 PowerShell 或 CMD 启动（Milvus 走 HTTP/gRPC 与 Shell 无关；若回退到 ChromaDB 本地模式，Git Bash 下其底层依赖可能异常退出）。
-
-```bash
-# 默认使用 LangGraph 引擎，默认端口 8080
-python rag_web_server.py
-
-# 切换为旧版 LangChain 引擎
-python rag_web_server.py --no-langgraph
-
-# 指定端口
-python rag_web_server.py --port 9090
-
-# 旧版 + 指定端口
-python rag_web_server.py --no-langgraph --port 9090
 ```
 
 打开浏览器访问：
@@ -632,7 +646,7 @@ gw.metrics()["usage_persisted"]     # True 表示已落盘，重启后历史仍�
 | **我的用量** | 主页 `http://localhost:8080` 右上角 📊 按钮 | 弹窗展示当前账号的调用次数 / token 总量 / 输入输出拆分 / 累计成本，以及最近 100 条调用明细（时间、模型、任务、耗时、成本），支持「今日 / 近 7 天 / 近 30 天 / 全部」切换 |
 | **Token 用量看板** | 管理后台 `/admin` → 📊 Token 用量 Tab | 全站汇总 + **用户排行榜**（谁烧的 token 最多）+ 全量调用明细，同样支持时间范围切换 |
 
-主页右上角的 👤 chip 可以切换「用量归属账号」（存 localStorage），提问时随请求上报，token 就记到该账号名下——这样多人共用一个部署时，每个人查到的是自己的账单。
+主页右上角的 👤 chip 显示当前登录账号；点击即退出登录（清除 Redis token 与本地存储）。用量归属账号以登录账号为准，不再允许手动切换，避免越权查询他人账单。
 
 对应后端接口：
 
@@ -665,16 +679,16 @@ GET /api/admin/usage/top?range=7d&limit=100                     # 全用户排�
 |------|------|
 | **提示词工程** | 在线编辑 11 个提示词模板（classify / rewrite / generate 等），支持搜索、按分类过滤、一键恢复默认。修改后即时生效，无需重启服务。 |
 | **在线问答（admin）** | 以管理员角色提问，可访问全部文档（含受限文档），方便验证修改后的提示词效果。 |
-| **登录认证** | salt:sha256 密码哈希存储，token 持久化到 localStorage，刷新页面保持登录状态。 |
+| **登录认证** | salt:sha256 密码哈希存储；登录成功后 token 写入 **Redis**（带 TTL，默认 7 天），并同时下发 HttpOnly Cookie + 前端 localStorage。所有问答 / 任务 / 用量接口均要求携带有效 token，过期或伪造一律 401。admin 与 user 走统一登录入口 `/api/login`，token 内携带 role，后端据此判定特权，客户端无法伪造。 |
 
 ### 权限隔离设计
 
 | 页面 | 角色 | 可访问文档 | 是否需要登录 |
 |------|------|------------|:----------:|
-| `/` 聊天页 | 固定 `user` | 仅公开文档 | ❌ 无需 |
-| `/admin` 管理后台 | 登录后 `admin` | 全部文档 | ✅ 需登录 |
+| `/` 聊天页 | 登录账号的 role（admin 看全部 / user 看公开） | admin 看全部（含受限）、user 仅公开 | ✅ 需登录 |
+| `/admin` 管理后台 | 登录后 `admin` | 全部文档 | ✅ 需登录（非 admin 自动跳回 `/`） |
 
-> 聊天页面不再提供角色切换功能，管理员如需访问受限文档，请从右上角「⚙️ 系统管理」进入管理后台的「在线问答」标签页。
+> **统一登录入口 `/login`**：所有页面均需登录，无 token 或 token 失效会自动重定向到 `/login`；登录成功后**前端按角色路由**——`role='admin'` 跳 `/admin`、其他角色跳 `/`。账号由管理员在 `admin_users` 表分配（`role='admin'` 或 `'user'`），角色完全由登录态（token）决定，前端无法伪造提权。右上角 👤 点击「退出登录」清除 token 并跳回 `/login`。
 
 ### 提示词模板列表
 
@@ -754,7 +768,7 @@ DOC_ACCESS_RULES = {
 
 | 表名 | 作用 |
 |------|------|
-| `chat_messages` | 对话历史持久化，每条 user/assistant 消息一行，按 `session_id` 隔离不同会话 |
+| `chat_messages` | 对话历史持久化，每条消息一行，按 `user_id`(外键→admin_users.id)+`session_id` 隔离。列 `speaker_role`=消息说话方（user=人问 / assistant=AI答 / system=系统提示），与 `admin_users.role`(账号权限) 是两回事 |
 | `task_checkpoints` | 断点快照，每个 LangGraph 节点执行后自动保存 `state` 的 JSON 序列化 |
 | `task_queue` | 任务队列，记录任务生命周期：`pending → running → completed/failed/interrupted` |
 | `chat_summaries` | 对话摘要表（P0 新增）：长对话压缩后的摘要落库，重启后仍可回放；`covers_to` 标记摘要覆盖到的消息序号、`msg_count` 记录覆盖条数 |
@@ -786,16 +800,17 @@ DOC_ACCESS_RULES = {
 
 | 接口 | 方法 | 作用 |
 |------|------|------|
-| `/api/tasks/unfinished?session_id=web:{role}` | GET | 查询指定角色会话的未完成任务列表（role 为 `user`/`admin`，实际 session_id 形如 `web:user`、`web:admin`） |
-| `/api/tasks/resume` | POST | 从断点恢复执行（body: `{"task_id": "xxx"}`） |
+| `/api/tasks/unfinished` | GET | 查询**当前登录用户**的未完成任务列表（无需传参，session_id 由后端按 token 派生，防串会话）；前端登录后渲染横条「上次未完成的任务」+「继续/忽略」按钮 |
+| `/api/tasks/resume` | POST | 从断点恢复执行（body: `{"task_id": "xxx"}`）；后端按当前登录用户身份隔离，杜绝恢复他人任务 |
 
 > **容错策略**：如果 MySQL 不可用，系统自动降级为内存模式（与旧版行为一致），打印警告但不阻断服务。所有数据库操作都有 try-except 兜底。
 
-### P0 记忆系统止血改造要点（2026-08-02）
+### 范式与断点重续改造要点（2026-08-03）
 
-针对三层记忆「各自为政」导致的多类数据正确性问题，本次对 `memory_store.py` / `langgraph_rag_agent.py` / `rag_web_server.py` 做了止血改造（详细方案与验证见 [UPGRADE_PLAN_MEMORY_KB.md](UPGRADE_PLAN_MEMORY_KB.md) §3.7）：
+针对 `user_id` 列此前冗余存用户名字符串（违反第三范式）的问题，本次做了统一整改：
 
-- **身份贯通（user_id）**：`chat_messages`/`task_checkpoints`/`task_queue` 三表新增 `user_id` 列与复合索引；存量库通过 `_create_tables` 内联的幂等 `ALTER` 自动补齐；`get_unfinished_tasks` 等接口按 `user_id` 过滤，杜绝任务/历史串户。
+- **范式整改（user_id 改为外键）**：`chat_messages`/`task_checkpoints`/`task_queue`/`chat_summaries` 四张表的用户列统一改为 `BIGINT` 类型，并加 `FOREIGN KEY (user_id) REFERENCES admin_users(id) ON DELETE CASCADE`。业务表不再冗余存用户名，显示用户名时通过 `admin_users.id` 关联查询（登录态的 `user_id` 来自 token payload）。`init_db.sql` 为建表唯一权威源。
+- **身份贯通（user_id 透传）**：登录态 `g.current_user["user_id"]`（来自 `admin_users.id`）贯穿 `save_message`/`save_checkpoint`/`create_task`/`get_unfinished_tasks`/`load_messages`/`save_summary` 等全链路；`/api/history`、`/api/tasks/unfinished`、`/api/tasks/resume` 一律后端派生 session_id，前端不再传 `session_id` 参数，彻底防串会话。
 - **原子取号**：`save_message`/`save_checkpoint` 改用单条 `INSERT ... SELECT COALESCE(MAX(...))+1` 取号，修复高并发下 `MAX()+1` 撞号问题。
 - **摘要落库**：新增 `chat_summaries` 表，`load_messages` 优先带最近摘要再拼接原文，长对话压缩结果进程重启不丢。
 - **缓存命中历史补录**：`langgraph_rag_agent.py` 新增 `_append_history`，缓存命中不再直接 return，而是先补录本轮问答，修复对话历史空洞。
@@ -842,7 +857,7 @@ DOC_ACCESS_RULES = {
 ### 5. 连接 MySQL 失败 / 断点恢复不生效
 
 - 检查 MySQL 是否已启动：`mysql -h <IP> -P 3306 -uroot -p<密码> -e "SHOW DATABASES;"`（密码见 `.env` 中的 `MYSQL_PASSWORD`）
-- 确认 `rag_agent` 数据库已自动创建（首次启动时会自动建库建表）
+- 确认 `rag_agent` 库及 6 张业务表已存在：先执行过 `init_db.sql` 初始化（服务启动不再自动建表，表缺失会降级内存模式并提示执行 `init_db.sql`）
 - MySQL 不可用不影响核心问答功能，系统会自动降级为内存模式
 - 断点恢复仅在 LangGraph 引擎模式下可用（`python rag_web_server.py` 默认即为 LangGraph）
 
@@ -859,12 +874,12 @@ DOC_ACCESS_RULES = {
 
 ### 8. 运行时 segfault / 闪退
 
-- **已代码级根治**：`advanced_rag_agent.py` 顶部（import torch 之前）已内置把 `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `NUMEXPR_NUM_THREADS` / `VECLIB_MAXIMUM_THREADS` 全部限制为 `1`，并关闭 `TOKENIZERS_PARALLELISM`。Windows + torch 2.13 多线程会触发 Segmentation fault，**加了这段后即可正常启动，无需手动设环境变量**。
-- 若仍崩，按以下顺序排查：
-  1. 检查 `sentence-transformers` 版本：必须是 **<4**（实测 `5.x` 在 Windows + torch 2.13 下构造 Embedding 必 segfault，降到 `3.3.1` 稳定）。
-  2. 检查 `numpy`：须为 **2.x**，**切勿降到 1.x**——torch 2.13 针对 numpy 2.x 编译，强降 numpy 会破坏 torch ABI 反而 segfault。
-  3. 确保运行在 **Python 3.10** 环境（本项目约定 `conda env: py310`）；部分依赖在 3.12+ 上有兼容问题。
-  4. 启动方式：推荐 PowerShell / CMD；回退到 ChromaDB 本地模式时 Git Bash 底层依赖可能异常退出（Milvus 走网络不受此限）。
+> **本项目已从设计上消除该类崩溃**：Embedding 只提供 **Ollama 模式**（`EMBED_BACKEND=ollama`，默认），由虚拟机上的 Ollama 提供 bge-m3，主 web 进程**完全不加载 torch**，因此历史上「本地 SentenceTransformer + fork 多 worker 触发 OpenMP/MKL Segmentation fault」这一类问题已不存在，无需任何线程数保险丝。
+
+- 若仍遇进程崩溃，按以下顺序排查（与 Embedding 无关的常见原因）：
+  1. 确保运行在 **Python 3.10** 环境（本项目约定 `conda env: py310`）；部分依赖在 3.12+ 上有兼容问题。
+  2. 启动方式：推荐 PowerShell / CMD；若向量库回退到 ChromaDB 本地模式，Git Bash 底层依赖可能异常退出（Milvus 走网络不受此限）。
+  3. **Linux / 虚拟机（如 Rocky Linux 10）部署**：Web server 若用 `gunicorn` / `uvicorn` 的 fork 多 worker，注意子进程 fork 后再 import 重型库可能不稳定，稳妥做法用 `gunicorn --preload`（父进程先 import 应用再 fork）或限制 worker 数；多 worker 用 `--workers N` 横向扩展并发。
 
 ### 9. LangGraph 模式 vs 旧版模式如何选择？
 

@@ -1,12 +1,13 @@
 """
 ================================================================================
-  高级 RAG Agent — 真实环境版（ChromaDB + Ollama）
+  高级 RAG Agent — 真实环境版（Milvus / ChromaDB + Ollama LLM 网关）
 ================================================================================
 
   本文件是advanced_rag.py 的真实环境版本：
     - 不使用任何 Mock 数据或 Mock LLM
-    - 直接连接本地 ChromaDB 向量数据库
-    - 直接调用本地 Ollama（qwen2:7b）进行推理
+    - 直接连接向量数据库（Milvus 默认，ChromaDB 兜底）
+    - 推理经 LLM 网关（llm_gateway.create_llm）路由到本地 Ollama 多模型：
+      qwen2:7b 负责生成/规划，qwen2.5:1.5b 负责分类打分/改写/压缩
     - 保留完整的 ReAct + Planning Agent + 智能 RAG + Skill 架构
 
   ┌──────────────────────────────────────────────────────────────────┐
@@ -71,7 +72,7 @@
   环境要求：
     - Python 3.10（conda env: pythonspace）
     - ChromaDB 已构建（./chroma_db）
-    - Ollama 已启动并加载 qwen2:7b 模型
+    - Ollama 已启动并加载 qwen2:7b 与 qwen2.5:1.5b 模型（网关按任务路由）
 
 ================================================================================
 """
@@ -85,12 +86,8 @@ import os
 def _load_dotenv(dotenv_path: str | None = None):
     """解析 .env 文件并将未设置的变量注入 os.environ。"""
     if dotenv_path is None:
-        # 从当前文件所在目录向上查找 .env
-        import __main__
-        dotenv_path = os.path.join(
-            os.path.dirname(os.path.abspath(__main__.__file__ if hasattr(__main__, '__file__') else __file__)),
-            ".env"
-        )
+        # 用本模块所在目录定位 .env，确保无论从哪个入口脚本运行都能加载到项目根配置
+        dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.isfile(dotenv_path):
         return
     with open(dotenv_path, "r", encoding="utf-8") as f:
@@ -108,18 +105,6 @@ def _load_dotenv(dotenv_path: str | None = None):
 
 _load_dotenv()
 
-# HF_ENDPOINT 指向国内镜像，加速 embedding 模型下载
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
-# Windows + torch 多线程在部分 CPU 上会触发 Segmentation fault，
-# 必须在任何 torch/transformers 代码加载前把各类数值库线程数限制在 1。
-# （实测 py310 + torch 2.13 + sentence-transformers 在构造 Embedding 时必崩，
-#   限定 OMP/MKL/OpenBLAS 等线程数后稳定。用 setdefault 以保留用户显式覆盖能力。）
-for _t in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-    os.environ.setdefault(_t, "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
 # 屏蔽 LangChain 的弃用警告，让输出更干净
 import warnings
 warnings.filterwarnings("ignore")
@@ -127,14 +112,12 @@ warnings.filterwarnings("ignore")
 import re
 import sys
 import json
-import ast
-import operator as op
 import time
 import hashlib
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any
 
 # ============================================================================
 # 配置区
@@ -143,7 +126,6 @@ DOC_FOLDER = "./docs"
 DB_PATH = "./chroma_db"
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.200.128:11434")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2:7b")
-EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
 SEPARATORS = ["\n\n", "\n", "。", "；", "？", "！", "，", "、"]
@@ -181,7 +163,7 @@ DEFAULT_ROLE = ROLE_USER   # 默认角色
 # 第零部分：Redis 智能缓存层
 # ============================================================================
 #
-#  为什么需要缓存？每次问答都要调 6+ 次 LLM（qwen2:7b），耗时 90s+。
+#  为什么需要缓存？每次问答都要调 6+ 次 LLM（经 LLM 网关路由到 qwen2:7b / qwen2.5:1.5b 等本地模型），耗时 90s+。
 #  同样的问题问两遍，完全没有必要重新跑一轮——缓存直接返回。
 #
 #  缓存架构 — 两级匹配（先精确后语义）：
@@ -427,8 +409,7 @@ class CacheManager:
         使用与 ChromaDB 相同的 BAAI/bge-small-zh-v1.5 模型。
         """
         if self._embed_fn is None:
-            from langchain_community.embeddings import SentenceTransformerEmbeddings
-            self._embed_fn = SentenceTransformerEmbeddings(model_name=EMBED_MODEL)
+            self._embed_fn = _make_embedder()
         return self._embed_fn.embed_query(text)
 
 
@@ -561,6 +542,34 @@ def create_llm(verbose: bool = True):
 # 这部分封装了 ChromaDB 的初始化和检索操作。
 # 但封装成类方便 Skill 调用。
 
+
+def _make_embedder():
+    """
+    构造 embedding 函数，统一供检索与缓存使用。
+
+    本项目只提供 **Ollama 模式**：langchain_community.embeddings.OllamaEmbeddings，
+    走 HTTP 调用虚拟机 Ollama（默认 192.168.200.128:11434）的 bge-m3。主进程
+    **不加载 torch**，从源头消除 Segmentation fault；Ollama 服务端自带多线程 +
+    批处理，吞吐稳定。需先在 VM 上 `ollama pull` 对应 embedding 模型（如 bge-m3）。
+
+    不再保留本地 SentenceTransformer 回退：EMBED_BACKEND 仅用于显式确认后端
+    （默认 ollama）；若误配为非 ollama 值，将强制使用 ollama 并打印告警，绝不会
+    退回任何本地 torch 路径。
+    """
+    backend = os.getenv("EMBED_BACKEND", "ollama").lower()
+    if backend != "ollama":
+        print(f"[VectorStore] 警告：EMBED_BACKEND={backend!r} 不受支持，"
+              f"本项目仅支持 ollama 模式，已强制使用 ollama")
+    try:
+        from langchain_ollama import OllamaEmbeddings
+    except ImportError:
+        from langchain_community.embeddings import OllamaEmbeddings
+    base = os.getenv("OLLAMA_BASE_URL", "http://192.168.200.128:11434")
+    model = os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
+    print(f"[VectorStore] Embedding 后端=ollama ({model} @ {base})，主进程不加载 torch")
+    return OllamaEmbeddings(model=model, base_url=base)
+
+
 class VectorStoreManager:
     """
     向量数据库管理器 —— 统一封装 ChromaDB / Milvus 两种后端（方案 P3）
@@ -582,8 +591,7 @@ class VectorStoreManager:
         # 混合检索开关：sparse BM25 + dense 向量 + RRF 融合（方案 P1 核心）
         self.hybrid = (os.getenv("HYBRID_SEARCH", "true").lower() != "false")
         # embedding 函数与 Chroma 路径完全一致，保证向量空间统一
-        from langchain_community.embeddings import SentenceTransformerEmbeddings
-        self._embed = SentenceTransformerEmbeddings(model_name=EMBED_MODEL)
+        self._embed = _make_embedder()
 
         if self.backend == "milvus":
             try:
@@ -658,10 +666,17 @@ class VectorStoreManager:
         if self.client.has_collection(self.collection):
             try:
                 desc = self.client.describe_collection(self.collection)
-                existing = [f.get("name") for f in desc.get("fields", [])]
-                if "sparse" in existing:
+                fields = desc.get("fields", [])
+                existing = [f.get("name") for f in fields]
+                # 维度也要匹配：切换 embedding 模型（如 dim 512→768）后必须重建
+                dense_field = next((f for f in fields if f.get("name") == "dense"), None)
+                existing_dim = None
+                if dense_field:
+                    existing_dim = dense_field.get("params", {}).get("dim") or dense_field.get("dim")
+                if "sparse" in existing and existing_dim == dim:
                     return
-                print(f"[VectorStore] 检测到旧版集合(无 sparse 字段)，重建以支持混合检索...")
+                reason = "维度不匹配" if existing_dim != dim else "无 sparse 字段"
+                print(f"[VectorStore] 检测到集合需重建({reason}: 现有 dim={existing_dim}, 新 dim={dim})，重建以支持混合检索...")
             except Exception:
                 pass
             self.client.drop_collection(self.collection)
@@ -1348,19 +1363,6 @@ class DocSearchSkill(BaseSkill):
 
         return [(doc, dist) for doc, dist, _ in selected]
 
-    def _extract_keywords(self, text: str) -> str:
-        """从文本中提取关键词用于第二轮检索"""
-        # 提取中文词和英文词
-        words = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z]{2,}', text)
-        # 取前8个去重
-        seen = set()
-        unique = []
-        for w in words:
-            if w not in seen:
-                seen.add(w)
-                unique.append(w)
-        return " ".join(unique[:8]) if unique else ""
-
 
 # ============================================================
 # 安全数学求值器 + CalculatorSkill 已抽到 skill_framework.py
@@ -1408,7 +1410,7 @@ class ReActAgent:
 
     工作流程：
       1. 构造 prompt，包含：子任务描述 + 可用技能列表 + 历史观察结果
-      2. 调用 LLM（Ollama qwen2:7b）生成下一步的 Thought + Action
+      2. 调用 LLM（经 LLM 网关 create_llm()，按 task 路由到 qwen2:7b / qwen2.5:1.5b）生成下一步的 Thought + Action
       3. 如果 Action 是某个技能，执行该技能获得 Observation
       4. 如果 LLM 输出 Final Answer，结束循环
       5. 否则把新的 Observation 加入上下文，回到第1步
@@ -1988,7 +1990,7 @@ def run_interactive(orchestrator: RAGOrchestrator):
     print(f"""
     ╔══════════════════════════════════════════════════════════════════╗
     ║          高级 RAG Agent — 交互模式                               ║
-    ║          ChromaDB + Ollama(qwen2:7b) + ReAct + Planning Agent   ║
+    ║     Milvus/Chroma + Ollama(LLM网关: qwen2.5:1.5b / qwen2:7b) + ReAct+Planning  ║
     ║          用户角色: {orchestrator.user_role}（{role_desc}）
     ╚══════════════════════════════════════════════════════════════════╝
 
@@ -2063,7 +2065,7 @@ def main():
     ╔══════════════════════════════════════════════════════════════════╗
     ║          高级 RAG Agent — 真实环境版                              ║
     ║          ReAct + Planning Agent + 智能 RAG + Skill 系统          ║
-    ║          ChromaDB + Ollama(qwen2:7b)  [{mode_label}]                     ║
+    ║      Milvus/Chroma + Ollama(LLM网关: qwen2.5:1.5b / qwen2:7b)  [{mode_label}]           ║
     ║          用户角色: {user_role}（{role_desc}）
     ╚══════════════════════════════════════════════════════════════════╝
     """)

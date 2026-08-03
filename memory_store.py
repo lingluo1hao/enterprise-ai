@@ -86,6 +86,62 @@ HISTORY_MAX_TURNS = 8
 HISTORY_COMPRESS_TURNS = 6
 
 
+# ============================================================================
+# JSON 序列化辅助（用于断点快照的 Document/tuple 兼容）
+# ============================================================================
+def _json_default(obj):
+    """
+    json.dumps 的 default 回调。
+    - langchain_core.documents.Document → {"__type__": "Document", "page_content": ..., "metadata": ...}
+    - tuple → {"__type__": "tuple", "items": [...]}（JSON 不支持 tuple）
+    - 其他不可序列化对象 → 退化为 str(obj)
+    """
+    # Document 对象识别：duck-type 检查 page_content + metadata
+    if hasattr(obj, "page_content") and hasattr(obj, "metadata"):
+        try:
+            meta = dict(obj.metadata) if obj.metadata else {}
+        except Exception:
+            meta = {}
+        return {
+            "__type__": "Document",
+            "page_content": obj.page_content,
+            "metadata": meta,
+        }
+    if isinstance(obj, tuple):
+        return {"__type__": "tuple", "items": list(obj)}
+    return str(obj)
+
+
+def _json_object_hook(d):
+    """
+    json.loads 的 object_pairs_hook/object_hook 回调：把 _json_default 打的标记还原。
+    - {"__type__": "Document", ...} → langchain Document
+    - {"__type__": "tuple", "items": [...]} → tuple
+    - 其他普通 dict 原样返回
+    """
+    if not isinstance(d, dict) or "__type__" not in d:
+        return d
+    t = d.get("__type__")
+    if t == "Document":
+        try:
+            from langchain_core.documents import Document
+            return Document(
+                page_content=d.get("page_content", ""),
+                metadata=d.get("metadata") or {},
+            )
+        except Exception:
+            # 极端情况：langchain_core 不在。降级为简单命名空间
+            class _Doc:
+                pass
+            doc = _Doc()
+            doc.page_content = d.get("page_content", "")
+            doc.metadata = d.get("metadata") or {}
+            return doc
+    if t == "tuple":
+        return tuple(d.get("items", []))
+    return d
+
+
 class MySQLMemoryStore:
     """
     MySQL 持久化记忆存储
@@ -109,10 +165,11 @@ class MySQLMemoryStore:
         database: str = MYSQL_DATABASE,
     ):
         """
-        初始化 MySQL 连接并创建表结构。
+        初始化 MySQL 连接并校验表结构。
 
-        如果连接失败，self.available = False，所有方法降级为空操作，
-        不影响 Agent 主流程（容错降级策略）。
+        建表 DDL 统一由 init_db.sql 负责（单一权威源），本类不在代码里
+        CREATE TABLE。如果连接失败或表缺失，self.available = False，
+        所有方法降级为空操作，不影响 Agent 主流程（容错降级策略）。
         """
         self.host = host
         self.port = port
@@ -162,10 +219,11 @@ class MySQLMemoryStore:
                 autocommit=True,        # 自动提交，简化事务管理
             )
 
-            # 创建三张表
-            self._create_tables()
-            self.available = True
-            print(f"  [MySQLMemoryStore] 连接成功: {host}:{port}/{database}")
+            # 校验表结构：建表职责统一交给 init_db.sql（单一权威源），
+            # 这里仅检查 6 张核心表是否已由 init_db.sql 建好
+            if self._verify_schema():
+                self.available = True
+                print(f"  [MySQLMemoryStore] 连接成功: {host}:{port}/{database}")
 
         except Exception as e:
             print(f"  [MySQLMemoryStore] 连接失败，降级为内存模式: {e}")
@@ -181,138 +239,48 @@ class MySQLMemoryStore:
         """
         return self._pool.connection()
 
-    def _create_tables(self):
-        """
-        创建三张表（如果不存在）。
 
-        表设计说明：
-        - chat_messages: 每条消息一行，按 session_id 隔离不同会话
-        - task_checkpoints: 每个节点执行后保存一条快照，按 thread_id 关联
-        - task_queue: 任务生命周期管理，status 字段记录当前状态
+    def _verify_schema(self):
         """
+        校验数据库表结构是否已由 init_db.sql 初始化。
+
+        设计原则：建表 DDL 的单一权威源是 init_db.sql，不在代码里重复
+        CREATE TABLE（避免两份 DDL 不同步、注释不一致）。本方法只做存在性
+        检查：
+          - 6 张核心表都在 -> 返回 True，正常可用
+          - 任意表缺失    -> 降级为内存模式，并打印明确提示「请先执行 init_db.sql」
+        """
+        required = [
+            "chat_messages", "task_checkpoints", "task_queue",
+            "chat_summaries", "prompt_templates", "admin_users",
+        ]
+        # 连接失败直接抛，由 __init__ 的 except 统一降级为内存模式
         conn = self._get_conn()
         cursor = conn.cursor()
-
-        # 表 1: 对话历史
-        # user_id 隔离不同用户（P0 止血：原表无 user_id，所有人历史混在一起）
-        # session_id 隔离不同会话
-        # role 区分 user/assistant/system（压缩后的摘要）
-        # content 存储消息原文
-        # msg_order 记录消息顺序（用于按序加载）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-                user_id     VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
-                session_id  VARCHAR(128)  NOT NULL,
-                role        VARCHAR(20)   NOT NULL,
-                content     TEXT          NOT NULL,
-                msg_order   INT           NOT NULL DEFAULT 0,
-                created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_user_session (user_id, session_id, msg_order),
-                INDEX idx_user_time (user_id, created_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-
-        # 表 2: 断点快照
-        # thread_id = task_id，每个任务一个线程
-        # node_name 记录快照是在哪个节点执行后保存的
-        # state_json 是 LangGraph AgentState 的完整 JSON 序列化
-        # checkpoint_order 区分同一任务的多个快照（取最新的一条恢复）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS task_checkpoints (
-                id              BIGINT AUTO_INCREMENT PRIMARY KEY,
-                user_id         VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
-                thread_id       VARCHAR(128)  NOT NULL,
-                session_id      VARCHAR(128)  NOT NULL,
-                node_name       VARCHAR(64)   NOT NULL,
-                state_json      LONGTEXT      NOT NULL,
-                checkpoint_order INT          NOT NULL DEFAULT 0,
-                created_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_user_thread (user_id, thread_id, checkpoint_order)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-
-        # 表 3: 任务队列
-        # status 取值: pending → running → completed/failed/interrupted
-        # pending:   任务已创建，尚未开始执行
-        # running:   正在执行中（LangGraph 图正在跑）
-        # completed: 正常完成，答案已返回
-        # failed:    执行出错
-        # interrupted: 被中断（服务宕机/用户关闭客户端）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS task_queue (
-                id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-                user_id     VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
-                task_id     VARCHAR(128)  NOT NULL UNIQUE,
-                session_id  VARCHAR(128)  NOT NULL,
-                query       TEXT          NOT NULL,
-                role        VARCHAR(20)   NOT NULL DEFAULT 'user',
-                status      VARCHAR(20)   NOT NULL DEFAULT 'pending',
-                answer      TEXT,
-                error_msg   TEXT,
-                created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                INDEX idx_user_status (user_id, status, created_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-
-        # 表 4: 对话历史摘要（P0 止血：压缩摘要落库，重启不丢）
-        # embedding 列 P3 阶段填充，用于跨会话语义召回
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chat_summaries (
-                id           BIGINT AUTO_INCREMENT PRIMARY KEY,
-                user_id      VARCHAR(64)  NOT NULL DEFAULT 'anonymous',
-                session_id   VARCHAR(128) NOT NULL,
-                summary      TEXT         NOT NULL,
-                covers_from  BIGINT       NOT NULL DEFAULT 0,
-                covers_to    BIGINT       NOT NULL DEFAULT 0,
-                msg_count    INT          NOT NULL DEFAULT 0,
-                importance   TINYINT      NOT NULL DEFAULT 3,
-                embedding    LONGBLOB     NULL,
-                created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_user_session (user_id, session_id, covers_to),
-                INDEX idx_importance (user_id, importance DESC, created_at DESC)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-
-        # ---- 兼容存量库：若 user_id 列不存在则补齐（幂等）----
-        # 表 1
-        try:
-            cursor.execute(
-                "ALTER TABLE chat_messages "
-                "ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous' AFTER id, "
-                "ADD INDEX idx_user_session (user_id, session_id, msg_order), "
-                "ADD INDEX idx_user_time (user_id, created_at)"
-            )
-        except Exception:
-            pass  # 列已存在则忽略（Duplicate column）
-        # 表 2
-        try:
-            cursor.execute(
-                "ALTER TABLE task_checkpoints "
-                "ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous' AFTER id, "
-                "ADD INDEX idx_user_thread (user_id, thread_id, checkpoint_order)"
-            )
-        except Exception:
-            pass
-        # 表 3
-        try:
-            cursor.execute(
-                "ALTER TABLE task_queue "
-                "ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'anonymous' AFTER id, "
-                "ADD INDEX idx_user_status (user_id, status, created_at)"
-            )
-        except Exception:
-            pass
-
+        missing = []
+        for t in required:
+            try:
+                cursor.execute("SHOW TABLES LIKE %s", (t,))
+                if not cursor.fetchone():
+                    missing.append(t)
+            except Exception:
+                missing.append(t)
         cursor.close()
         conn.close()
+
+        if missing:
+            self.available = False
+            print("  [MySQLMemoryStore] 数据库表缺失，已降级为内存模式。")
+            print("  [MySQLMemoryStore] 缺失表: " + ", ".join(missing))
+            print("  [MySQLMemoryStore] 请先执行 init_db.sql 初始化数据库后再启动服务。")
+            return False
+        return True
 
     # ========================================================================
     # 对话历史 CRUD
     # ========================================================================
 
-    def save_message(self, session_id: str, role: str, content: str, user_id: str = "anonymous"):
+    def save_message(self, session_id: str, speaker_role: str, content: str, user_id: int = 0):
         """
         保存一条对话消息到 MySQL。
 
@@ -320,10 +288,10 @@ class MySQLMemoryStore:
         现在消息直接写入 MySQL，服务重启后依然存在。
 
         参数：
-            session_id: 会话标识符
-            role: 消息角色（user / assistant / system）
-            content: 消息内容
-            user_id: 用户标识（P0 止血，默认 anonymous）
+            session_id:   会话标识符
+            speaker_role: 消息说话方（user / assistant / system），不是账号权限等级
+            content:      消息内容
+            user_id:      登录账号的 ID（admin_users.id），外键关联，不冗余存用户名
         """
         if not self.available:
             # 降级：写入内存
@@ -331,7 +299,7 @@ class MySQLMemoryStore:
                 self._fallback_history[session_id] = []
             order = len(self._fallback_history[session_id])
             self._fallback_history[session_id].append(
-                {"role": role, "content": content, "msg_order": order}
+                {"role": speaker_role, "content": content, "msg_order": order}
             )
             return
 
@@ -341,17 +309,17 @@ class MySQLMemoryStore:
             # 原子取号：单条 SQL 同时完成「取最大 order + 插入」，
             # 避免 SELECT MAX + INSERT 两步非原子导致并发撞号（P0 止血 3.5）
             cursor.execute(
-                "INSERT INTO chat_messages (user_id, session_id, role, content, msg_order) "
+                "INSERT INTO chat_messages (user_id, session_id, speaker_role, content, msg_order) "
                 "SELECT %s, %s, %s, %s, COALESCE(MAX(msg_order), 0) + 1 "
                 "FROM chat_messages WHERE user_id = %s AND session_id = %s",
-                (user_id, session_id, role, content, user_id, session_id),
+                (user_id, session_id, speaker_role, content, user_id, session_id),
             )
             cursor.close()
             conn.close()
         except Exception as e:
             print(f"  [MySQLMemoryStore] save_message 失败: {e}")
 
-    def load_messages(self, session_id: str, limit: int = 50, user_id: str = "anonymous") -> List[Dict]:
+    def load_messages(self, session_id: str, limit: int = 50, user_id: int = 0) -> List[Dict]:
         """
         从 MySQL 加载对话历史。
 
@@ -363,9 +331,10 @@ class MySQLMemoryStore:
         参数：
             session_id: 会话标识符
             limit: 最多加载多少条（默认 50，避免超长历史拖慢加载）
-            user_id: 用户标识（与写入时一致）
+            user_id: 登录账号的 ID（admin_users.id），与写入时一致
         返回：
             [{"role": "user", "content": "..."}, ...] 格式的消息列表
+            （返回仍用 OpenAI 约定的 "role" 键，便于直接喂给 LLM）
         """
         if not self.available:
             return [
@@ -404,7 +373,7 @@ class MySQLMemoryStore:
                 covers_to = crow[0] if crow else 0
 
             cursor.execute(
-                "SELECT role, content FROM chat_messages "
+                "SELECT speaker_role, content FROM chat_messages "
                 "WHERE user_id = %s AND session_id = %s AND id > %s "
                 "ORDER BY msg_order DESC LIMIT %s",
                 (user_id, session_id, covers_to, limit),
@@ -412,7 +381,7 @@ class MySQLMemoryStore:
             rows = cursor.fetchall()
             cursor.close()
             conn.close()
-            # DESC 查询后需要反转为正序
+            # DESC 查询后需要反转为正序；返回键仍用 OpenAI 约定的 "role"
             messages = [
                 {"role": row[0], "content": row[1]}
                 for row in reversed(rows)
@@ -424,7 +393,7 @@ class MySQLMemoryStore:
             print(f"  [MySQLMemoryStore] load_messages 失败: {e}")
             return []
 
-    def clear_messages(self, session_id: str, user_id: str = "anonymous"):
+    def clear_messages(self, session_id: str, user_id: int = 0):
         """清空指定会话的所有对话历史"""
         if not self.available:
             self._fallback_history.pop(session_id, None)
@@ -451,7 +420,7 @@ class MySQLMemoryStore:
         session_id: str,
         node_name: str,
         state: Dict[str, Any],
-        user_id: str = "anonymous",
+        user_id: int = 0,
     ):
         """
         保存一个 LangGraph 断点快照。
@@ -459,12 +428,16 @@ class MySQLMemoryStore:
         作用：在每个 LangGraph 节点执行完毕后调用，把当前 state 序列化存入 MySQL。
         如果服务在此之后宕机，下次可以通过 load_latest_checkpoint 恢复到这个状态。
 
+        序列化：state 中 retrieved_docs 元素是 (Document, score) 元组，
+        Document 对象不能直接 json.dumps，需要走 _json_default 拆解为字典，
+        并打上 __type__ 标记，反序列化时用 object_hook 还原。
+
         参数：
             thread_id: 任务 ID（与 task_queue.task_id 对应）
             session_id: 会话 ID
             node_name: 刚执行完的节点名称（如 "classify", "retrieve"）
             state: LangGraph 的 AgentState 字典
-            user_id: 用户标识（P0 止血）
+            user_id: 登录账号的 ID（admin_users.id），外键关联
         """
         if not self.available:
             if thread_id not in self._fallback_checkpoints:
@@ -472,15 +445,15 @@ class MySQLMemoryStore:
             order = len(self._fallback_checkpoints[thread_id])
             self._fallback_checkpoints[thread_id].append({
                 "node_name": node_name,
-                "state_json": json.dumps(state, ensure_ascii=False, default=str),
+                "state_json": json.dumps(state, ensure_ascii=False, default=_json_default),
                 "checkpoint_order": order,
             })
             return
 
         try:
-            # state 中可能包含不可 JSON 序列化的对象（如 Document），
-            # 用 default=str 做兜底转换
-            state_json = json.dumps(state, ensure_ascii=False, default=str)
+            # state 中可能包含不可 JSON 序列化的对象（如 Document、tuple），
+            # 用 _json_default 把 Document 转 dict、tuple 转 list 并打 __type__ 标记
+            state_json = json.dumps(state, ensure_ascii=False, default=_json_default)
 
             conn = self._get_conn()
             cursor = conn.cursor()
@@ -505,6 +478,10 @@ class MySQLMemoryStore:
         作用：断点恢复时调用。读取 task_checkpoints 中该 thread_id 的最新快照，
         返回 state 字典和中断节点名称。
 
+        反序列化：通过 _json_object_hook 把 {"__type__": "Document"} 还原为
+        langchain_core.documents.Document 对象；{"__type__": "tuple"} 还原为 tuple，
+        否则后续节点访问 d[0].page_content 会报 'str' object has no attribute。
+
         参数：
             thread_id: 任务 ID
         返回：
@@ -518,7 +495,7 @@ class MySQLMemoryStore:
             last = checkpoints[-1]
             return {
                 "node_name": last["node_name"],
-                "state": json.loads(last["state_json"]),
+                "state": json.loads(last["state_json"], object_hook=_json_object_hook),
                 "checkpoint_order": last["checkpoint_order"],
             }
 
@@ -538,7 +515,7 @@ class MySQLMemoryStore:
                 return None
             return {
                 "node_name": row[0],
-                "state": json.loads(row[1]),
+                "state": json.loads(row[1], object_hook=_json_object_hook),
                 "checkpoint_order": row[2],
             }
         except Exception as e:
@@ -551,7 +528,7 @@ class MySQLMemoryStore:
 
     def create_task(
         self, session_id: str, query: str, role: str = "user",
-        user_id: str = "anonymous",
+        user_id: int = 0,
     ) -> str:
         """
         创建一个新任务，返回 task_id。
@@ -564,7 +541,7 @@ class MySQLMemoryStore:
             session_id: 会话 ID
             query: 用户问题
             role: 用户角色
-            user_id: 用户标识（P0 止血，防止 A 用户恢复 B 用户的任务）
+            user_id: 登录账号的 ID（admin_users.id），防止 A 用户恢复 B 用户的任务
         返回：
             task_id（UUID 格式，全局唯一）
         """
@@ -634,7 +611,7 @@ class MySQLMemoryStore:
         except Exception as e:
             print(f"  [MySQLMemoryStore] update_task_status 失败: {e}")
 
-    def get_unfinished_tasks(self, session_id: str, user_id: str = "anonymous") -> List[Dict]:
+    def get_unfinished_tasks(self, session_id: str, user_id: int = 0) -> List[Dict]:
         """
         查询指定会话的所有未完成任务（status=running 或 interrupted）。
 
@@ -649,7 +626,7 @@ class MySQLMemoryStore:
 
         参数：
             session_id: 会话 ID
-            user_id: 用户标识（P0 止血：防止 A 用户恢复 B 用户的任务）
+            user_id: 登录账号的 ID（admin_users.id），防止 A 用户恢复 B 用户的任务
         返回：
             [{"task_id": "...", "query": "...", "created_at": "...", "status": "..."}, ...]
         """
@@ -685,7 +662,7 @@ class MySQLMemoryStore:
     # 对话摘要 CRUD（P0 止血 3.4：压缩摘要落库，重启不丢）
     # ========================================================================
 
-    def get_last_message_id(self, session_id: str, user_id: str = "anonymous") -> int:
+    def get_last_message_id(self, session_id: str, user_id: int = 0) -> int:
         """
         返回指定会话最后一条 chat_messages.id，用于记录摘要覆盖到的位置。
         """
@@ -707,7 +684,7 @@ class MySQLMemoryStore:
 
     def save_summary(
         self,
-        user_id: str,
+        user_id: int,
         session_id: str,
         summary: str,
         covers_to: int,

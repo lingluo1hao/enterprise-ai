@@ -601,15 +601,44 @@ class PromptManager:
 
 class AuthManager:
     """
-    管理员认证管理器
+    认证管理器（管理员 + 普通用户通用）
 
     密码存储格式：salt:sha256(salt + password)
+    Token 存储：登录成功后写入 Redis（auth:token:{token} → session JSON），带 TTL。
+      - admin 与 user 各自生成独立随机 token，且 token 内携带 role，
+        普通用户 token 无法调用需要 admin 角色的接口。
+      - Redis 不可用时回退到进程内字典（仅单实例有效，会打印告警）。
     """
+
+    # Token 有效期（秒），可被环境变量 AUTH_TOKEN_TTL 覆盖
+    TOKEN_TTL = int(os.environ.get("AUTH_TOKEN_TTL", "604800"))  # 默认 7 天
 
     def __init__(self):
         self._pool = None
         self.available = False
+        self._redis = None
+        self._token_store = {}  # Redis 不可用时的回退存储
         self._init_db()
+        self._init_redis()
+
+    def _init_redis(self):
+        """初始化 Redis 连接（用于 token 存储）"""
+        try:
+            import redis as redis_pkg
+            self._redis = redis_pkg.Redis(
+                host=os.environ.get("REDIS_HOST", "127.0.0.1"),
+                port=int(os.environ.get("REDIS_PORT", "6379")),
+                password=os.environ.get("REDIS_PASSWORD") or None,
+                db=int(os.environ.get("REDIS_DB", "0")),
+                socket_connect_timeout=5, socket_timeout=5,
+                decode_responses=True,
+            )
+            self._redis.ping()
+            print(f"  [AuthManager] Redis 已连接（token 存储）")
+        except Exception as e:
+            self._redis = None
+            self._token_store = {}
+            print(f"  [AuthManager] ⚠ Redis 不可用，token 回退到内存存储: {e}")
 
     def _init_db(self):
         """初始化 MySQL 连接"""
@@ -629,6 +658,77 @@ class AuthManager:
         except Exception as e:
             print(f"  [AuthManager] 连接失败: {e}")
             self._pool = None
+
+    # ---- Token 存储（Redis 优先，内存回退）----
+    # 索引：auth:user_tokens:{username} (Set) → 该账号当前在用的所有 token
+    # 用于：登录时清空同账号旧 token、登出时按 username 定位
+    @staticmethod
+    def _user_index_key(username: str) -> str:
+        return f"auth:user_tokens:{username}" if username else ""
+
+    def _save_token(self, token: str, session: Dict):
+        import json as _json
+        payload = _json.dumps(session)
+        username = session.get("username") if isinstance(session, dict) else None
+        if self._redis is not None:
+            pipe = self._redis.pipeline()
+            pipe.setex(f"auth:token:{token}", self.TOKEN_TTL, payload)
+            if username:
+                idx = self._user_index_key(username)
+                pipe.sadd(idx, token)
+                pipe.expire(idx, self.TOKEN_TTL)
+            pipe.execute()
+        else:
+            self._token_store[token] = (time.time() + self.TOKEN_TTL, payload)
+
+    def _load_token(self, token: str) -> Optional[Dict]:
+        import json as _json
+        if self._redis is not None:
+            raw = self._redis.get(f"auth:token:{token}")
+            if not raw:
+                return None
+            try:
+                return _json.loads(raw)
+            except Exception:
+                return None
+        # 内存回退
+        item = self._token_store.get(token)
+        if not item:
+            return None
+        exp, payload = item
+        if exp < time.time():
+            self._token_store.pop(token, None)
+            return None
+        try:
+            return _json.loads(payload)
+        except Exception:
+            return None
+
+    def _evict_user_tokens(self, username: str):
+        """登录前调用：清空该 username 在 Redis 里的所有旧 token（避免一账号多 token 堆积）。"""
+        if not username or self._redis is None:
+            return
+        idx = self._user_index_key(username)
+        try:
+            old_tokens = self._redis.smembers(idx) or set()
+            if old_tokens:
+                pipe = self._redis.pipeline()
+                for t in old_tokens:
+                    pipe.delete(f"auth:token:{t}")
+                pipe.delete(idx)
+                pipe.execute()
+        except Exception as e:
+            print(f"  [AuthManager] ⚠ 清旧 token 失败（忽略）: {e}")
+
+    def _delete_token(self, token: str, username: str = None):
+        if self._redis is not None:
+            pipe = self._redis.pipeline()
+            pipe.delete(f"auth:token:{token}")
+            if username:
+                pipe.srem(self._user_index_key(username), token)
+            pipe.execute()
+        else:
+            self._token_store.pop(token, None)
 
     def _get_conn(self):
         return self._pool.connection() if self._pool else None
@@ -672,14 +772,21 @@ class AuthManager:
 
     def login(self, username: str, password: str) -> Optional[Dict]:
         """
-        用户登录验证。
+        用户登录验证。成功后把 token 写入 Redis（带 TTL），token 内携带 role。
 
-        返回: {"username": ..., "display_name": ..., "token": ...} 或 None
+        同账号已有 token 时，全部先清掉再发新 token（防 1 账号多 token 堆积）。
+
+        返回: {"username", "display_name", "role", "token"} 或 None
         """
         if not self.available:
-            # 降级：本地硬编码认证
+            # 降级：本地硬编码认证（仅 admin）
             if username == "admin" and password == "admin123":
-                return {"username": "admin", "display_name": "管理员", "token": "local_fallback"}
+                token = secrets.token_hex(32)
+                session = {"username": "admin", "display_name": "管理员",
+                           "role": "admin", "user_id": 0}
+                self._save_token(token, session)
+                return {"username": "admin", "display_name": "管理员",
+                        "role": "admin", "token": token}
             return None
 
         try:
@@ -694,19 +801,31 @@ class AuthManager:
             cursor.close()
 
             if row and self._verify_password(password, row[2]):
-                # 更新最后登录时间，生成 token
+                # 同账号已有 token 时全部清掉（防 1 账号多 token 堆积）
+                self._evict_user_tokens(row[1])
+                # 校验通过：生成独立随机 token，写入 Redis（admin/user 各自独立）
                 token = secrets.token_hex(32)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE admin_users SET last_login=NOW() WHERE id=%s",
-                    (row[0],)
-                )
-                cursor.close()
-                conn.close()
-                return {
+                session = {
                     "username": row[1],
                     "display_name": row[3] or row[1],
-                    "role": row[4],
+                    "role": row[4] or "user",
+                    "user_id": row[0],
+                }
+                self._save_token(token, session)
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE admin_users SET last_login=NOW() WHERE id=%s",
+                        (row[0],)
+                    )
+                    cursor.close()
+                except Exception:
+                    pass
+                conn.close()
+                return {
+                    "username": session["username"],
+                    "display_name": session["display_name"],
+                    "role": session["role"],
                     "token": token,
                 }
 
@@ -717,11 +836,24 @@ class AuthManager:
             print(f"  [AuthManager] login 失败: {e}")
             return None
 
-    def verify_token(self, token: str) -> bool:
-        """验证 token 是否有效（当前使用简单的会话 token）"""
-        # 简化版：如果 auth manager 可用且 token 不为空，视为有效
-        # 生产环境应使用 JWT 或 Redis session
-        return bool(token and len(token) >= 32)
+    def verify_token(self, token: str) -> Optional[Dict]:
+        """
+        验证 token 是否有效（查 Redis / 内存回退）。
+
+        返回 session 字典 {"username","display_name","role","user_id"} 或 None。
+        """
+        if not token or len(token) < 32:
+            return None
+        return self._load_token(token)
+
+    def logout(self, token: str):
+        """注销：删除 token 存储（Redis 或内存回退），并从用户名反向索引中移除。"""
+        if not token:
+            return
+        # 拿 username 以便从反向索引 SREM（避免该 username 的索引长期悬挂）
+        session = self._load_token(token)
+        username = session.get("username") if isinstance(session, dict) else None
+        self._delete_token(token, username=username)
 
     def change_password(self, username: str, old_password: str, new_password: str) -> bool:
         """修改密码"""

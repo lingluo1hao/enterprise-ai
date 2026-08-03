@@ -4,9 +4,12 @@
 ================================================================================
 
   为非技术人员提供友好的人工智能问答界面。
-  - 支持普通用户 / 特权用户角色切换
+  - 支持普通用户 / 特权用户两种角色（由登录账号决定）
   - 实时显示推理进度（SSE 推送）
   - 自动连接 Redis 缓存加速重复问题
+  - 后端：LangGraph 引擎（默认）+ LLM 网关多模型路由
+    （qwen2:7b 生成/规划、qwen2.5:1.5b 打分/改写/压缩）
+  - 向量检索：Milvus 默认 + Chroma 兜底；Embedding 默认 Ollama bge-m3
 
   启动方式：
     python rag_web_server.py              # 默认端口 8080
@@ -29,13 +32,13 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import warnings
 warnings.filterwarnings("ignore")
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, g
 
 # ====== 导入核心模块 ======
 from audit_logger import get_audit_logger
 from advanced_rag_agent import (
-    OLLAMA_URL, MODEL_NAME, DB_PATH, DOC_FOLDER,
-    ROLE_ADMIN, ROLE_USER, DEFAULT_ROLE,
+    OLLAMA_URL, MODEL_NAME, DB_PATH,
+    ROLE_ADMIN, DEFAULT_ROLE,
     AccessControlFilter, CacheManager,
     RAGOrchestrator,
     OllamaLLM,
@@ -45,13 +48,14 @@ from advanced_rag_agent import (
 
 
 def _derive_session_id(user_id: str = "anonymous", role: str = "user") -> str:
-    """会话 ID 按身份派生，避免所有人共用一份历史（P0 止血 3.2）。
+    """会话 ID 按用户 + 角色派生，避免同角色用户共用历史（P0 止血 3.2）。
 
-    当前 Web 端无 username 体系，用 role 区分（web:user / web:admin）。
-    user_id 仅作签名占位，将来接入登录后传入真实用户名即可。
+    Web 端当前用 username（如 guest/admin）+ role 共同区分会话。
+    这样不同 guest 用户、或同一浏览器切换账号后，历史不会串。
     """
+    safe_user = "".join(c if c.isalnum() or c in "-_" else "_" for c in (user_id or "anonymous"))[:32]
     safe_role = "".join(c if c.isalnum() or c in "-_" else "_" for c in (role or "user"))[:16]
-    return f"web:{safe_role}"
+    return f"web:{safe_role}:{safe_user}"
 
 
 class LangGraphEngine:
@@ -65,18 +69,20 @@ class LangGraphEngine:
         # 兼容角色切换中的 skill_registry.get_skill() 调用
         self.skill_registry = type("SR", (), {"get_skill": lambda self, name: None})()
 
-    def query(self, question, user_role=None, user=None):
+    def query(self, question, user_role=None, user=None, user_id=None):
         role = user_role or self.user_role
+        user = user or role
         return self.app.query(question, role=role,
-                              session_id=_derive_session_id(role), user=user)
+                              session_id=_derive_session_id(user, role),
+                              user=user, user_id=user_id)
 
-    def check_unfinished_tasks(self, session_id="web_session"):
+    def check_unfinished_tasks(self, session_id="web_session", user_id=0):
         """查询指定会话的未完成任务（断点检测）"""
-        return self.app.check_unfinished_tasks(session_id)
+        return self.app.check_unfinished_tasks(session_id, user_id=user_id)
 
-    def resume_task(self, task_id, session_id="web_session"):
+    def resume_task(self, task_id, session_id="web_session", user_id=None):
         """从断点恢复执行指定任务"""
-        return self.app.resume(task_id, session_id=session_id)
+        return self.app.resume(task_id, session_id=session_id, user_id=user_id)
 
 
 # ====== Flask 应用 ======
@@ -252,8 +258,14 @@ def _audit_log(action: str, target: str = "",
 
 @app.route("/")
 def index():
-    """返回聊天界面"""
+    """返回聊天界面（受保护，无 token 会由前端重定向到 /login）"""
     return _HTML_PAGE
+
+
+@app.route("/login")
+def login_page():
+    """统一登录入口：登录后由前端按角色跳转（admin→/admin，其他→/）"""
+    return _LOGIN_PAGE
 
 
 @app.route("/api/health")
@@ -271,31 +283,29 @@ def health():
 def api_query():
     """
     同步查询（简单模式）：直接运行并返回结果，不流式推送。
-    前端用 fetch + 轮询 /api/progress。
+    需登录；role/user 一律来自登录态（token），客户端不可伪造。
     """
     data = request.get_json(force=True, silent=True)
     if data is None:
         return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
 
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+
     question = data.get("question", "").strip()
-    user_role = data.get("role", orchestrator.user_role)
-    # 用量归因用户：优先用客户端上报的真实用户名，没有则退回角色（user/admin/guest）
-    user = data.get("username") or user_role
+    # role/user/user_id 一律来自登录态，客户端不可伪造（防普通用户提权看受限文档）
+    user_role = g.current_user["role"]
+    user = g.current_user["username"]
+    user_id = g.current_user["user_id"]
 
     err = validate_input(question, MAX_QUESTION_LEN, "问题")
     if err:
         return jsonify({"error": err}), 400
-        return jsonify({"error": "问题不能为空"}), 400
 
-    # 特权角色需要管理员 Token
-    if user_role == ROLE_ADMIN:
-        auth_result = _require_admin_token()
-        if auth_result:
-            return auth_result
-
-    result = orchestrator.query(question, user_role=user_role, user=user)
-    _audit_log("query", target=question[:80], username=user_role)
-    return jsonify({"answer": result, "role": orchestrator.user_role})
+    result = orchestrator.query(question, user_role=user_role, user=user, user_id=user_id)
+    _audit_log("query", target=question[:80], username=user)
+    return jsonify({"answer": result, "role": user_role})
 
 
 @app.route("/api/query/stream", methods=["POST"])
@@ -307,24 +317,21 @@ def api_query_stream():
 
     data = request.get_json(force=True, silent=True)
     if data is None:
-        result = jsonify({"error": "请求体格式错误，需要 JSON"}), 400
-        return result
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
 
     question = data.get("question", "").strip()
-    user_role = data.get("role", orchestrator.user_role)
-    # 用量归因用户：优先用客户端上报的真实用户名，没有则退回角色（user/admin/guest）
-    user = data.get("username") or user_role
+    # role/user/user_id 一律来自登录态，客户端不可伪造（防普通用户提权看受限文档）
+    user_role = g.current_user["role"]
+    user = g.current_user["username"]
+    user_id = g.current_user["user_id"]
 
     err = validate_input(question, MAX_QUESTION_LEN, "问题")
     if err:
-        result = jsonify({"error": err}), 400
-        return result
-
-    # 特权角色需要管理员 Token
-    if user_role == ROLE_ADMIN:
-        auth_result = _require_admin_token()
-        if auth_result:
-            return auth_result
+        return jsonify({"error": err}), 400
 
     # 创建队列用于接收进度
     progress_queue = queue.Queue()
@@ -353,7 +360,7 @@ def api_query_stream():
             def run_query():
                 try:
                     result_holder["answer"] = orchestrator.query(
-                        question, user_role=user_role, user=user
+                        question, user_role=user_role, user=user, user_id=user_id
                     )
                 except Exception as e:
                     import traceback
@@ -416,34 +423,18 @@ def api_query_stream():
 @app.route("/api/role", methods=["POST"])
 def set_role():
     """
-    切换用户角色。
+    返回当前登录用户的角色（只读）。
 
-    安全策略：
-      - 切换到普通用户 (user) 无需认证；
-      - 切换到特权用户 (admin) 必须在请求头携带有效管理 Token，
-        防止未授权用户通过直接调用 API 访问受限文档。
+    角色由登录账号决定，不可由客户端自行切换——避免普通用户
+    通过直接调用 API 把全局 orchestrator 角色提升为 admin 而访问受限文档。
     """
-    data = request.get_json(force=True)
-    new_role = data.get("role", ROLE_USER)
-
-    if new_role not in (ROLE_ADMIN, ROLE_USER):
-        return jsonify({"error": "无效角色"}), 400
-
-    # 切换到 admin 需要认证
-    if new_role == ROLE_ADMIN:
-        auth_result = _require_admin_token()
-        if auth_result:
-            return auth_result
-
-    orchestrator.user_role = new_role
-    orchestrator.cache.current_role = new_role
-    doc_skill = orchestrator.skill_registry.get_skill("doc_search")
-    if doc_skill:
-        doc_skill.user_role = new_role
-
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    role = g.current_user["role"]
     return jsonify({
-        "role": new_role,
-        "description": AccessControlFilter.get_role_description(new_role),
+        "role": role,
+        "description": AccessControlFilter.get_role_description(role),
     })
 
 
@@ -451,17 +442,37 @@ def set_role():
 # 内部辅助函数
 # ======================================================================
 
-def _require_admin_token():
-    """
-    校验请求是否携带有效的管理员 Token。
+def _get_token_from_request():
+    """从 Authorization: Bearer 头 或 rag_token cookie 取 token。"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return request.cookies.get("rag_token") or ""
 
-    用于保护 admin 角色相关的接口，防止未授权用户直接调用 API
-    访问受限文档。返回 None 表示校验通过，否则返回 (响应, 状态码)。
+
+def _require_auth():
     """
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    校验是否已登录（任意角色）。
+
+    通过返回 None 并把 session 写入 g.current_user；否则返回 (响应, 状态码)。
+    token 经 Redis 校验（admin/user 各自独立、带 role）。
+    """
+    token = _get_token_from_request()
     from prompt_manager import get_auth_manager
     auth = get_auth_manager()
-    if not auth.verify_token(token):
+    session = auth.verify_token(token)
+    if not session:
+        return jsonify({"error": "未登录或登录已过期，请先登录"}), 401
+    g.current_user = session
+    return None
+
+
+def _require_admin():
+    """校验是否为管理员（role=admin）。通过返回 None，否则返回 (响应, 状态码)。"""
+    denied = _require_auth()
+    if denied:
+        return denied
+    if g.current_user.get("role") != ROLE_ADMIN:
         return jsonify({"error": "需要管理员权限"}), 403
     return None
 
@@ -472,43 +483,114 @@ def _require_admin_token():
 
 @app.route("/api/tasks/unfinished")
 def get_unfinished_tasks():
-    """
-    查询当前会话的未完成任务。
-
-    用户登录/连接时调用。如果有 interrupted 状态的任务，
-    说明上次执行被中断（服务宕机或用户关闭客户端）。
-    前端收到后可弹窗提示用户："上次有未完成的任务，是否恢复？"
-    """
-    session_id = request.args.get("session_id", "web_session")
+    """查询当前登录用户的未完成任务（需登录）。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    # session_id 一律按当前登录用户派生，忽略客户端传入，防串会话
+    session_id = _derive_session_id(g.current_user["username"], g.current_user["role"])
     if not use_langgraph or not isinstance(orchestrator, LangGraphEngine):
         return jsonify({"tasks": [], "message": "当前引擎不支持断点恢复"})
-    tasks = orchestrator.check_unfinished_tasks(session_id)
+    tasks = orchestrator.check_unfinished_tasks(session_id, user_id=g.current_user["user_id"])
     return jsonify({"tasks": tasks, "count": len(tasks)})
 
 
 @app.route("/api/tasks/resume", methods=["POST"])
 def resume_task():
     """
-    从断点恢复执行指定任务。
+    从断点恢复执行指定任务（需登录），以 SSE 流返回。
 
-    前端用户点击"恢复"按钮后调用此接口。
-    后端读取 MySQL task_checkpoints 最后一条快照，恢复 state，重新执行图。
+    复用 /api/query/stream 的 ProgressWriter + 后台线程模式：resume 内部
+    要重跑 LangGraph 图（30-90s），改成流式后前端能实时看到进度日志，
+    并能用刚加的 ⏹ 中断按钮中止（AbortController）。
     """
-    data = request.get_json(force=True)
-    task_id = data.get("task_id")
-    session_id = data.get("session_id", "web_session")
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
 
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+
+    task_id = (data.get("task_id") or "").strip()
     if not task_id:
         return jsonify({"error": "缺少 task_id 参数"}), 400
 
     if not use_langgraph or not isinstance(orchestrator, LangGraphEngine):
         return jsonify({"error": "当前引擎不支持断点恢复"}), 400
 
-    try:
-        answer = orchestrator.resume_task(task_id, session_id)
-        return jsonify({"answer": answer, "task_id": task_id, "status": "completed"})
-    except Exception as e:
-        return jsonify({"error": str(e), "task_id": task_id, "status": "failed"}), 500
+    # session_id 一律按当前登录用户派生，忽略客户端传入，防串会话
+    session_id = _derive_session_id(g.current_user["username"], g.current_user["role"])
+    user_id = g.current_user["user_id"]
+
+    # 提前捕获 IP（生成器在请求上下文外执行）
+    client_ip = _get_client_ip()
+    # 提前捕获用户名（生成器在请求上下文外执行，不能在 generate() 内访问 g.current_user）
+    current_username = g.current_user["username"]
+
+    def generate():
+        output_queue = queue.Queue()
+        original_stdout = sys.stdout
+        sys.stdout = ProgressWriter(output_queue, original_stdout)
+
+        result_holder = {"answer": None, "error": None}
+
+        def run_resume():
+            try:
+                result_holder["answer"] = orchestrator.resume_task(
+                    task_id, session_id, user_id=user_id
+                )
+            except Exception as e:
+                import traceback as _tb
+                result_holder["error"] = str(e)
+                output_queue.put({
+                    "type": "log",
+                    "text": f"[ERROR] {_tb.format_exc()}",
+                })
+
+        # 推送首事件
+        evt = json.dumps({"type": "start", "task_id": task_id}, ensure_ascii=False)
+        yield f"data: {evt}\n\n"
+
+        thread = threading.Thread(target=run_resume, daemon=True)
+        thread.start()
+
+        # 轮询 stdout 队列，转发为 SSE
+        finished = False
+        while not finished or not output_queue.empty():
+            try:
+                msg = output_queue.get(timeout=0.1)
+                evt = json.dumps(msg, ensure_ascii=False)
+                yield f"data: {evt}\n\n"
+            except queue.Empty:
+                if not thread.is_alive():
+                    finished = True
+
+        sys.stdout = original_stdout
+
+        if result_holder["error"]:
+            get_audit_logger().log(
+                ip=client_ip, username=current_username,
+                action="task_resume", target=task_id, result="failure",
+                detail=result_holder["error"][:200],
+            )
+            yield f"data: {json.dumps({'type': 'error', 'text': result_holder['error']}, ensure_ascii=False)}\n\n"
+        else:
+            get_audit_logger().log(
+                ip=client_ip, username=current_username,
+                action="task_resume", target=task_id, result="success",
+            )
+            yield f"data: {json.dumps({'type': 'done', 'answer': result_holder['answer']}, ensure_ascii=False)}\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+    )
 
 
 # ======================================================================
@@ -542,11 +624,19 @@ def admin_login():
 
     if user:
         _audit_log("login", target=username, result="success", username=username)
-        return jsonify({
+        resp = jsonify({
             "success": True,
-            "user": {"username": user["username"], "display_name": user["display_name"]},
+            "user": {
+                "username": user["username"],
+                "display_name": user["display_name"],
+                "role": user["role"],
+            },
             "token": user["token"],
         })
+        # 同时写入 HttpOnly Cookie，浏览器后续请求自动携带（双保险，前端也可用 localStorage）
+        resp.set_cookie("rag_token", user["token"], httponly=True,
+                        max_age=auth.TOKEN_TTL, samesite="Lax", path="/")
+        return resp
     else:
         _audit_log("login", target=username, result="failure",
                    detail="用户名或密码错误", username=username)
@@ -556,32 +646,150 @@ def admin_login():
 @app.route("/api/admin/me", methods=["GET"])
 def admin_me():
     """
-    获取当前登录管理员信息。
+    获取当前登录管理员信息（需 admin 角色）。
 
-    前端页面刷新后，用 localStorage 中的 token 调用此接口恢复登录状态。
+    前端页面刷新后，用 token 调用此接口恢复登录状态，返回真实登录账号。
     """
-    auth_result = _require_admin_token()
+    auth_result = _require_admin()
     if auth_result:
         return auth_result
-
-    from prompt_manager import get_auth_manager
-    auth = get_auth_manager()
-    # 当前 token 只做格式校验，返回默认管理员信息
     return jsonify({
-        "username": "admin",
-        "display_name": "管理员",
-        "role": "admin"
+        "username": g.current_user["username"],
+        "display_name": g.current_user.get("display_name"),
+        "role": g.current_user["role"],
     })
 
 
-@app.route("/api/admin/change-password", methods=["POST"])
-def admin_change_password():
-    """修改密码"""
+# ---- 统一登录 / 登出 / 当前用户（admin / user 通用） ----
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    """统一登录入口：admin_users 表中任意启用账号（role=admin/user 均可）。
+
+    成功后 token 写入 Redis（带 TTL），同时下发 HttpOnly Cookie，
+    浏览器后续请求自动携带；前端也可把 token 存 localStorage 自行携带。
+    """
     data = request.get_json(force=True, silent=True)
     if data is None:
         return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
 
-    username = data.get("username", "").strip()
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    for val, limit, lbl in [
+        (username, MAX_USERNAME_LEN, "用户名"),
+        (password, MAX_PASSWORD_LEN, "密码"),
+    ]:
+        err = validate_input(val, limit, lbl)
+        if err:
+            _audit_log("login", target=username, result="failure", detail=err)
+            return jsonify({"error": err}), 400
+
+    from prompt_manager import get_auth_manager
+    auth = get_auth_manager()
+    user = auth.login(username, password)
+    if user:
+        _audit_log("login", target=username, result="success", username=username)
+        resp = jsonify({
+            "success": True,
+            "token": user["token"],
+            "user": {
+                "username": user["username"],
+                "display_name": user["display_name"],
+                "role": user["role"],
+            },
+        })
+        resp.set_cookie("rag_token", user["token"], httponly=True,
+                        max_age=auth.TOKEN_TTL, samesite="Lax", path="/")
+        return resp
+    _audit_log("login", target=username, result="failure",
+               detail="用户名或密码错误", username=username)
+    return jsonify({"success": False, "error": "用户名或密码错误"}), 401
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    """登出：删除 Redis 中的 token，并清除 Cookie。"""
+    token = _get_token_from_request()
+    if token:
+        from prompt_manager import get_auth_manager
+        get_auth_manager().logout(token)
+    resp = jsonify({"success": True, "message": "已登出"})
+    resp.delete_cookie("rag_token", path="/")
+    return resp
+
+
+@app.route("/api/me", methods=["GET"])
+def api_me():
+    """返回当前登录用户信息（任意已登录角色）。前端据此恢复会话、判断特权。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    return jsonify({
+        "username": g.current_user["username"],
+        "display_name": g.current_user.get("display_name"),
+        "role": g.current_user["role"],
+    })
+
+
+def _get_memory_store():
+    """兼容两种编排器，取到统一的 MySQLMemoryStore 实例。"""
+    o = orchestrator
+    if o is None:
+        return None
+    ms = getattr(o, "memory_store", None)
+    if ms is None and getattr(o, "app", None) is not None:
+        ms = getattr(o.app, "memory_store", None)
+    return ms
+
+
+@app.route("/api/history", methods=["GET"])
+def get_history():
+    """
+    返回当前登录用户的历史对话，供前端刷新/重登后恢复显示。
+
+    历史已落库（chat_messages 表，按 username + session_id 隔离），
+    这里只负责按当前用户派生 session_id 拉取并回传。
+    system 角色的摘要（压缩产物，仅供 LLM 续聊）不渲染给用户。
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    user = g.current_user
+    session_id = _derive_session_id(user["username"], user["role"])
+    ms = _get_memory_store()
+    if ms is None:
+        return jsonify({"session_id": session_id, "messages": []})
+    try:
+        raw = ms.load_messages(session_id, user_id=user["user_id"])
+        visible = [
+            {"role": m["role"], "content": m["content"]}
+            for m in raw
+            if m.get("role") in ("user", "assistant")
+        ]
+        return jsonify({"session_id": session_id, "messages": visible})
+    except Exception as e:
+        return jsonify({"session_id": session_id, "messages": [], "error": str(e)})
+
+
+@app.route("/api/change-password", methods=["POST"])
+@app.route("/api/admin/change-password", methods=["POST"])
+def change_password_api():
+    """
+    修改密码（需登录，所有角色通用；只能改当前登录账号自己的密码）。
+
+    普通用户（聊天页）和 admin（后台）共用此接口。任意登录账号都能改
+    自己的密码，不能改他人——username 一律取自 token 中的 g.current_user，
+    忽略客户端传入，防越权。
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+
+    # 只能改当前登录账号，忽略客户端传的 username，防改他人密码
+    username = g.current_user["username"]
     old_password = data.get("old_password", "")
     new_password = data.get("new_password", "")
 
@@ -596,7 +804,7 @@ def admin_change_password():
     if len(new_password) < 6:
         return jsonify({"error": "新密码至少6位"}), 400
 
-    from prompt_manager import AuthManager, get_auth_manager
+    from prompt_manager import get_auth_manager
     auth = get_auth_manager()
     if auth.change_password(username, old_password, new_password):
         _audit_log("change_password", target=username, result="success", username=username)
@@ -762,15 +970,19 @@ def _summarize(rows):
 @app.route("/api/usage/me")
 def api_usage_me():
     """
-    当前用户的 token 用量（网页「我的用量」面板数据源）。
+    当前登录用户的 token 用量（网页「我的用量」面板数据源）。
 
-    参数：user=用户名  range=today|7d|30d|all  limit=明细条数
+    需登录；只返回当前登录账号的用量（忽略客户端 user 参数，防越权查询他人用量）。
     """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+
     gw = _gateway_or_none()
     if gw is None:
         return jsonify({"error": "LLM 网关未启用，无法查询用量"}), 503
 
-    user = (request.args.get("user") or "").strip() or DEFAULT_ROLE
+    user = g.current_user["username"]
     rng = request.args.get("range", "all")
     try:
         limit = max(1, min(int(request.args.get("limit", 50)), 200))
@@ -809,7 +1021,7 @@ def api_usage_me():
 @app.route("/api/admin/usage/top")
 def api_admin_usage_top():
     """全用户 token 排行 + 最近明细（管理后台看板，需要管理员 Token）。"""
-    auth_result = _require_admin_token()
+    auth_result = _require_admin()
     if auth_result:
         return auth_result
 
@@ -1111,6 +1323,12 @@ _ADMIN_PAGE = r"""
   }
   .qa-msg.assistant .qa-bubble{background:var(--surface);border:1px solid var(--border)}
   .qa-msg.user .qa-bubble{background:var(--primary);color:#fff}
+  .qa-progress-head{font-size:13px;font-weight:600;color:var(--primary);margin-bottom:8px;display:flex;align-items:center;gap:6px}
+  .qa-progress-head .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--primary-light);border-top-color:var(--primary);border-radius:50%;animation:qaSpin .8s linear infinite}
+  .qa-progress-logs{max-height:240px;overflow-y:auto;font-size:12px;color:var(--text-2);line-height:1.6;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .qa-progress-logs .log-line{padding:2px 0;border-bottom:1px dashed var(--border)}
+  .qa-progress-logs .log-line:last-child{border-bottom:none}
+  @keyframes qaSpin{to{transform:rotate(360deg)}}
   .qa-input-area{
     display:flex;gap:10px;padding:16px 20px;border-top:1px solid var(--border);background:var(--surface)
   }
@@ -1135,30 +1353,62 @@ _ADMIN_PAGE = r"""
   .toast.success{background:var(--success);color:#fff}
   .toast.error{background:var(--danger);color:#fff}
   @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+  /* ===== 修改密码模态框（admin 后台用） ===== */
+  .modal-mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;z-index:9999;animation:fadeIn .15s}
+  .modal-mask.show{display:flex}
+  .modal{background:var(--surface);border-radius:14px;box-shadow:var(--shadow-lg);width:100%;max-width:420px;animation:popIn .2s}
+  .modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px 12px;border-bottom:1px solid var(--border)}
+  .modal-head h3{font-size:17px;font-weight:600;display:flex;align-items:center;gap:8px;margin:0}
+  .modal-close{background:none;border:none;cursor:pointer;color:var(--text-3);font-size:22px;line-height:1;padding:2px 6px;border-radius:6px}
+  .modal-close:hover{background:var(--bg);color:var(--text)}
+  .modal-body{padding:18px 22px 22px}
+  .pwd-row{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+  .pwd-row label{font-size:13px;font-weight:500;color:var(--text-2)}
+  .pwd-row input{padding:10px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:14px;font-family:inherit;background:var(--bg);color:var(--text);transition:border-color .15s}
+  .pwd-row input:focus{outline:none;border-color:var(--primary)}
+  .pwd-msg{font-size:13px;min-height:18px;margin-bottom:8px}
+  .pwd-msg.err{color:var(--danger)}
+  .pwd-msg.ok{color:var(--success)}
+  .pwd-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:6px}
+  .pwd-actions .btn{min-width:88px}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  @keyframes popIn{from{transform:scale(.95);opacity:0}to{transform:scale(1);opacity:1}}
+  /* ===== 在线问答：断点重续横条 + 中断按钮 ===== */
+  .qa-resume-bar{
+    display:flex;align-items:center;gap:10px;
+    margin:0 14px 8px;padding:10px 14px;
+    background:linear-gradient(90deg,#fff7e6,#fffbe9);
+    border:1px solid #ffd591;border-left:4px solid #fa8c16;border-radius:10px;
+    font-size:13px;color:#614700;box-shadow:0 1px 4px rgba(250,140,22,.12);
+  }
+  .qa-resume-bar .resume-icon{font-size:16px}
+  .qa-resume-bar .resume-text{flex:1;line-height:1.4}
+  .qa-resume-bar .resume-text b{color:#ad4e00}
+  .qa-resume-bar .btn-resume{
+    border:none;background:#fa8c16;color:#fff;font-weight:600;
+    padding:5px 16px;border-radius:7px;cursor:pointer;font-size:13px
+  }
+  .qa-resume-bar .btn-resume:hover{background:#d8760b}
+  .qa-resume-bar .btn-resume-dismiss{
+    border:1px solid #d9d9d9;background:#fff;color:#595959;
+    padding:5px 12px;border-radius:7px;cursor:pointer;font-size:13px
+  }
+  .qa-resume-bar .btn-resume-dismiss:hover{background:#f5f5f5}
+  .qa-send-btn.stopping{background:var(--danger);color:#fff}
+  .qa-send-btn.stopping:hover{background:var(--danger-hover,#dc2626)}
 </style>
 </head>
 <body>
 
-<!-- ===== Login Page ===== -->
-<div id="loginPage" class="login-page">
-  <div class="login-card">
-    <h2>🔐 系统管理</h2>
-    <p class="sub">RAG Agent 提示词工程管理</p>
-    <div class="form-group">
-      <label>用户名</label>
-      <input id="loginUser" type="text" placeholder="请输入用户名" value="admin" autocomplete="username">
-    </div>
-    <div class="form-group">
-      <label>密码</label>
-      <input id="loginPwd" type="password" placeholder="请输入密码" autocomplete="current-password">
-    </div>
-    <p id="loginError" class="error-msg"></p>
-    <button class="btn btn-primary" style="margin-top:8px" onclick="doLogin()">登 录</button>
-    <p style="text-align:center;margin-top:12px;font-size:12px;color:var(--text-3)">
-      默认账号: admin / admin123
-    </p>
-  </div>
-</div>
+<!-- 本页为受保护页面：仅 admin 角色可访问；无 token / 失效 / 非 admin 时由脚本重定向 -->
+<script>
+(function(){
+  var t = localStorage.getItem('rag_token');
+  if(!t){ location.replace('/login'); return; }
+  document.documentElement.style.visibility = 'hidden';
+})();
+</script>
 
 <!-- ===== App Page ===== -->
 <div id="appPage" class="app-page hidden">
@@ -1167,7 +1417,6 @@ _ADMIN_PAGE = r"""
     <div class="user-info">
       <span>👤</span>
       <span class="name" id="displayName"></span>
-      <a href="/" style="color:var(--primary);text-decoration:none;font-size:13px;margin-left:8px">💬 知识问答</a>
       <a href="/admin" style="color:var(--primary);text-decoration:none;font-size:13px">🔧 提示词管理</a>
       <button class="btn btn-sm btn-outline" onclick="doLogout()">退出</button>
     </div>
@@ -1215,6 +1464,13 @@ _ADMIN_PAGE = r"""
               <span class="qa-tip" onclick="setQAQuestion('三层记忆架构是什么？')">🗂️ 三层记忆架构是什么？</span>
             </div>
           </div>
+        </div>
+        <!-- 断点重续横条：检测到上次未完成任务时显示，跟聊天页同款体验 -->
+        <div id="qaResumeBar" class="qa-resume-bar" style="display:none">
+          <span class="resume-icon">⏸️</span>
+          <span class="resume-text">检测到上次未完成的任务：<b class="resume-query"></b></span>
+          <button class="btn-resume" onclick="resumeFromBarQA()">继续</button>
+          <button class="btn-resume-dismiss" onclick="dismissResumeBarQA()">忽略</button>
         </div>
         <div class="qa-input-area">
           <textarea class="qa-input" id="qaInput" rows="2" placeholder="输入你的问题，按 Enter 发送..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askQA()}"></textarea>
@@ -1300,92 +1556,84 @@ _ADMIN_PAGE = r"""
 // ===== State =====
 let token = '';
 let currentUser = null;
+// 在线问答断点重续 + 中断控制（admin 后台独立命名空间，跟聊天页的 currentAbortController 不冲突）
+let currentAbortControllerQA = null;
+let isQueryingQA = false;
 
 // ===== Init =====
-document.getElementById('loginPwd').addEventListener('keydown', e => {
-  if (e.key === 'Enter') doLogin();
-});
-
-// 页面加载时尝试自动登录
+// 页面加载时校验登录态（无 token / 失效 / 非 admin 时由函数内重定向）
 tryAutoLogin();
 
 // ===== Auth =====
-async function doLogin() {
-  const username = document.getElementById('loginUser').value.trim();
-  const password = document.getElementById('loginPwd').value.trim();
-  const errEl = document.getElementById('loginError');
-
-  if (!username || !password) {
-    errEl.textContent = '请输入用户名和密码';
-    errEl.style.display = 'block';
-    return;
-  }
-
-  try {
-    const res = await fetch('/api/admin/login', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({username, password})
-    });
-    const data = await res.json();
-    if (data.success) {
-      token = data.token;
-      currentUser = data.user;
-      localStorage.setItem('rag_admin_token', token);
-      localStorage.setItem('rag_admin_user', JSON.stringify(currentUser));
-      showApp();
-    } else {
-      errEl.textContent = data.error || '登录失败';
-      errEl.style.display = 'block';
-    }
-  } catch(e) {
-    errEl.textContent = '网络错误，请稍后重试';
-    errEl.style.display = 'block';
-  }
-}
-
+// 登录统一在 /login 页完成；本页只校验已有 token（见 tryAutoLogin）。
 function doLogout() {
   token = '';
   currentUser = null;
-  localStorage.removeItem('rag_admin_token');
+  localStorage.removeItem('rag_token');
   localStorage.removeItem('rag_admin_user');
-  document.getElementById('loginPage').classList.remove('hidden');
+  location.replace('/login');
+}
+
+// ===== 无权限提示(普通用户访问 /admin 时显示,不静默跳转) =====
+function showNoPermission(u){
   document.getElementById('appPage').classList.add('hidden');
-  document.getElementById('loginPwd').value = '';
+  document.getElementById('loginPage').classList.add('hidden');
+  let np = document.getElementById('noPermissionPage');
+  if(!np){
+    np = document.createElement('div');
+    np.id = 'noPermissionPage';
+    np.style.cssText = 'position:fixed;inset:0;z-index:9000;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--text);';
+    np.innerHTML =
+      '<div style="background:var(--surface);padding:40px 48px;border-radius:16px;box-shadow:var(--shadow-lg);text-align:center;max-width:440px">' +
+      '<div style="font-size:48px;margin-bottom:12px">🚫</div>' +
+      '<h2 style="margin:0 0 10px;font-size:20px">无访问权限</h2>' +
+      '<p style="margin:0 0 6px;color:var(--text-2);font-size:14px">当前账号 <b style="color:var(--primary)">' + (u && u.username ? u.username : 'unknown') + '</b> 不是管理员,无法访问系统管理页。</p>' +
+      '<p style="margin:0 0 22px;color:var(--text-3);font-size:13px">如需管理权限,请联系系统管理员开通。</p>' +
+      '<div style="display:flex;gap:12px;justify-content:center">' +
+      '<button onclick="location.replace(\'/\')" style="padding:8px 20px;border:1.5px solid var(--primary);border-radius:8px;background:var(--primary-light);color:var(--primary);font-size:14px;cursor:pointer">返回问答</button>' +
+      '<button onclick="doLogout()" style="padding:8px 20px;border:1.5px solid #cbd5e1;border-radius:8px;background:transparent;color:var(--text-2);font-size:14px;cursor:pointer">退出登录</button>' +
+      '</div>' +
+      '</div>';
+    document.body.appendChild(np);
+  } else {
+    np.style.display = 'flex';
+  }
 }
 
 function showApp() {
   document.getElementById('displayName').textContent = currentUser.display_name;
-  document.getElementById('loginPage').classList.add('hidden');
+  document.documentElement.style.visibility = 'visible';  // 校验通过，显示页面
   document.getElementById('appPage').classList.remove('hidden');
   loadPrompts();
   loadCategories();
+  loadQAHistory();      // 在线问答：刷新/重登后恢复历史问答
+  checkUnfinishedQA();  // 在线问答：检测上次未完成的任务，弹横条让用户确认是否继续
 }
 
 async function tryAutoLogin() {
-  const savedToken = localStorage.getItem('rag_admin_token');
-  if (!savedToken) return;
+  const savedToken = localStorage.getItem('rag_token');
+  if (!savedToken){ location.replace('/login'); return; }
 
   try {
-    const res = await fetch('/api/admin/me', {
+    const res = await fetch('/api/me', {
       headers: {'Authorization': 'Bearer ' + savedToken}
     });
     if (res.ok) {
-      const serverUser = await res.json();
-      const localUser = JSON.parse(localStorage.getItem('rag_admin_user') || '{}');
+      const u = await res.json();
+      if (u.role !== 'admin'){ showNoPermission(u); return; }  // 非 admin 提示无权限,不让页面"消失"
       token = savedToken;
       currentUser = {
-        username: serverUser.username || localUser.username || 'admin',
-        display_name: serverUser.display_name || localUser.display_name || '管理员'
+        username: u.username,
+        display_name: u.display_name || '管理员'
       };
       showApp();
     } else {
-      localStorage.removeItem('rag_admin_token');
-      localStorage.removeItem('rag_admin_user');
+      localStorage.removeItem('rag_token');
+      location.replace('/login');
     }
   } catch(e) {
-    localStorage.removeItem('rag_admin_token');
-    localStorage.removeItem('rag_admin_user');
+    localStorage.removeItem('rag_token');
+    location.replace('/login');
   }
 }
 
@@ -1646,26 +1894,7 @@ async function importDefaults() {
 }
 
 function changePassword() {
-  const oldPwd = prompt('请输入原密码:');
-  if (!oldPwd) return;
-  const newPwd = prompt('请输入新密码（至少6位）:');
-  if (!newPwd || newPwd.length < 6) {
-    alert('新密码至少6位');
-    return;
-  }
-  const newPwd2 = prompt('请再次输���新密码:');
-  if (newPwd !== newPwd2) {
-    alert('两次密码不一致');
-    return;
-  }
-  fetch('/api/admin/change-password', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({username: currentUser.username, old_password: oldPwd, new_password: newPwd})
-  }).then(r => r.json()).then(d => {
-    if (d.success) showToast(d.message, 'success');
-    else showToast(d.error, 'error');
-  });
+  openChangePwd();
 }
 
 // ===== Q&A =====
@@ -1675,19 +1904,108 @@ function setQAQuestion(text) {
   input.focus();
 }
 
+async function loadQAHistory() {
+  try {
+    const r = await fetch('/api/history', {
+      headers: {'Authorization': 'Bearer ' + token}
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    const msgs = data.messages || [];
+    if (!msgs.length) return;
+    const qaMsgs = document.getElementById('qaMessages');
+    if (!qaMsgs) return;
+    // 有历史时移除空状态
+    const emptyEl = document.getElementById('qaEmpty');
+    if (emptyEl) emptyEl.remove();
+    for (const m of msgs) {
+      if (m.role === 'user') {
+        qaMsgs.innerHTML +=
+          '<div class="qa-msg user">' +
+            '<div class="avatar">👤</div>' +
+            '<div class="qa-bubble">' + escapeHtml(m.content) + '</div>' +
+          '</div>';
+      } else if (m.role === 'assistant') {
+        qaMsgs.innerHTML +=
+          '<div class="qa-msg assistant">' +
+            '<div class="avatar">🤖</div>' +
+            '<div class="qa-bubble" style="white-space:pre-wrap">' + escapeHtml(m.content) + '</div>' +
+          '</div>';
+      }
+    }
+    qaMsgs.scrollTop = qaMsgs.scrollHeight;
+  } catch (e) {
+    // 历史拉取失败不影响新对话，静默忽略
+  }
+}
+
+// ===== 在线问答：断点重续（跟聊天页 checkUnfinishedTasks 同款体验）=====
+function checkUnfinishedQA() {
+  fetch('/api/tasks/unfinished', {headers: {'Authorization': 'Bearer ' + token}})
+    .then(r => r.json())
+    .then(data => {
+      if (!data.tasks || data.tasks.length === 0) return;
+      const task = data.tasks[0];
+      const bar = document.getElementById('qaResumeBar');
+      if (!bar) return;
+      bar.querySelector('.resume-query').textContent = task.query;
+      bar.dataset.taskId = task.task_id;
+      bar.style.display = 'flex';
+    })
+    .catch(() => {/* 接口失败不影响主流程 */});
+}
+
+function resumeFromBarQA() {
+  const bar = document.getElementById('qaResumeBar');
+  if (!bar) return;
+  const taskId = bar.dataset.taskId;
+  if (!taskId) return;
+  bar.style.display = 'none';
+  sendQuestionWithQA(taskId, bar.querySelector('.resume-query').textContent);
+}
+
+function dismissResumeBarQA() {
+  const bar = document.getElementById('qaResumeBar');
+  if (bar) bar.style.display = 'none';
+}
+
+// 中断当前流式查询：跟聊天页 abortCurrentQuery 同款
+function abortCurrentQA() {
+  if (currentAbortControllerQA) {
+    try { currentAbortControllerQA.abort(); } catch (e) {}
+  }
+}
+
+function updateQASendButton() {
+  const btn = document.getElementById('qaSendBtn');
+  if (!btn) return;
+  btn.disabled = false;
+  if (isQueryingQA) {
+    btn.classList.add('stopping');
+    btn.textContent = '⏹';
+    btn.title = '中断当前回答';
+    btn.onclick = function(){ abortCurrentQA(); };
+  } else {
+    btn.classList.remove('stopping');
+    btn.textContent = '发送';
+    btn.title = '发送';
+    btn.onclick = function(){ askQA(); };
+  }
+}
+
 async function askQA() {
   const input = document.getElementById('qaInput');
   const sendBtn = document.getElementById('qaSendBtn');
   const question = input.value.trim();
-  if (!question) return;
+  if (!question || isQueryingQA) return;
 
   // 隐藏空状态提示
   const emptyEl = document.getElementById('qaEmpty');
   if (emptyEl) emptyEl.remove();
 
   input.value = '';
-  sendBtn.disabled = true;
-  sendBtn.textContent = '发送中...';
+  isQueryingQA = true;
+  updateQASendButton();
 
   const msgs = document.getElementById('qaMessages');
   msgs.innerHTML += `
@@ -1696,33 +2014,210 @@ async function askQA() {
       <div class="qa-bubble">${escapeHtml(question)}</div>
     </div>`;
 
-  // Add loading
+  // 流式进度气泡：进度头 + 日志列表，跟聊天页 handleSSEEvent 同款体验
   const loadingId = 'loading_' + Date.now();
   msgs.innerHTML += `
     <div class="qa-msg assistant" id="${loadingId}">
       <div class="avatar">🤖</div>
-      <div class="qa-bubble">思考中...</div>
+      <div class="qa-bubble">
+        <div class="qa-progress-head"><span class="spinner"></span><span class="head-text">准备中...</span></div>
+        <div class="qa-progress-logs"></div>
+      </div>
     </div>`;
   msgs.scrollTop = msgs.scrollHeight;
 
+  const bubble = document.getElementById(loadingId).querySelector('.qa-bubble');
+  const headText = bubble.querySelector('.head-text');
+  const logsEl = bubble.querySelector('.qa-progress-logs');
+  let finalAnswer = null;
+
+  // 把 controller 挂到全局，让"⏹ 停止"按钮能真中止请求
+  currentAbortControllerQA = new AbortController();
+
   try {
-    const res = await fetch('/api/query', {
+    const resp = await fetch('/api/query/stream', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + token
       },
       body: JSON.stringify({question, role: 'admin',
-                            username: (currentUser && currentUser.username) || 'admin'})
+                            username: (currentUser && currentUser.username) || 'admin'}),
+      signal: currentAbortControllerQA.signal
     });
-    const data = await res.json();
-    document.getElementById(loadingId).querySelector('.qa-bubble').textContent = data.answer || data.error || '无响应';
-    document.getElementById(loadingId).scrollIntoView({behavior:'smooth'});
+
+    if (!resp.ok || !resp.body) {
+      throw new Error('HTTP ' + resp.status);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch (e) { continue; }
+        if (data.type === 'start') {
+          headText.textContent = '正在分析问题...';
+        } else if (data.type === 'log') {
+          const text = data.text || '';
+          // 阶段判定（跟聊天页 handleSSEEvent 同步）
+          if (text.includes('用户提问')) headText.textContent = '正在检索文档...';
+          else if (text.includes('子任务') && text.includes('开始执行')) headText.textContent = '正在执行子任务...';
+          else if (text.includes('最终回答') || text.includes('从缓存返回')) headText.textContent = '正在生成答案...';
+          if (text && text.length < 200) {
+            const div = document.createElement('div');
+            div.className = 'log-line';
+            div.textContent = text;
+            logsEl.appendChild(div);
+            logsEl.scrollTop = logsEl.scrollHeight;
+          }
+        } else if (data.type === 'done') {
+          finalAnswer = data.answer || '';
+          headText.textContent = '✓ 回答完成';
+          bubble.querySelector('.spinner').style.display = 'none';
+        } else if (data.type === 'error') {
+          throw new Error(data.text || data.error || '未知错误');
+        }
+      }
+    }
+
+    // 流结束：用最终答案替换整个进度区
+    if (finalAnswer !== null) {
+      bubble.innerHTML = '<div class="qa-progress-head" style="margin-bottom:6px"><span style="color:var(--success)">✓</span><span>回答完成</span></div>' +
+                         '<div style="white-space:pre-wrap;font-size:14px;line-height:1.7">' + escapeHtml(finalAnswer) + '</div>';
+    } else {
+      bubble.innerHTML = '<div style="color:var(--text-3)">无响应</div>';
+    }
   } catch(e) {
-    document.getElementById(loadingId).querySelector('.qa-bubble').textContent = '请求失败: ' + e.message;
+    if (e.name === 'AbortError') {
+      bubble.innerHTML = '<div style="color:var(--text-3)">⏹ 已中断当前回答</div>';
+    } else {
+      bubble.innerHTML = '<div style="color:var(--danger)">请求失败: ' + escapeHtml(e.message) + '</div>';
+    }
   } finally {
-    sendBtn.disabled = false;
-    sendBtn.textContent = '发送';
+    isQueryingQA = false;
+    currentAbortControllerQA = null;
+    updateQASendButton();
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+}
+
+// 断点重续入口：复用原问题，调 /api/tasks/resume 恢复上次未完成的任务
+async function sendQuestionWithQA(taskId, question) {
+  if (!question || isQueryingQA) return;
+  const emptyEl = document.getElementById('qaEmpty');
+  if (emptyEl) emptyEl.remove();
+
+  const msgs = document.getElementById('qaMessages');
+  msgs.innerHTML += `
+    <div class="qa-msg user">
+      <div class="avatar">👤</div>
+      <div class="qa-bubble">${escapeHtml(question)}</div>
+    </div>`;
+
+  // 流式进度气泡，跟 askQA 风格一致
+  const loadingId = 'resume_' + Date.now();
+  msgs.innerHTML += `
+    <div class="qa-msg assistant" id="${loadingId}">
+      <div class="avatar">🤖</div>
+      <div class="qa-bubble">
+        <div class="qa-progress-head"><span class="spinner"></span><span class="head-text">⏳ 正在从断点恢复...</span></div>
+        <div class="qa-progress-logs"></div>
+      </div>
+    </div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+
+  const bubble = document.getElementById(loadingId).querySelector('.qa-bubble');
+  const headText = bubble.querySelector('.head-text');
+  const logsEl = bubble.querySelector('.qa-progress-logs');
+  let finalAnswer = null;
+  let errored = false;
+
+  isQueryingQA = true;
+  updateQASendButton();
+  currentAbortControllerQA = new AbortController();
+
+  try {
+    const resp = await fetch('/api/tasks/resume', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token
+      },
+      body: JSON.stringify({task_id: taskId}),
+      signal: currentAbortControllerQA.signal
+    });
+
+    if (!resp.ok || !resp.body) {
+      let errText = '恢复失败';
+      try { const j = await resp.json(); errText = j.error || errText; } catch (_) {}
+      throw new Error(errText);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch (e) { continue; }
+        if (data.type === 'start') {
+          headText.textContent = '正在分析问题...';
+        } else if (data.type === 'log') {
+          const text = data.text || '';
+          if (text.includes('用户提问')) headText.textContent = '正在检索文档...';
+          else if (text.includes('子任务') && text.includes('开始执行')) headText.textContent = '正在执行子任务...';
+          else if (text.includes('最终回答') || text.includes('从缓存返回')) headText.textContent = '正在生成答案...';
+          if (text && text.length < 200) {
+            const div = document.createElement('div');
+            div.className = 'log-line';
+            div.textContent = text;
+            logsEl.appendChild(div);
+            logsEl.scrollTop = logsEl.scrollHeight;
+          }
+        } else if (data.type === 'done') {
+          finalAnswer = data.answer || '';
+          headText.textContent = '✓ 恢复完成';
+          bubble.querySelector('.spinner').style.display = 'none';
+        } else if (data.type === 'error') {
+          errored = true;
+          throw new Error(data.text || data.error || '未知错误');
+        }
+      }
+    }
+
+    if (finalAnswer !== null) {
+      bubble.innerHTML = '<div class="qa-progress-head" style="margin-bottom:6px"><span style="color:var(--success)">✓</span><span>恢复完成</span></div>' +
+                         '<div style="white-space:pre-wrap;font-size:14px;line-height:1.7">' + escapeHtml(finalAnswer) + '</div>';
+    } else if (errored) {
+      bubble.innerHTML = '<div style="color:var(--danger)">恢复过程出现异常，请稍后重试。</div>';
+    } else {
+      bubble.innerHTML = '<div style="color:var(--text-3)">无响应</div>';
+    }
+  } catch(e) {
+    if (e.name === 'AbortError') {
+      bubble.innerHTML = '<div style="color:var(--text-3)">⏹ 已中断断点恢复</div>';
+    } else {
+      bubble.innerHTML = '<div style="color:var(--danger)">恢复失败：' + escapeHtml(e.message) + '</div>';
+    }
+  } finally {
+    isQueryingQA = false;
+    currentAbortControllerQA = null;
+    updateQASendButton();
+    msgs.scrollTop = msgs.scrollHeight;
   }
 }
 
@@ -1740,9 +2235,169 @@ function escapeHtml(s) {
   d.textContent = s;
   return d.innerHTML;
 }
+
+// ===== 修改密码模态框 =====
+function openChangePwd() {
+  const m = document.getElementById('changePwdModal');
+  if (!m) return;
+  document.getElementById('oldPwdInput').value = '';
+  document.getElementById('newPwdInput').value = '';
+  document.getElementById('newPwdInput2').value = '';
+  document.getElementById('changePwdMsg').textContent = '';
+  document.getElementById('changePwdMsg').className = 'pwd-msg';
+  m.classList.add('show');
+  setTimeout(() => document.getElementById('oldPwdInput').focus(), 50);
+}
+
+function closeChangePwd() {
+  document.getElementById('changePwdModal').classList.remove('show');
+}
+
+async function submitChangePwd() {
+  const oldPwd = document.getElementById('oldPwdInput').value;
+  const newPwd = document.getElementById('newPwdInput').value;
+  const newPwd2 = document.getElementById('newPwdInput2').value;
+  const msgEl = document.getElementById('changePwdMsg');
+  msgEl.className = 'pwd-msg';
+  msgEl.textContent = '';
+
+  if (!oldPwd || !newPwd || !newPwd2) {
+    msgEl.className = 'pwd-msg err';
+    msgEl.textContent = '请填写完整';
+    return;
+  }
+  if (newPwd.length < 6) {
+    msgEl.className = 'pwd-msg err';
+    msgEl.textContent = '新密码至少 6 位';
+    return;
+  }
+  if (newPwd !== newPwd2) {
+    msgEl.className = 'pwd-msg err';
+    msgEl.textContent = '两次输入的新密码不一致';
+    return;
+  }
+
+  try {
+    const r = await fetch('/api/change-password', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({old_password: oldPwd, new_password: newPwd})
+    });
+    const d = await r.json();
+    if (d.success) {
+      msgEl.className = 'pwd-msg ok';
+      msgEl.textContent = '✅ ' + d.message;
+      showToast(d.message, 'success');
+      setTimeout(closeChangePwd, 800);
+    } else {
+      msgEl.className = 'pwd-msg err';
+      msgEl.textContent = d.error || '修改失败';
+    }
+  } catch (e) {
+    msgEl.className = 'pwd-msg err';
+    msgEl.textContent = '网络错误：' + e.message;
+  }
+}
 </script>
+
+<!-- 修改密码模态框（admin 后台用） -->
+<div class="modal-mask" id="changePwdModal" onclick="if(event.target===this)closeChangePwd()">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>🔑 修改密码</h3>
+      <button class="modal-close" onclick="closeChangePwd()" title="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="pwd-row">
+        <label for="oldPwdInput">当前密码</label>
+        <input type="password" id="oldPwdInput" placeholder="请输入当前密码" autocomplete="current-password">
+      </div>
+      <div class="pwd-row">
+        <label for="newPwdInput">新密码</label>
+        <input type="password" id="newPwdInput" placeholder="至少 6 位" autocomplete="new-password">
+      </div>
+      <div class="pwd-row">
+        <label for="newPwdInput2">确认新密码</label>
+        <input type="password" id="newPwdInput2" placeholder="再次输入新密码" autocomplete="new-password">
+      </div>
+      <div class="pwd-msg" id="changePwdMsg"></div>
+      <div class="pwd-actions">
+        <button class="btn btn-outline" onclick="closeChangePwd()">取消</button>
+        <button class="btn btn-primary" onclick="submitChangePwd()">确认修改</button>
+      </div>
+    </div>
+  </div>
+</div>
 </body>
 </html>
+"""
+
+_LOGIN_PAGE = r"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - RAG 企业知识库</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
+    background:linear-gradient(135deg,#1e3a8a 0%,#0f172a 100%);display:flex;align-items:center;justify-content:center}
+  .card{background:#1e293b;padding:38px 40px;border-radius:16px;width:340px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  h2{margin:0 0 6px;color:#f8fafc;font-size:21px}
+  .sub{margin:0 0 24px;color:#94a3b8;font-size:13px}
+  input{width:100%;padding:12px 13px;margin-bottom:14px;border-radius:9px;border:1px solid #334155;
+    background:#0f172a;color:#e2e8f0;font-size:14px;box-sizing:border-box}
+  button{width:100%;padding:12px;border:0;border-radius:9px;background:#2563eb;color:#fff;font-size:15px;cursor:pointer}
+  button:hover{background:#1d4ed8}
+  .err{color:#f87171;font-size:13px;margin-top:14px;min-height:18px;text-align:center}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>🔐 系统登录</h2>
+    <p class="sub">账号由管理员分配，登录后按角色进入对应页面</p>
+    <input id="lu" placeholder="用户名" autocomplete="username">
+    <input id="lp" type="password" placeholder="密码" autocomplete="current-password">
+    <button onclick="doLogin()">登 录</button>
+    <div class="err" id="le"></div>
+  </div>
+<script>
+const LS='rag_token';
+// 已登录则直接跳对应页，避免重复登录
+(function(){
+  var t=localStorage.getItem(LS);
+  if(t){
+    fetch('/api/me',{headers:{'Authorization':'Bearer '+t}}).then(function(r){
+      if(r.ok) return r.json().then(function(u){
+        location.replace(u.role==='admin' ? '/admin' : '/');
+      });
+    }).catch(function(){});
+  }
+})();
+function doLogin(){
+  var u=document.getElementById('lu').value.trim();
+  var p=document.getElementById('lp').value;
+  var e=document.getElementById('le');
+  e.textContent='';
+  if(!u||!p){e.textContent='请输入用户名和密码';return;}
+  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:u,password:p})})
+    .then(function(r){return r.json().then(function(j){return {r:r,j:j};});})
+    .then(function(o){
+      var r=o.r,j=o.j;
+      if(r.ok && j.token){
+        localStorage.setItem(LS,j.token);
+        location.replace((j.user && j.user.role==='admin') ? '/admin' : '/');
+      }else{
+        e.textContent=(j.error||'登录失败，请检查账号或密码');
+      }
+    }).catch(function(){e.textContent='网络错误，无法连接服务';});
+}
+document.getElementById('lp').addEventListener('keydown',function(ev){if(ev.key==='Enter')doLogin();});
+</script>
+</body></html>
 """
 
 _HTML_PAGE = r"""
@@ -1881,6 +2536,9 @@ _HTML_PAGE = r"""
   }
   .btn-send:hover{background:var(--primary-hover);transform:scale(1.03)}
   .btn-send:disabled{background:var(--border);cursor:not-allowed;transform:none}
+  /* 主动中断态：查询中按钮变红色"停止符" */
+  .btn-send.stopping{background:#ef4444}
+  .btn-send.stopping:hover{background:#dc2626}
   .input-hint{font-size:11px;color:var(--text-3);margin-top:8px;text-align:center}
 
   /* ===== 用量入口（Header）===== */
@@ -1896,6 +2554,14 @@ _HTML_PAGE = r"""
     background:var(--primary-light);color:var(--primary);transition:all .2s
   }
   .btn-usage:hover{background:var(--primary);color:#fff}
+
+  /* ===== 退出登录按钮 ===== */
+  .btn-logout{
+    display:flex;align-items:center;gap:6px;padding:6px 14px;border-radius:20px;
+    font-size:13px;font-weight:500;cursor:pointer;border:1.5px solid #cbd5e1;
+    background:transparent;color:var(--text-2);transition:all .2s
+  }
+  .btn-logout:hover{background:#fee2e2;border-color:#ef4444;color:#b91c1c}
 
   /* ===== Modal ===== */
   .modal-mask{
@@ -1920,6 +2586,25 @@ _HTML_PAGE = r"""
   }
   .modal-close:hover{background:var(--bg);color:var(--text)}
   .modal-body{padding:20px 24px 24px;overflow-y:auto}
+  /* ===== 修改密码表单 ===== */
+  .pwd-row{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+  .pwd-row label{font-size:13px;font-weight:500;color:var(--text-2)}
+  .pwd-row input{
+    width:100%;padding:10px 12px;border:1.5px solid var(--border);border-radius:8px;
+    font-size:14px;background:var(--bg);color:var(--text);transition:border-color .2s
+  }
+  .pwd-row input:focus{outline:none;border-color:var(--primary)}
+  .pwd-msg{font-size:13px;min-height:18px;margin-bottom:6px}
+  .pwd-msg.err{color:var(--danger)}
+  .pwd-msg.ok{color:var(--success)}
+  /* ===== 轻量 toast 提示 ===== */
+  .toast{
+    position:fixed;top:20px;right:20px;z-index:200;
+    padding:12px 20px;border-radius:10px;font-size:14px;
+    box-shadow:var(--shadow-lg);animation:slideIn .3s;max-width:360px;
+  }
+  .toast.success{background:var(--success);color:#fff}
+  .toast.error{background:var(--danger);color:#fff}
 
   /* ===== 用量统计卡 ===== */
   .usage-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px}
@@ -1978,9 +2663,40 @@ _HTML_PAGE = r"""
     .stat-grid{grid-template-columns:repeat(2,1fr)}
     .user-chip span.uname{max-width:70px;overflow:hidden;text-overflow:ellipsis}
   }
+
+  /* ===== 断点重续横条 ===== */
+  .resume-bar{
+    display:flex;align-items:center;gap:10px;
+    margin:0 14px 8px;padding:10px 14px;
+    background:linear-gradient(90deg,#fff7e6,#fffbe9);
+    border:1px solid #ffd591;border-left:4px solid #fa8c16;border-radius:10px;
+    font-size:13px;color:#614700;box-shadow:0 1px 4px rgba(250,140,22,.12);
+  }
+  .resume-bar .resume-icon{font-size:16px}
+  .resume-bar .resume-text{flex:1;line-height:1.4}
+  .resume-bar .resume-text b{color:#ad4e00}
+  .resume-bar .btn-resume{
+    border:none;background:#fa8c16;color:#fff;font-weight:600;
+    padding:5px 16px;border-radius:7px;cursor:pointer;font-size:13px
+  }
+  .resume-bar .btn-resume:hover{background:#d8760b}
+  .resume-bar .btn-resume-dismiss{
+    border:1px solid #d9d9d9;background:#fff;color:#595959;
+    padding:5px 12px;border-radius:7px;cursor:pointer;font-size:13px
+  }
+  .resume-bar .btn-resume-dismiss:hover{background:#f5f5f5}
 </style>
 </head>
 <body>
+
+<!-- 本页为受保护页面：无 token 或 token 失效时由 <body> 顶部脚本重定向到 /login -->
+<script>
+(function(){
+  var t = localStorage.getItem('rag_token');
+  if(!t){ location.replace('/login'); return; }
+  document.documentElement.style.visibility = 'hidden';  // 先隐藏，校验通过再显示
+})();
+</script>
 
 <!-- Header -->
 <header class="header">
@@ -1989,8 +2705,8 @@ _HTML_PAGE = r"""
     <h1>企业知识库问答</h1>
   </div>
   <div class="header-right">
-    <a href="/admin" style="text-decoration:none;color:var(--primary);font-size:13px;font-weight:500;margin-right:8px">⚙️ 系统管理</a>
-    <div class="user-chip" id="userChip" onclick="changeUser()" title="点击切换用量归属账号">
+    <a href="/admin" id="adminLink" style="display:none;text-decoration:none;color:var(--primary);font-size:13px;font-weight:500;margin-right:8px" title="进入系统管理后台">⚙️ 系统管理</a>
+    <div class="user-chip" id="userChip" title="当前登录账号(只读)">
       <span>👤</span><span class="uname" id="userLabel">guest</span>
     </div>
     <div class="btn-usage" onclick="openUsage()" title="查看我的 Token 使用记录">
@@ -2004,6 +2720,12 @@ _HTML_PAGE = r"""
       <div class="role-dot user"></div>
       <span id="roleLabel">普通用户</span>
     </div>
+    <button class="btn-logout" id="changePwdBtn" onclick="openChangePwd()" title="修改密码">
+      <span>🔑</span><span>修改密码</span>
+    </button>
+    <button class="btn-logout" id="logoutBtn" onclick="doLogout()" title="退出登录">
+      <span>🚪</span><span>退出</span>
+    </button>
   </div>
 </header>
 
@@ -2029,6 +2751,32 @@ _HTML_PAGE = r"""
   </div>
 </div>
 
+<!-- 修改密码弹窗 -->
+<div class="modal-mask" id="changePwdModal" onclick="if(event.target===this)closeChangePwd()">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-head">
+      <h3>🔑 修改密码</h3>
+      <button class="modal-close" onclick="closeChangePwd()">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="pwd-row">
+        <label>原密码</label>
+        <input type="password" id="oldPwdInput" placeholder="请输入当前密码" autocomplete="off">
+      </div>
+      <div class="pwd-row">
+        <label>新密码</label>
+        <input type="password" id="newPwdInput" placeholder="至少 6 位" autocomplete="off">
+      </div>
+      <div class="pwd-row">
+        <label>确认新密码</label>
+        <input type="password" id="newPwdInput2" placeholder="再次输入新密码" autocomplete="off">
+      </div>
+      <div id="changePwdMsg" class="pwd-msg"></div>
+      <button class="btn btn-primary" onclick="submitChangePwd()" style="margin-top:6px">确认修改</button>
+    </div>
+  </div>
+</div>
+
 <!-- Main Chat -->
 <div class="main">
   <div class="chat-area" id="chatArea">
@@ -2046,12 +2794,19 @@ _HTML_PAGE = r"""
     </div>
   </div>
 
-  <!-- Input -->
+    <!-- Input -->
   <div class="input-area">
+    <!-- 断点重续横条：检测到上次未完成任务时显示 -->
+    <div id="resumeBar" class="resume-bar" style="display:none">
+      <span class="resume-icon">⏸️</span>
+      <span class="resume-text">检测到上次未完成的任务：<b class="resume-query"></b></span>
+      <button class="btn-resume" onclick="resumeFromBar()">继续</button>
+      <button class="btn-resume-dismiss" onclick="dismissResumeBar()">忽略</button>
+    </div>
     <div class="input-row">
       <textarea id="questionInput" rows="1" placeholder="输入您的问题，按 Enter 发送（Shift+Enter 换行）..."
         onkeydown="handleKeydown(event)"></textarea>
-      <button class="btn-send" id="sendBtn" onclick="sendQuestion()" title="发送">➤</button>
+      <button class="btn-send" id="sendBtn" onclick="onSendBtnClick()" title="发送">➤</button>
     </div>
     <div class="input-hint" id="docHint">当前为普通用户模式，仅可访问公开文档；管理员请从右上角进入系统管理</div>
   </div>
@@ -2059,13 +2814,151 @@ _HTML_PAGE = r"""
 
 <script>
 // ============================================================
+// Token 管理（登录态由统一登录页 /login 处理，本页仅校验与重定向）
+// ============================================================
+const RAG_TOKEN_KEY = 'rag_token';
+function getRagToken(){ return localStorage.getItem(RAG_TOKEN_KEY) || ''; }
+function setRagToken(t){ if(t) localStorage.setItem(RAG_TOKEN_KEY, t); else localStorage.removeItem(RAG_TOKEN_KEY); }
+
+// 包装 fetch：自动带 Authorization；401/403 时只清 token + 控制台告警，不再自动弹回登录页
+// （原行为会把任何 401/403 误判为「登录态失效」并 showLogin，导致登录后页面卡死）
+(function(){
+  const _orig = window.fetch.bind(window);
+  window.fetch = function(url, opts){
+    opts = opts || {};
+    const t = getRagToken();
+    if(t){
+      opts.headers = Object.assign({}, opts.headers);
+      opts.headers['Authorization'] = 'Bearer ' + t;
+    }
+    return _orig(url, opts).then(function(res){
+      if(res.status === 401 || res.status === 403){
+        console.warn('[rag-auth] 接口 ' + url + ' 返回 ' + res.status + '，可能是登录态失效');
+        // 不再自动清 token / 弹登录页：避免误伤（任意接口 401 都会触发）
+        // 改由各业务函数自行决定如何处理（如 openUsage 在 401 时显示错误）
+      }
+      return res;
+    });
+  };
+})();
+
+async function bootstrapAuth(){
+  const token = getRagToken();
+  if(!token){ location.replace('/login'); return; }
+  try{
+    const r = await fetch('/api/me', {headers:{'Authorization':'Bearer '+token}});
+    if(r.ok){
+      const u = await r.json();
+      currentUser = u.username;
+      currentRole = u.role;
+      // admin 应在 /admin 后台工作，不在聊天页——强制跳走
+      if (currentRole === 'admin') {
+        location.replace('/admin');
+        return;
+      }
+      document.documentElement.style.visibility = 'visible';  // 校验通过，显示页面
+      renderUser();
+      loadHistory();  // 刷新/重登后恢复历史对话
+      checkUnfinishedTasks();  // 刷新/重登后检测上次未完成的任务，弹横条让用户确认是否继续
+      return;
+    }
+  }catch(e){}
+  setRagToken(''); location.replace('/login');
+}
+
+// ============================================================
+// 退出登录：清 token + 调 /api/logout + 跳登录页
+// ============================================================
+function doLogout(){
+  fetch('/api/logout', {method:'POST'}).catch(function(){});
+  setRagToken('');
+  location.replace('/login');
+}
+
+// ============================================================
+// 修改密码（聊天页，普通用户/任意登录用户通用）
+// ============================================================
+function openChangePwd(){
+  document.getElementById('oldPwdInput').value = '';
+  document.getElementById('newPwdInput').value = '';
+  document.getElementById('newPwdInput2').value = '';
+  const msg = document.getElementById('changePwdMsg');
+  msg.textContent = ''; msg.className = 'pwd-msg';
+  document.getElementById('changePwdModal').classList.add('show');
+}
+function closeChangePwd(){
+  document.getElementById('changePwdModal').classList.remove('show');
+}
+async function submitChangePwd(){
+  const oldPwd = document.getElementById('oldPwdInput').value;
+  const newPwd = document.getElementById('newPwdInput').value;
+  const newPwd2 = document.getElementById('newPwdInput2').value;
+  const msg = document.getElementById('changePwdMsg');
+  msg.className = 'pwd-msg';
+
+  if (!oldPwd || !newPwd || !newPwd2){
+    msg.className = 'pwd-msg err';
+    msg.textContent = '请填写完整';
+    return;
+  }
+  if (newPwd.length < 6){
+    msg.className = 'pwd-msg err';
+    msg.textContent = '新密码至少 6 位';
+    return;
+  }
+  if (newPwd !== newPwd2){
+    msg.className = 'pwd-msg err';
+    msg.textContent = '两次输入的新密码不一致';
+    return;
+  }
+
+  try{
+    const r = await fetch('/api/change-password', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({old_password: oldPwd, new_password: newPwd})
+    });
+    const d = await r.json();
+    if (d.success){
+      msg.className = 'pwd-msg ok';
+      msg.textContent = d.message || '密码修改成功';
+      showToast(d.message || '密码修改成功', 'success');
+      setTimeout(closeChangePwd, 900);
+    } else {
+      msg.className = 'pwd-msg err';
+      msg.textContent = d.error || '修改失败';
+    }
+  }catch(e){
+    msg.className = 'pwd-msg err';
+    msg.textContent = '网络错误: ' + e.message;
+  }
+}
+
+// 聊天页轻量 toast（与后台 showToast 同款）
+function showToast(msg, type){
+  const t = document.createElement('div');
+  t.className = 'toast ' + (type || 'info');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(function(){ t.remove(); }, 3000);
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+  // userChip 仅展示(显示当前登录账号),不绑定任何点击行为
+  // 退出登录改由独立的 #logoutBtn 处理(doLogout)
+  bootstrapAuth();
+});
+
+// ============================================================
 // 全局状态
 // ============================================================
 let currentRole = 'user';
 let isQuerying = false;
-// 用量归属账号：决定 token 记到谁头上，也决定「我的用量」查谁
-let currentUser = localStorage.getItem('rag_user') || 'guest';
+// 用量归属账号：登录后由 token 决定（见 bootstrapAuth），不再允许游客随意填写
+let currentUser = '';
 let usageRange = 'today';
+// 当前查询的 AbortController：用于主动中断对话（点击"停止"按钮时 abort）
+let currentAbortController = null;
 
 // ============================================================
 // 用量归属账号
@@ -2073,16 +2966,16 @@ let usageRange = 'today';
 function renderUser() {
   document.getElementById('userLabel').textContent = currentUser;
   document.getElementById('usageUser').textContent = currentUser;
+  // 系统管理入口只对 admin 可见（普通用户不应看见后台按钮）
+  const adminLink = document.getElementById('adminLink');
+  if (adminLink) {
+    adminLink.style.display = (currentRole === 'admin') ? '' : 'none';
+  }
 }
 
 function changeUser() {
-  const name = prompt('设置用量归属账号（token 会记到这个名字下）:', currentUser);
-  if (name === null) return;
-  const v = name.trim().slice(0, 32);
-  if (!v) return;
-  currentUser = v;
-  localStorage.setItem('rag_user', v);
-  renderUser();
+  // 已改为登录态驱动，不再允许游客随意修改用量归属账号
+  alert('用量归属账号以登录账号为准，无需手动切换。退出请点击右上角账号。');
 }
 
 // ============================================================
@@ -2212,46 +3105,44 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     })
     .catch(() => console.warn('Health check failed'));
-
-  // ===== 断点重续：页面加载时检查未完成任务 =====
-  fetch('/api/tasks/unfinished?session_id=web_' + (currentRole || 'user'))
-    .then(r => r.json())
-    .then(data => {
-      if (data.count && data.count > 0) {
-        const task = data.tasks[0];
-        const msg = '检测到上次有未完成的任务：\n"' + task.query + '"\n\n是否恢复执行？';
-        if (confirm(msg)) {
-          // 用户点击"确定"，恢复执行
-          addMessage('user', task.query);
-          isQuerying = true;
-          toggleUI(true);
-          addMessage('assistant', '正在从断点恢复执行...');
-          fetch('/api/tasks/resume', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({task_id: task.task_id, session_id: 'web_' + (currentRole || 'user')})
-          })
-          .then(r => r.json())
-          .then(result => {
-            if (result.answer) {
-              addMessage('assistant', result.answer);
-            } else if (result.error) {
-              addMessage('assistant', '恢复失败：' + result.error);
-            }
-          })
-          .catch(e => addMessage('assistant', '恢复请求失败：' + e))
-          .finally(() => {
-            isQuerying = false;
-            toggleUI(false);
-          });
-        }
-      }
-    })
-    .catch(() => console.warn('Unfinished tasks check failed'));
 });
 
 // ============================================================
-// 角色状态（聊天页固定为普通用户，不允许切换）
+// 断点重续：登录后检测上次未完成的任务，弹出友好横条让用户确认是否继续
+// （不再用浏览器原生 confirm，避免被弹窗拦截；session_id 由后端按 token 派生）
+// ============================================================
+function checkUnfinishedTasks() {
+  fetch('/api/tasks/unfinished')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.tasks || data.tasks.length === 0) return;
+      const task = data.tasks[0];
+      const bar = document.getElementById('resumeBar');
+      if (!bar) return;
+      bar.querySelector('.resume-query').textContent = task.query;
+      bar.dataset.taskId = task.task_id;
+      bar.style.display = 'flex';
+    })
+    .catch(() => console.warn('Unfinished tasks check failed'));
+}
+
+function resumeFromBar() {
+  const bar = document.getElementById('resumeBar');
+  if (!bar) return;
+  const taskId = bar.dataset.taskId;
+  if (!taskId) return;
+  bar.style.display = 'none';
+  // 把原问题当作一次新提问渲染出来，并恢复执行
+  sendQuestionWith(taskId, bar.querySelector('.resume-query').textContent);
+}
+
+function dismissResumeBar() {
+  const bar = document.getElementById('resumeBar');
+  if (bar) bar.style.display = 'none';
+}
+
+// ============================================================
+// 角色状态：聊天页只服务非 admin 用户，admin 在 /admin 后台使用
 // ============================================================
 function updateRoleUI() {
   const badge = document.getElementById('roleBadge');
@@ -2259,10 +3150,11 @@ function updateRoleUI() {
   const dot = badge.querySelector('.role-dot');
   const hint = document.getElementById('docHint');
 
+  // 聊天页强制按普通用户展示（admin 也只看文档问答，不会在这里看到管理入口）
   badge.className = 'role-badge user';
   dot.className = 'role-dot user';
   label.textContent = '普通用户';
-  hint.innerHTML = '当前为普通用户模式，仅可访问公开文档；管理员请从右上角进入系统管理';
+  hint.innerHTML = '当前为普通用户模式，仅可访问公开文档';
 }
 
 // ============================================================
@@ -2278,6 +3170,28 @@ function handleKeydown(e) {
 function askSuggestion(el) {
   document.getElementById('questionInput').value = el.textContent;
   sendQuestion();
+}
+
+// 刷新/重登后从后端拉取历史对话并渲染（数据在 MySQL，不在前端内存）
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/history', {
+      headers: {'Authorization': 'Bearer ' + getRagToken()}
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    const msgs = data.messages || [];
+    if (!msgs.length) return;
+    // 有历史时隐藏欢迎页
+    const welcome = document.getElementById('welcome');
+    if (welcome) welcome.style.display = 'none';
+    for (const m of msgs) {
+      if (m.role === 'user') addUserMessage(m.content);
+      else if (m.role === 'assistant') addAssistantMessage(m.content);
+    }
+  } catch (e) {
+    // 历史拉取失败不影响新对话，静默忽略
+  }
 }
 
 async function sendQuestion() {
@@ -2304,11 +3218,14 @@ async function sendQuestion() {
   const progressBox = addProgressBox();
 
   // 启动 SSE 流
+  // 主动中断用：把 controller 存到 currentAbortController，让"停止"按钮可以 abort
+  currentAbortController = new AbortController();
   try {
     const resp = await fetch('/api/query/stream', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question, role: currentRole, username: currentUser})
+      body: JSON.stringify({question, role: currentRole, username: currentUser}),
+      signal: currentAbortController.signal
     });
 
     const reader = resp.body.getReader();
@@ -2356,12 +3273,112 @@ async function sendQuestion() {
 
   } catch (e) {
     if (progressBox.parentNode) progressBox.remove();
-    addErrorMessage('连接中断: ' + e.message);
+    if (e.name === 'AbortError') {
+      // 用户主动中断：友好提示（不是错误）
+      addAssistantMessage('⏹ 已中断当前回答。');
+    } else {
+      addErrorMessage('连接中断: ' + e.message);
+    }
   }
 
+  currentAbortController = null;
   isQuerying = false;
   updateSendButton();
   updateRoleUI();
+}
+
+// 从断点重续横条触发：复用原问题，调 /api/tasks/resume 恢复上次未完成的任务
+async function sendQuestionWith(taskId, question) {
+  if (!question || isQuerying) return;
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.style.display = 'none';
+
+  addUserMessage(question);
+
+  // 用进度框替换原"⏳ 正在恢复..."占位气泡，跟普通 query 风格一致
+  removeLastAssistant();
+  const progressBox = addProgressBox();
+  document.getElementById('chatArea').appendChild(progressBox);
+  progressBox.scrollIntoView({behavior: 'smooth', block: 'end'});
+
+  isQuerying = true;
+  updateSendButton();
+
+  // 关键：把 AbortController 挂到全局，让刚加的 ⏹ 中断按钮能真正中止
+  currentAbortController = new AbortController();
+
+  try {
+    const resp = await fetch('/api/tasks/resume', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({task_id: taskId}),
+      signal: currentAbortController.signal,
+    });
+
+    if (!resp.ok && resp.status !== 200) {
+      // 非流式错误（如 400/500）
+      let errText = '恢复失败';
+      try {
+        const j = await resp.json();
+        errText = j.error || errText;
+      } catch (_) {}
+      if (progressBox.parentNode) progressBox.remove();
+      addErrorMessage('恢复失败：' + errText);
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalAnswer = null;
+    let errored = false;
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          handleSSEEvent(data, progressBox, question);
+          if (data.type === 'done') finalAnswer = data.answer;
+          else if (data.type === 'error') errored = true;
+        } catch (_) {}
+      }
+    }
+
+    if (progressBox.parentNode) progressBox.remove();
+    if (errored) {
+      addErrorMessage('恢复过程出现异常，请稍后重试。');
+    } else if (finalAnswer) {
+      addAssistantMessage(finalAnswer);
+    } else {
+      addErrorMessage('恢复过程出现异常，请稍后重试。');
+    }
+  } catch (e) {
+    if (progressBox.parentNode) progressBox.remove();
+    if (e.name === 'AbortError') {
+      addAssistantMessage('⏹ 已中断断点恢复');
+    } else {
+      addErrorMessage('连接中断: ' + e.message);
+    }
+  } finally {
+    isQuerying = false;
+    currentAbortController = null;
+    updateSendButton();
+  }
+}
+
+function removeLastAssistant() {
+  const area = document.getElementById('chatArea');
+  if (!area) return;
+  const last = area.lastElementChild;
+  if (last && last.classList.contains('message')) {
+    last.remove();
+  }
 }
 
 function handleSSEEvent(data, progressBox, question) {
@@ -2470,8 +3487,35 @@ function addErrorMessage(text) {
 
 function updateSendButton() {
   const btn = document.getElementById('sendBtn');
-  btn.disabled = isQuerying;
-  btn.textContent = isQuerying ? '...' : '➤';
+  if (isQuerying) {
+    // 查询中：变成"停止"按钮（红色 ⏹，点击触发 abort）
+    btn.classList.add('stopping');
+    btn.textContent = '⏹';
+    btn.title = '点击中断当前回答';
+    btn.disabled = false;  // 必须可点，所以单独控制
+  } else {
+    btn.classList.remove('stopping');
+    btn.textContent = '➤';
+    btn.title = '发送';
+    btn.disabled = false;
+  }
+}
+
+// 发送按钮的真正入口：查询中点击=abort，空闲点击=发送
+function onSendBtnClick() {
+  if (isQuerying) {
+    abortCurrentQuery();
+  } else {
+    sendQuestion();
+  }
+}
+
+function abortCurrentQuery() {
+  if (currentAbortController) {
+    try { currentAbortController.abort(); } catch (e) {}
+  }
+  // 后端 daemon 线程会继续跑完，但前端立刻停止显示（用户视角的"中断"）
+  // 若需要"硬中断"（停后端 LangGraph 任务），需在后端节点协作 CheckpointSaver
 }
 
 function scrollToBottom() {
@@ -2587,7 +3631,8 @@ def init_system():
     # 2. 向量数据库
     try:
         vector_db = VectorStoreManager.init_vector_store()
-        print(f"  ✓ 向量数据库: {DB_PATH}")
+        print(f"  ✓ 向量数据库: VECTOR_BACKEND={os.getenv('VECTOR_BACKEND', 'milvus')}"
+              f"（Chroma 兜底路径 {DB_PATH}）")
     except Exception as e:
         print(f"  ✗ 向量数据库初始化失败: {e}")
         sys.exit(1)

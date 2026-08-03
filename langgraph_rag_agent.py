@@ -14,6 +14,13 @@ LangGraph 版高级 RAG Agent
 复用 advanced_rag_agent.py 中的 OllamaLLM / VectorStoreManager / CacheManager / AccessControlFilter，
 不重复造轮子。
 
+关键依赖（最终架构）：
+  - LLM：经 LLM 网关（llm_gateway）统一路由 —— qwen2:7b 负责 generate/plan，
+    qwen2.5:1.5b 负责 grade/rewrite/compress（见 create_llm()）。
+  - Embedding：统一使用 Ollama bge-m3（advanced_rag_agent._make_embedder，主进程不加载
+    torch，只提供 Ollama 模式，无本地 SentenceTransformer 回退）。
+  - 向量库：Milvus 默认，Chroma 兜底（VECTOR_BACKEND 切换，检索接口统一）。
+
 图结构：
   START → load_history → classify → [条件边]
     ├ simple  → query_rewrite → retrieve → grade_docs → [条件边]
@@ -53,8 +60,6 @@ from advanced_rag_agent import (
     VectorStoreManager,
     CacheManager,
     AccessControlFilter,
-    OLLAMA_URL,
-    MODEL_NAME,
     ROLE_ADMIN,
     ROLE_USER,
     DEFAULT_ROLE,
@@ -99,7 +104,7 @@ HISTORY_MAX_TURNS = 8
 HISTORY_COMPRESS_TURNS = 6
 
 # 每次向量检索返回的文档片段数量。
-# ChromaDB 的 similarity_search_with_score 的 k 参数。
+# 向量库（Milvus/Chroma 统一接口）的 similarity_search_with_score 的 k 参数。
 # 5 是一个平衡值：太少可能遗漏关键信息，太多会塞满 LLM 上下文窗口。
 RETRIEVE_TOP_K = 5
 
@@ -167,7 +172,7 @@ class AgentState(TypedDict, total=False):
 
     # 当前轮次的改写查询词列表。
     # 第 1 轮改写 2-3 个搜索词，后续轮次换角度重新改写。
-    # 每个搜索词都会分别去 ChromaDB 检索，结果合并去重。
+    # 每个搜索词都会分别去向量库（Milvus/Chroma）检索，结果合并去重。
     rewritten_queries: List[str]
 
     # 累积检索到的文档列表，格式为 [(langchain Document, 距离分数), ...]。
@@ -263,7 +268,7 @@ class LangGraphRAGApp:
         # 所以本文件里 11 处 self.llm.chat(system, user) 一行都不用改。
         print("\n[1/3] 连接 LLM...")
         self.llm = create_llm()
-        self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
+        self.user = 1              # 当前调用用户的 ID（admin_users.id）；Web 模式会被覆盖为真实登录用户 ID
 
         # 2. 向量数据库（复用现有 VectorStoreManager）
         # VectorStoreManager 封装了 Milvus / ChromaDB 的初始化、文档索引、向量检索，
@@ -384,7 +389,7 @@ class LangGraphRAGApp:
             ├── query_type == "simple" ──► query_rewrite（多轮检索反馈循环）
             │                                  │
             │                                  ▼
-            │                               retrieve（ChromaDB 检索）
+            │                               retrieve（向量库 Milvus/Chroma 检索）
             │                                  │
             │                                  ▼
             │                               grade_docs（LLM 评分相关性）
@@ -555,7 +560,7 @@ class LangGraphRAGApp:
             return {"messages": history}
 
         # Layer 2: 查 MySQL（服务重启后的首次加载，或新会话）
-        history = self.memory_store.load_messages(session_id)
+        history = self.memory_store.load_messages(session_id, user_id=self.user)
         # 写入内存缓存，后续同会话直接读内存
         self._active_context[session_id] = history
         print(f"  [load_history] 会话 {session_id}：{len(history)} 条（MySQL 加载）")
@@ -701,7 +706,7 @@ class LangGraphRAGApp:
     # 对话历史统一写入（P0 止血 3.3：缓存命中与正常路径共用，杜绝历史空洞）
     # ========================================================================
 
-    def _append_history(self, session_id, question, answer, user_id="anonymous", cached=False):
+    def _append_history(self, session_id, question, answer, user_id: int = 0, cached=False):
         """
         把一轮问答写入 Layer 1（内存）+ Layer 2（MySQL）。
 
@@ -842,10 +847,10 @@ class LangGraphRAGApp:
         """
         【节点：向量检索 — 简单问题分支，simple】
 
-        作用：用改写后的查询词去 ChromaDB 做向量相似度检索，并对结果做权限过滤。
+        作用：用改写后的查询词去向量库（Milvus/Chroma 统一接口）做向量相似度检索，并对结果做权限过滤。
 
         原理：
-        每个改写查询词独立发送到 ChromaDB 的 similarity_search_with_score()。
+        每个改写查询词独立发送到向量库（Milvus/Chroma 统一接口）的 similarity_search_with_score()。
         这个函数先对查询词做 embedding（转为向量），然后在向量空间中找最近的 top-k 个文档。
         返回的是 (Document, 距离分数) 元组，距离越小表示越相似。
 
@@ -1275,7 +1280,7 @@ class LangGraphRAGApp:
         """
         【辅助：向量检索 + 去重 + 权限过滤】
 
-        作用：对多个查询词分别做 ChromaDB 向量检索，合并结果后去重。
+        作用：对多个查询词分别做向量库（Milvus/Chroma）向量检索，合并结果后去重。
 
         原理：
         1. 每个查询词独立调用 similarity_search_with_score() 取 top-k 个文档
@@ -1414,7 +1419,7 @@ class LangGraphRAGApp:
 
         流程（5 步）：
         1. query_rewrite — 将子任务改写为 2-3 个搜索词
-        2. retrieve — ChromaDB 向量检索 + 权限过滤
+        2. retrieve — 向量库（Milvus/Chroma）向量检索 + 权限过滤
         3. grade_docs — LLM 批量评分文档相关性
         4. MMR 重排序 — 过滤不相关 + 去冗余
         5. generate — 基于最终文档生成子回答
@@ -1864,6 +1869,7 @@ class LangGraphRAGApp:
         role: str = DEFAULT_ROLE,
         session_id: str = "default",
         user: str = None,
+        user_id: int = None,
     ) -> str:
         """
         【对外入口：用户提问】
@@ -1892,9 +1898,10 @@ class LangGraphRAGApp:
         返回：
             生成的回答文本
         """
-        # 把 user 记到实例上，让本次问答里所有 self.llm.chat 都带上归因
-        if user:
-            self.user = user
+        # 把 user_id（admin_users.id，外键）记到实例上，
+        # 本次问答里所有 memory_store 写入都用它做用户隔离（不再冗余存用户名）。
+        if user_id is not None:
+            self.user = user_id
         total_start = time.time()
 
         print("\n" + "=" * 70)
@@ -1931,7 +1938,7 @@ class LangGraphRAGApp:
             "query": question,
             "role": role,
             "session_id": session_id,
-            "messages": self._active_context.get(session_id, self.memory_store.load_messages(session_id)),
+            "messages": self._active_context.get(session_id, self.memory_store.load_messages(session_id, user_id=self.user)),
             "retrieved_docs": [],
             "doc_grades": [],
             "retrieval_iterations": 0,
@@ -1976,7 +1983,7 @@ class LangGraphRAGApp:
 
         return answer
 
-    def check_unfinished_tasks(self, session_id: str) -> List[Dict]:
+    def check_unfinished_tasks(self, session_id: str, user_id: int = 0) -> List[Dict]:
         """
         【断点检测：查询指定会话的未完成任务】
 
@@ -1986,13 +1993,14 @@ class LangGraphRAGApp:
 
         参数：
             session_id: 会话 ID
+            user_id: 登录账号的 ID（admin_users.id），防止 A 用户恢复 B 用户的任务
         返回：
             [{"task_id": "...", "query": "...", "created_at": "..."}, ...]
             空列表表示没有未完成任务
         """
-        return self.memory_store.get_unfinished_tasks(session_id)
+        return self.memory_store.get_unfinished_tasks(session_id, user_id=user_id)
 
-    def resume(self, task_id: str, session_id: str = "default") -> str:
+    def resume(self, task_id: str, session_id: str = "default", user_id: int = None) -> str:
         """
         【断点重续：从上次中断的位置恢复执行】
 
@@ -2026,6 +2034,10 @@ class LangGraphRAGApp:
         print(f"[断点重续] 恢复任务 {task_id}")
         print(f"{'=' * 70}")
 
+        # 把 user_id 记到实例上，resume 内部 load_messages 用它做用户隔离
+        if user_id is not None:
+            self.user = user_id
+
         # 1. 查询任务信息
         task = self.memory_store.get_task_by_id(task_id)
         if not task:
@@ -2042,7 +2054,14 @@ class LangGraphRAGApp:
             restored_state = ckpt["state"]
             # 确保关键字段存在
             restored_state["session_id"] = session_id
-            restored_state.setdefault("messages", self.memory_store.load_messages(session_id))
+            restored_state.setdefault("messages", self.memory_store.load_messages(session_id, user_id=self.user))
+            # 【兜底】旧脏 checkpoint 的 retrieved_docs 元素是 str（老版本用 default=str 序列化），
+            # 访问 .page_content 会炸。清空让 retrieve 节点重跑（影响极小，文档可重检）。
+            rd = restored_state.get("retrieved_docs", [])
+            if rd and any(isinstance(d, str) or not hasattr(d, "__iter__") for d in rd):
+                print(f"  [resume] 检测到旧版脏 checkpoint（retrieved_docs 非 Document 对象），清空后重跑")
+                restored_state["retrieved_docs"] = []
+                restored_state["doc_grades"] = []
         else:
             # 没有快照，从头开始
             print(f"  无断点快照，从头执行")
@@ -2050,7 +2069,7 @@ class LangGraphRAGApp:
                 "query": task["query"],
                 "role": task.get("role", DEFAULT_ROLE),
                 "session_id": session_id,
-                "messages": self.memory_store.load_messages(session_id),
+                "messages": self.memory_store.load_messages(session_id, user_id=self.user),
                 "retrieved_docs": [],
                 "doc_grades": [],
                 "retrieval_iterations": 0,
@@ -2154,7 +2173,7 @@ def run_interactive(app: LangGraphRAGApp, role: str):
             print("  已切换为普通用户（仅公开文档）")
             continue
         if question.lower() in ("/history", "/历史"):
-            history = app._active_context.get(session_id, app.memory_store.load_messages(session_id))
+            history = app._active_context.get(session_id, app.memory_store.load_messages(session_id, user_id=app.user))
             print(f"  当前会话历史（{len(history)} 条）:")
             for m in history:
                 r = "用户" if m["role"] == "user" else "助手"
@@ -2162,7 +2181,7 @@ def run_interactive(app: LangGraphRAGApp, role: str):
             continue
         if question.lower() in ("/clear", "/清空"):
             app._active_context.pop(session_id, None)
-            app.memory_store.clear_messages(session_id)
+            app.memory_store.clear_messages(session_id, user_id=app.user)
             print("  已清空会话历史（内存 + MySQL）")
             continue
 
