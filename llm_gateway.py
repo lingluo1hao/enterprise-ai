@@ -53,6 +53,7 @@ import random
 import sqlite3
 import threading
 import http.client
+import redis
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -774,6 +775,93 @@ class TokenBucket:
                     "rejected": self.rejected}
 
 
+def _get_shared_redis():
+    """获取共享限流用的 Redis 客户端（与 CacheManager 同源：REDIS_HOST/PORT/DB/PASSWORD）。
+    连不上返回 None，调用方降级为内存限流。"""
+    try:
+        r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "192.168.200.128"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            password=os.getenv("REDIS_PASSWORD", "dev0619") or None,
+            db=int(os.getenv("REDIS_DB", "0")),
+            socket_connect_timeout=3, socket_timeout=3,
+            decode_responses=True,
+        )
+        r.ping()
+        return r
+    except Exception as e:
+        print(f"[Gateway] 共享限流 Redis 不可用（{e}），降级内存限流")
+        return None
+
+
+class RedisTokenBucket:
+    """
+    Redis 令牌桶（多实例共享限流）。
+
+    用 Lua 脚本在 Redis 端原子完成 refill + consume，保证多 gunicorn worker /
+    多机部署时全局 RPM/TPM 配额一致。rate 内部换算为每秒补充速率。
+    client 为 None 时 try_acquire 直接放行（兼容未配置 Redis）。
+    """
+
+    _LUA = """
+    local rate = tonumber(ARGV[1])
+    local cap  = tonumber(ARGV[2])
+    local now  = tonumber(ARGV[3])
+    local cost = tonumber(ARGV[4])
+    local d = redis.call('HMGET', KEYS[1], 't', 'ts')
+    local tokens = d[1]
+    local ts = d[2]
+    if not tokens then tokens = cap; ts = now end
+    tokens = math.min(cap, tokens + (now - ts) * rate)
+    if tokens >= cost then
+        tokens = tokens - cost
+        redis.call('HMSET', KEYS[1], 't', tokens, 'ts', now)
+        redis.call('EXPIRE', KEYS[1], 120)
+        return 1
+    end
+    redis.call('HMSET', KEYS[1], 't', tokens, 'ts', now)
+    redis.call('EXPIRE', KEYS[1], 120)
+    return 0
+    """
+
+    def __init__(self, rate_per_min, capacity=None, prefix="b", client=None):
+        self.rate = float(rate_per_min)
+        self.capacity = float(capacity or rate_per_min)
+        self.prefix = prefix
+        self.client = client
+        self.rejected = 0
+        self._script = client.register_script(self._LUA) if client else None
+
+    def try_acquire(self, n: float = 1.0) -> bool:
+        if self.rate <= 0 or self.client is None:
+            return True
+        ok = self._script(keys=[self.prefix], args=[self.rate / 60.0, self.capacity, time.time(), n])
+        if not ok:
+            self.rejected += 1
+        return bool(ok)
+
+    def acquire(self, n: float = 1.0, timeout: float = 0.0) -> bool:
+        if self.rate <= 0 or self.client is None:
+            return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if self.try_acquire(n):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            wait = min(0.5, max(0.02, n * 60.0 / max(self.rate, 1e-6)))
+            time.sleep(wait * (0.8 + 0.4 * random.random()))
+
+    def snapshot(self) -> Dict[str, float]:
+        if self.client is None:
+            return {"tokens": self.capacity, "capacity": self.capacity,
+                    "rate_per_min": self.rate, "rejected": self.rejected}
+        d = self.client.hmget(self.prefix, "t", "ts")
+        tokens = float(d[0]) if d[0] else self.capacity
+        return {"tokens": round(tokens, 2), "capacity": self.capacity,
+                "rate_per_min": self.rate, "rejected": self.rejected}
+
+
 class CircuitBreaker:
     """
     熔断器：三态状态机。
@@ -1170,8 +1258,9 @@ class LLMGateway:
             max_per_host=int(self.cfg.pool_size_per_host),
             idle_timeout=float(self.cfg.pool_idle_timeout),
         )
-        self._global_rpm = TokenBucket(int(self.cfg.global_rpm or 0))
-        self._global_tpm = TokenBucket(int(self.cfg.global_tpm or 0))
+        self._shared_redis = _get_shared_redis()
+        self._global_rpm = self._make_bucket(int(self.cfg.global_rpm or 0), "gw:global:rpm")
+        self._global_tpm = self._make_bucket(int(self.cfg.global_tpm or 0), "gw:global:tpm")
         self._build_runtimes()
         self._remember_mtime()
 
@@ -1194,6 +1283,23 @@ class LLMGateway:
             else:
                 print("[Gateway] Token 用量仅进程内累计（未配置 usage_db，重启即丢）")
 
+    # -- 限流桶工厂（Redis 共享 / 内存降级） -------------------------------
+    _warned_no_redis = False  # 类级标志，避免重复告警刷屏
+
+    def _make_bucket(self, rate_per_min: int, prefix: str):
+        """构造令牌桶：配置了 Redis 则用共享桶（多实例全局配额一致），
+        否则降级为进程内内存桶并告警（多实例时配额会被放大 N 倍）。"""
+        if rate_per_min <= 0:
+            return TokenBucket(0)
+        if self._shared_redis is not None:
+            return RedisTokenBucket(rate_per_min, prefix=prefix, client=self._shared_redis)
+        if not LLMGateway._warned_no_redis:
+            print("[Gateway] ⚠ 未检测到 Redis，LLM 限流为进程内内存态；"
+                  "多实例部署时全局 RPM/TPM 配额会被放大 N 倍。"
+                  "建议设置 REDIS_HOST 启用共享限流。")
+            LLMGateway._warned_no_redis = True
+        return TokenBucket(rate_per_min)
+
     # -- 初始化与热重载 ----------------------------------------------------
     def _build_runtimes(self) -> None:
         runtimes: Dict[str, _ModelRuntime] = {}
@@ -1209,8 +1315,8 @@ class LLMGateway:
                 cfg=mc,
                 provider=provider,
                 breaker=CircuitBreaker(mc.fail_threshold, mc.recovery_sec),
-                rpm_bucket=TokenBucket(mc.rpm),
-                tpm_bucket=TokenBucket(mc.tpm),
+                rpm_bucket=self._make_bucket(mc.rpm, f"gw:m:{name}:rpm"),
+                tpm_bucket=self._make_bucket(mc.tpm, f"gw:m:{name}:tpm"),
             )
         with self._lock:
             self._runtimes = runtimes
@@ -1256,8 +1362,8 @@ class LLMGateway:
 
         with self._lock:
             self.cfg = new_cfg
-            self._global_rpm = TokenBucket(int(new_cfg.global_rpm or 0))
-            self._global_tpm = TokenBucket(int(new_cfg.global_tpm or 0))
+            self._global_rpm = self._make_bucket(int(new_cfg.global_rpm or 0), "gw:global:rpm")
+            self._global_tpm = self._make_bucket(int(new_cfg.global_tpm or 0), "gw:global:tpm")
         self._build_runtimes()
         self._cfg_mtime = mtime
         if self._verbose:

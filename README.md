@@ -975,6 +975,50 @@ DOC_ACCESS_RULES = {
 
 - 网关默认开启（`USE_LLM_GATEWAY=true`）。临时关闭：`export USE_LLM_GATEWAY=false`，业务代码会自动退回改造前的单模型直连，用于对照或应急回滚，无需改代码。
 - 路由、限流、熔断等参数都在 `llm_gateway.yaml`，修改后 10 秒内自动热重载，无需重启。
+
+## 生产部署（高并发 · gunicorn）
+
+> ⚠️ **gunicorn 仅支持 Linux / macOS**，不能在 Windows 宿主机直接运行（依赖 `fcntl`）。
+> 本项目实际部署在 Linux VM（192.168.200.128）上，请在 VM 内启动 gunicorn。
+> Windows 本地仅用于开发调试（`python rag_web_server.py` 单进程模式）。
+
+### 1. 安装（VM / Linux）
+```bash
+pip install gunicorn redis
+```
+
+### 2. 启动高并发服务
+```bash
+# 使用 gunicorn_config.py（推荐）：4 进程 × 8 线程，兼容 SSE 长连接
+gunicorn -c gunicorn_config.py rag_web_server:app
+
+# 或用环境变量覆盖
+GUNICORN_WORKERS=8 GUNICORN_THREADS=16 PORT=8080 gunicorn -c gunicorn_config.py rag_web_server:app
+```
+
+### 3. 关键设计
+- **多 worker 初始化**：gunicorn 不执行 `__main__`，故 `post_worker_init` 钩子在每个 worker 内调用 `init_system()`，确保每个进程都加载向量库 + 编排器。
+- **LangGraph 开关**：模块顶层已用环境变量 `RAG_LANGGRAPH`（默认 true）控制，不再写死 `False`，避免 gunicorn 下回退到旧引擎。
+- **并发重建保护**：多 worker 同时初始化向量库时，用 Redis 分布式锁（`rag:init:vectorstore:lock`）保证只有一个进程重建 Milvus 集合，其余等待后只连接，避免 `drop+create` 竞争。
+- **限流共享（Redis）**：LLM 网关的 RPM/TPM 令牌桶已从进程内 `TokenBucket` 升级为 `RedisTokenBucket`（Lua 原子操作）。多实例部署时全局配额一致，不再被放大 N 倍。未配置 Redis 时自动降级为内存桶并告警。
+
+### 4. 调优参数（环境变量）
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `GUNICORN_WORKERS` | 4 | worker 进程数，建议 `2×CPU+1` |
+| `GUNICORN_THREADS` | 8 | 每 worker 线程数（gthread 模式） |
+| `GUNICORN_TIMEOUT` | 120 | 单请求超时（LLM 调用慢，给足） |
+| `GUNICORN_WORKER_CLASS` | gthread | 推荐 gthread，兼容 SSE 长连接 |
+| `RAG_LANGGRAPH` | true | false 关闭 LangGraph 引擎 |
+| `REDIS_HOST/PORT/DB/PASSWORD` | 192.168.200.128:6379 | 共享限流 + 缓存 + 初始化锁 |
+
+### 5. Windows 本地调试替代
+Windows 下无 gunicorn，可用纯 Python 的 `waitress`：
+```bash
+pip install waitress
+waitress-serve --threads=8 --port=8080 rag_web_server:app
+```
+（仅开发调试，生产仍在 VM 用 gunicorn）
 - 想新增云端模型（如 DeepSeek / 通义千问），在 yaml 的 `models` 里配好 `provider` + `api_key_env`，并把 `enabled` 改为 `true` 即可，无需动业务代码。
 - 网关改造说明、路由策略与已修复的真实缺陷见 [`LLM_GATEWAY_README.md`](LLM_GATEWAY_README.md)。
 

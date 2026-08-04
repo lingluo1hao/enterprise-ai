@@ -44,6 +44,7 @@ from advanced_rag_agent import (
     OllamaLLM,
     create_llm,
     VectorStoreManager,
+    REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB,
 )
 
 
@@ -92,7 +93,10 @@ app = Flask(__name__)
 orchestrator = None
 llm = None
 vector_db = None
-use_langgraph = False
+# LangGraph 引擎开关：默认开启。
+# 注意 gunicorn 多 worker 不执行 __main__，必须用环境变量控制（不能写死 False），
+# 否则所有 worker 会回退到旧版 RAGOrchestrator。可用 RAG_LANGGRAPH=0/False 关闭。
+use_langgraph = os.getenv("RAG_LANGGRAPH", "true").lower() not in ("0", "false", "no", "off")
 
 
 # ======================================================================
@@ -3628,9 +3632,9 @@ def init_system():
         print("    请确认 Ollama 已运行且已加载模型")
         sys.exit(1)
 
-    # 2. 向量数据库
+    # 2. 向量数据库（多 worker 安全：Redis 锁防并发重建 Milvus 集合）
     try:
-        vector_db = VectorStoreManager.init_vector_store()
+        vector_db = _init_vector_store_locked()
         print(f"  ✓ 向量数据库: VECTOR_BACKEND={os.getenv('VECTOR_BACKEND', 'milvus')}"
               f"（Chroma 兜底路径 {DB_PATH}）")
     except Exception as e:
@@ -3648,7 +3652,39 @@ def init_system():
     print(f"  ✓ Web 界面已启动\n")
 
 
+def _init_vector_store_locked():
+    """
+    多 worker 安全初始化向量库。
+
+    gunicorn 多 worker 时每个 worker 都会调 init_system()，若同时触发
+    Milvus 集合重建（维度变更/集合不存在），并发 drop+create 会冲突报错。
+    用 Redis 分布式锁保证只有一个 worker 执行完整重建，其余等待后只连接。
+    无 Redis（单实例开发）时直接初始化，无并发风险。
+    """
+    try:
+        import redis as _redis
+        import time as _t
+        r = _redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD,
+                         db=REDIS_DB, socket_connect_timeout=5, socket_timeout=5)
+        r.ping()
+    except Exception:
+        return VectorStoreManager.init_vector_store()
+
+    lock_key = "rag:init:vectorstore:lock"
+    if r.set(lock_key, "1", nx=True, ex=600):
+        try:
+            return VectorStoreManager.init_vector_store()
+        finally:
+            r.delete(lock_key)
+    # 未持锁：等待持锁 worker 建好集合（最多 2 分钟），再只连接不重建
+    deadline = _t.time() + 120
+    while _t.time() < deadline and r.exists(lock_key):
+        _t.sleep(1)
+    return VectorStoreManager.init_vector_store()
+
+
 def main():
+    global use_langgraph
     import argparse
     parser = argparse.ArgumentParser(description="RAG Agent Web Server")
     parser.add_argument("--port", type=int, default=8080, help="Web 服务器端口 (默认 8080)")
@@ -3656,12 +3692,11 @@ def main():
     parser.add_argument(
         "--langgraph",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=use_langgraph,
         help="使用 LangGraph 引擎（默认开启，--no-langgraph 使用旧版）",
     )
     args = parser.parse_args()
 
-    global use_langgraph
     use_langgraph = args.langgraph
 
     init_system()
@@ -3670,6 +3705,8 @@ def main():
     print(f"  🌐 浏览器打开: {url}")
     print(f"  按 Ctrl+C 停止服务器\n")
 
+    # 开发/单进程模式。生产高并发请用 gunicorn（见 gunicorn_config.py）：
+    #   gunicorn -c gunicorn_config.py rag_web_server:app
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 
