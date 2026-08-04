@@ -696,6 +696,10 @@ class VectorStoreManager:
             FieldSchema("access_level", DataType.VARCHAR, max_length=16),
             FieldSchema("chunk_index", DataType.INT64),
             FieldSchema("user_id", DataType.VARCHAR, max_length=64),
+            # 父子文档（small-to-big）：子片段检索命中后，透传父窗口上下文
+            FieldSchema("parent_id", DataType.VARCHAR, max_length=64),
+            FieldSchema("parent_content", DataType.VARCHAR, max_length=8192),
+            FieldSchema("is_parent", DataType.BOOL),
         ]
         # BM25 函数：content -> sparse（Milvus 原生稀疏检索，中文已配置 analyzer）
         bm25 = Function(
@@ -724,37 +728,38 @@ class VectorStoreManager:
         return 0
 
     def _build_milvus(self):
-        """从 docs/ 构建 Milvus 索引（upsert，幂等可重复执行）"""
-        import hashlib
-        from langchain_core.documents import Document
-        raw_docs = self._load_raw_docs()
-        if not raw_docs:
-            raise Exception(f"{DOC_FOLDER} 文件夹内没有可识别文档！")
-        split_docs = self._split(raw_docs)
-        print(f"  分片完成: {len(split_docs)} 个片段")
+        """首次构建：走统一数据面（增量 ingestion 引擎，force 全量）。
 
-        entities = []
-        for i, doc in enumerate(split_docs):
-            content = doc.page_content
-            src = doc.metadata.get("source", "")
-            cid = hashlib.md5((content + src).encode("utf-8")).hexdigest()
-            vec = self._embed.embed_documents([content])[0]
-            entities.append({
-                "chunk_id": cid,
-                "content": content[:8192],
-                "dense": vec,
-                "file_path": src,
-                "file_name": os.path.basename(src),
-                "access_level": doc.metadata.get("access_level", "public"),
-                "chunk_index": i,
-                "user_id": "anonymous",   # 知识库文档为全局可见
-            })
-        # 分批 upsert，避免单次包过大；主键相同自动覆盖（幂等）
-        batch = 200
-        for s in range(0, len(entities), batch):
-            self.client.upsert(self.collection, entities[s:s + batch])
-        self.client.flush(self.collection)
-        print(f"[VectorStore] Milvus 索引构建完成，共 {len(entities)} 条")
+        实体 shape 与旧实现完全一致（chunk_id=md5(content+src) 幂等、
+        content[:8192]、user_id=anonymous 等），仅把「全量重读 + 逐条 embed」
+        替换为统一的 IngestPipeline，便于复用增量/多格式/批量能力。
+        """
+        rep = self.ingest_documents(force=True)
+        print(f"[VectorStore] Milvus 索引构建完成：{rep.summary()}")
+
+    def ingest_documents(self, force: bool = False, files=None,
+                         dry_run: bool = False, progress_cb=None):
+        """数据面增量 ingestion（改造后统一入口）。
+
+        扫 docs/ → 指纹增量(mtime+size+md5) → 多格式 loader → 结构切分 →
+        批量 embedding(并发+重试) → 幂等 upsert。可重复触发、仅处理变更文件；
+        force=True 全量重建；dry_run=True 只预检不落库。
+
+        :return: RunReport（本次运行统计）
+        """
+        from ingest.pipeline import IngestPipeline
+        from ingest.store import MilvusStoreBackend
+        store = MilvusStoreBackend(self.client, self.collection)
+        pipe = IngestPipeline(
+            folder=DOC_FOLDER,
+            embedder=self._embed.embed_documents,
+            store=store,
+            access_fn=AccessControlFilter.get_access_level,
+            dry_run=dry_run,
+        )
+        rep = pipe.run(force=force, files=files, progress_cb=progress_cb)
+        pipe.close()
+        return rep
 
     def _parse_hits(self, hits):
         """把 Milvus 命中列表转成 (id, Document, distance) 三元组列表"""
@@ -767,10 +772,14 @@ class VectorStoreManager:
                 "file_name": entity.get("file_name", ""),
                 "access_level": entity.get("access_level", "public"),
                 "chunk_index": entity.get("chunk_index", 0),
+                "parent_id": entity.get("parent_id", ""),
             }
+            # small-to-big：优先返回父窗口上下文（更完整），
+            # 旧实体无 parent_content 时回退到子片段 content
+            page_content = entity.get("parent_content") or entity.get("content", "")
             out.append((
                 hit.id,
-                Document(page_content=entity.get("content", ""), metadata=meta),
+                Document(page_content=page_content[:8192], metadata=meta),
                 float(getattr(hit, "distance", 0.0)),
             ))
         return out

@@ -32,7 +32,8 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import warnings
 warnings.filterwarnings("ignore")
 
-from flask import Flask, request, jsonify, Response, g
+from flask import Flask, request, jsonify, Response, g, send_from_directory
+from werkzeug.security import safe_join
 
 # ====== 导入核心模块 ======
 from audit_logger import get_audit_logger
@@ -722,6 +723,37 @@ def api_logout():
     return resp
 
 
+# --------------------------------------------------------------------------- #
+# PDF 页面渲染图静态访问（PDF 整页 PNG，由 ingest 阶段预渲染到 assets/figures/）
+# --------------------------------------------------------------------------- #
+FIGURES_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "figures"
+)
+
+
+@app.route("/api/figures/<path:subpath>", methods=["GET"])
+def api_figures(subpath):
+    """安全返回 PDF 页面渲染图（pypdfium2 在 ingest 阶段预渲染到 assets/figures/）。
+
+    仅允许访问 .png 结尾、且 safe_join 校验在 FIGURES_DIR 内的文件，
+    防止路径穿越（../、绝对路径等）。
+    """
+    # 拒绝非 png（其他后缀一律 404，避免被当成目录泄露）
+    if not subpath.lower().endswith(".png"):
+        return jsonify({"error": "only png allowed"}), 404
+    safe = safe_join(FIGURES_DIR, subpath.replace("\\", "/"))
+    if not safe or not os.path.isfile(safe):
+        return jsonify({"error": "not found"}), 404
+    # 必须落在 FIGURES_DIR 之下（防止 safe_join 之外的手法）
+    safe_abs = os.path.abspath(safe)
+    if not safe_abs.startswith(os.path.abspath(FIGURES_DIR)):
+        return jsonify({"error": "forbidden"}), 403
+    return send_from_directory(os.path.dirname(safe_abs),
+                               os.path.basename(safe_abs),
+                               mimetype="image/png",
+                               max_age=3600)
+
+
 @app.route("/api/me", methods=["GET"])
 def api_me():
     """返回当前登录用户信息（任意已登录角色）。前端据此恢复会话、判断特权。"""
@@ -764,12 +796,17 @@ def get_history():
     if ms is None:
         return jsonify({"session_id": session_id, "messages": []})
     try:
-        raw = ms.load_messages(session_id, user_id=user["user_id"])
-        visible = [
-            {"role": m["role"], "content": m["content"]}
-            for m in raw
-            if m.get("role") in ("user", "assistant")
-        ]
+        # UI 展示最近 8 条 + 历史摘要卡片（避免滚太长）；
+        # system 摘要转为 summary 角色，对用户可见，避免历史“消失”。
+        raw = ms.load_messages(session_id, user_id=user["user_id"], limit=8)
+        visible = []
+        for m in raw:
+            role = m.get("role")
+            if role in ("user", "assistant"):
+                visible.append({"role": role, "content": m["content"]})
+            elif role == "system":
+                # 压缩产物（前情提要）对用户可见，避免历史“消失”
+                visible.append({"role": "summary", "content": m["content"]})
         return jsonify({"session_id": session_id, "messages": visible})
     except Exception as e:
         return jsonify({"session_id": session_id, "messages": [], "error": str(e)})
@@ -3192,6 +3229,7 @@ async function loadHistory() {
     for (const m of msgs) {
       if (m.role === 'user') addUserMessage(m.content);
       else if (m.role === 'assistant') addAssistantMessage(m.content);
+      else if (m.role === 'summary') addSummaryMessage(m.content);
     }
   } catch (e) {
     // 历史拉取失败不影响新对话，静默忽略
@@ -3450,14 +3488,58 @@ function addAssistantMessage(text) {
   const area = document.getElementById('chatArea');
   const div = document.createElement('div');
   div.className = 'message';
-  // 简单 Markdown 渲染（标题、粗体、段落）
-  const html = simpleMarkdown(text);
+  // 先把 [[FIG:assets/figures/xxx.png]] 切成 (文本段, 图段) 交错渲染
+  // （simpleMarkdown 不识别自定义占位符，会包到 <p> 里破坏布局，所以前置拆分）
+  const html = renderAssistantContent(text);
   div.innerHTML = `
     <div class="msg-avatar assistant">AI</div>
     <div class="msg-body">
       <div class="msg-role-name">AI 助手</div>
       <div class="msg-content">${html}</div>
       <div class="msg-time">${formatTime()}</div>
+    </div>
+  `;
+  area.appendChild(div);
+  scrollToBottom();
+}
+
+/* 把文本切成 markdown 段 + 图段（按 [[FIG:path]] 占位符切分），分别渲染。
+   图段渲染为 <div class="chat-figure"><img src="/api/figures/path" loading="lazy"></div>。
+   路径必须是 assets/figures/ 开头的相对路径；其他路径一律忽略（防注入）。 */
+function renderAssistantContent(text) {
+  const parts = String(text || '').split(/\[\[FIG:([^\]]+)\]\]/);
+  let out = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) {
+      // 文本段：走 markdown
+      if (parts[i].trim()) out += simpleMarkdown(parts[i]);
+    } else {
+      // 图段：渲染 <img>
+      // 注意：rel 含中文/空格（如 assets/figures/27 【技术对接】.../page_001.png），
+      // 旧正则 [\w\-./%]+ 不含中文与空格会整条判不通过导致图被静默丢弃。
+      // 放宽到「assets/figures/ 开头 + .png 结尾」即可；越权防护由服务端
+      // /api/figures 的 safe_join + abspath 包含校验兜底。
+      const rel = parts[i].trim();
+      if (!/^assets\/figures\/.+\.png$/i.test(rel)) continue;
+      const url = '/api/figures/' + rel.split('/').map(encodeURIComponent).join('/');
+      out += `<div class="chat-figure" style="margin:10px 0;border:1px solid #e1e5ea;border-radius:6px;overflow:hidden;background:#f8f9fa;">
+        <img src="${url}" loading="lazy" alt="${rel}" style="display:block;max-width:100%;height:auto;">
+        <div style="padding:4px 10px;font-size:12px;color:#5f5e5a;background:#fff;">📄 ${rel}</div>
+      </div>`;
+    }
+  }
+  return out || '';
+}
+
+function addSummaryMessage(text) {
+  const area = document.getElementById('chatArea');
+  const div = document.createElement('div');
+  div.className = 'message summary-card';
+  const html = simpleMarkdown(text);
+  div.innerHTML = `
+    <div class="msg-body" style="background:var(--primary-light, #e8f1fb); border-left:4px solid var(--primary, #185fa5); border-radius:8px;">
+      <div class="msg-role-name" style="color:var(--primary, #185fa5);">📋 历史摘要（前情提要）</div>
+      <div class="msg-content">${html}</div>
     </div>
   `;
   area.appendChild(div);

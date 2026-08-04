@@ -68,8 +68,10 @@ enterprise-ai/
 ├── test_llm_gateway_models.py # 【LLM 网关】小模型 vs 大模型任务对比验证
 ├── bench_routing_speed.py # 【LLM 网关】路由改版前后时延基准
 ├── gunicorn_config.py      # 【高并发部署】gunicorn 多 worker 配置（4×8 gthread + post_worker_init 钩子）
+├── ingest/                 # 【百万级数据面】增量 ingestion 引擎：抽独立 CLI + mtime/size/md5 指纹增量 + 多格式 loader + 批量并发 embedding
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
-├── docs/                   # 企业 PDF 文档目录
+├── knowledge/             # 企业知识库 PDF 文档目录（ingestion 数据源，自动构建向量索引）
+├── docs/                   # 旧目录（已迁移至 knowledge/，仅作历史归档）
 ├── chroma_db/              # ChromaDB 向量数据库持久化目录
 ├── screenshots/            # 项目截图
 ├── .env                    # 环境变量（MySQL/Redis/Ollama 密码等敏感配置，不提交 Git）
@@ -92,8 +94,10 @@ enterprise-ai/
 | `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。**`app.run(threaded=True)` 仅为 Windows 本地开发 fallback**，生产请走下方「生产部署（高并发 · gunicorn）」章节。 |
 | `gunicorn_config.py` | **高并发生产部署入口**。gunicorn 配置：默认 4 workers × 8 threads（gthread 模式，兼容 SSE 长连接 + 同步 LLM 调用），`post_worker_init` 钩子在**每个 worker 内**调 `init_system()` 完成向量库/编排器初始化——因为 gunicorn 不执行 `__main__`，否则各进程不会初始化、且顶层 `RAG_LANGGRAPH` 已正确默认开启 LangGraph。workers / threads / timeout / worker_class 均可经 `GUNICORN_*` 环境变量覆盖。Linux/VM 上用 `gunicorn -c gunicorn_config.py rag_web_server:app` 启动。注：gunicorn 仅支持 Linux/macOS（依赖 `fcntl`），Windows 本地请用 `waitress-serve` 调试。 |
 | `llm_gateway.py` | **企业级 LLM 网关**，统一所有 LLM 调用的出口。内含多模型路由、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载。纯标准库实现，零第三方依赖。 |
+| `ingest/` | **百万级 RAG 数据面引擎**（改造点落地）。`pipeline.IngestPipeline` 编排「扫 knowledge/ → 指纹增量(mtime+size+md5) → 多格式 loader(txt/md/pdf/html/docx/xlsx/pptx) → 结构切分 → 批量 embedding(并发池+重试) → 幂等 upsert」；`store.MilvusStoreBackend` 复用现有 Milvus 客户端；`cli` 提供 `ingest/status/delete/rebuild` 子命令。支持增量（仅处理变更文件）、`--force` 全量、`--dry-run` 预检。测试见 `tests/test_ingest.py`（零外部依赖，`python tests/test_ingest.py` 直接跑）。 |
 | `llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
-| `docs/` | 存放企业 PDF 文档，首次运行时会自动构建向量索引（默认写入 Milvus，ChromaDB 兜底）。 |
+| `knowledge/` | 存放企业知识库 PDF 文档（ingestion 数据源），首次运行 / `ingest` 时自动构建向量索引（默认写入 Milvus，ChromaDB 兜底）。 |
+| `docs/` | 旧目录，已迁至 `knowledge/`，仅作历史归档。 |
 | `chroma_db/` | ChromaDB 持久化目录（仅在 `VECTOR_BACKEND=chroma` 或 Milvus 不可用时使用），保存文档切片与向量。 |
 
 ## 技术架构
@@ -205,7 +209,7 @@ source venv/bin/activate
 pip install langchain langchain-community langgraph \
             chromadb "pymilvus~=2.5.0" redis pymysql dbutils \
             flask flask-cors \
-            pypdf sentence-transformers \
+            pypdf pypdfium2 sentence-transformers \
             fastmcp mcp \
             pyyaml
 ```
@@ -225,7 +229,8 @@ pip install langchain langchain-community langgraph \
 | 缓存 | `redis` + `dbutils` | Redis 连接池与两级问答缓存 | 必需（开启缓存时） |
 | 持久化 | `pymysql` + `dbutils` | MySQL 连接池（对话历史 / 断点 / 任务队列） | 必需（开启断点重续时） |
 | Web | `flask` + `flask-cors` | Web 服务与跨域支持 | 必需（使用 Web 时） |
-| 文档处理 | `pypdf` | PDF 文本抽取 | 必需（使用 `docs/` 时） |
+| 文档处理 | `pypdf` | PDF 文本抽取 | 必需（使用 `knowledge/` 时） |
+| 文档图渲染 | `pypdfium2` | PDF 页面整页渲染成 PNG（用于回答里展示真图，PyPDF text 流不包含图 caption） | 可选（缺失时 `knowledge/` 内 PDF 仍可入库，仅图卡片不可见；`pip install pypdfium2`） |
 | Embedding | `sentence-transformers` | 仅 `EMBED_BACKEND=local` 时本地 torch 加载 BGE 等模型（自动带 `numpy` 等传递依赖）；默认 `ollama` 模式不装也能跑 | 可选 |
 | MCP | `fastmcp` | MCP Server 把 Skill 暴露为 Tools / Resource / Prompt | 可选（使用 MCP 时） |
 | MCP | `mcp` | MCP 客户端 SDK（外部调用测试） | 可选（使用 MCP 时） |
@@ -349,7 +354,9 @@ mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"
 
 ### 6. 准备文档
 
-将企业 PDF 文档放入 `docs/` 目录下。首次运行时会自动读取并构建向量索引（默认写入 Milvus，ChromaDB 兜底）。
+将企业 PDF 文档放入 `knowledge/` 目录下。首次运行 / 执行 `python -m ingest.cli ingest` 时会自动读取并构建向量索引（默认写入 Milvus，ChromaDB 兜底）。
+
+> **PDF 图示问答**：若安装了 `pypdfium2`，ingestion 阶段会同时把每页整页渲染成 PNG（存到 `assets/figures/<文件stem>/page_<NNN>.png`），向量库记录图路径。用户问"通信流程图""架构图"等时，召回页面后前端会自动渲染对应 PNG；未安装则该能力降级（仅文字召回，PDF 里的矢量图因 PyPDF 不暴露 caption，LLM 看不到具体图）。
 
 ### 7. 修改配置
 
@@ -875,8 +882,8 @@ DOC_ACCESS_RULES = {
 
 ### 6. 向量库未构建（Milvus / ChromaDB）
 
-- 首次运行会自动扫描 `docs/` 目录并构建索引，耐心等待即可
-- 如果 `docs/` 为空，系统会提示找不到文档
+- 首次运行 / 执行 `python -m ingest.cli ingest` 会自动扫描 `knowledge/` 目录并构建索引，耐心等待即可
+- 如果 `knowledge/` 为空，系统会提示找不到文档
 
 ### 7. 权限没有生效
 
@@ -1002,6 +1009,43 @@ GUNICORN_WORKERS=8 GUNICORN_THREADS=16 PORT=8080 gunicorn -c gunicorn_config.py 
 - **多 worker 初始化**：gunicorn 不执行 `__main__`，故 `post_worker_init` 钩子在每个 worker 内调用 `init_system()`，确保每个进程都加载向量库 + 编排器。
 - **LangGraph 开关**：模块顶层已用环境变量 `RAG_LANGGRAPH`（默认 true）控制，不再写死 `False`，避免 gunicorn 下回退到旧引擎。
 - **并发重建保护**：多 worker 同时初始化向量库时，用 Redis 分布式锁（`rag:init:vectorstore:lock`）保证只有一个进程重建 Milvus 集合，其余等待后只连接，避免 `drop+create` 竞争。
+
+### 4. 数据面：增量 ingestion（百万级 RAG 文档入向量库）
+
+首次启动若 Milvus 集合为空，会自动走 `IngestPipeline` 全量构建；日常增量用独立 CLI：
+
+```bash
+# 增量 ingestion：仅处理「指纹(mtime+size+md5)变更」的文件
+python -m ingest.cli ingest
+
+# 全量重建（文档大规模调整后用）
+python -m ingest.cli ingest --force
+
+# 预检：只打印会做什么，不落库
+python -m ingest.cli ingest --dry-run
+
+# 查看已追踪文件清单
+python -m ingest.cli status
+
+# 删除 / 强制重建单个文件
+python -m ingest.cli delete  path/to/old.pdf
+python -m ingest.cli rebuild path/to/changed.docx
+```
+
+- **指纹增量**：`knowledge/.ingest_manifest.sqlite` 记录每个文件指纹；重启/重跑只处理变更文件，未变文件零开销。
+- **多格式**：`txt/md/pdf/html/docx/xlsx/pptx`（xlsx/pptx 需 `openpyxl`/`python-pptx`，缺失则跳过该格式不报错）。
+- **批量 embedding**：攒批（默认 64）+ 线程池并发 + 失败重试，显著摊薄 Ollama bge-m3 的 HTTP RTT。
+- **结构感知切分（small-to-big）**：Markdown 按 `#`~`####`、HTML 按 `h1`~`h6` 切章节（层级路径随片段透传）；fenced 代码块与 Markdown 表格作为原子片段**不切断**；每个子片段（默认 400 字，精确匹配）携带父窗口文本（默认 1200 字），检索命中子片段但把父窗口上下文回传给 LLM。可用 `structure_aware=False` 回退到固定 600/120 朴素切分。
+- **幂等**：`chunk_id = md5(content+source)`，内容不变 → 同一主键 → upsert 覆盖；支持断点续跑。
+
+测试（零外部依赖，开发机即可跑）：
+
+```bash
+python tests/test_ingest.py                 # 打印 PASS/FAIL
+python -m pytest tests/test_ingest.py -v    # 若已装 pytest
+# 集成测试需 Milvus+Ollama，不可达时自动 skip：
+python -m pytest tests/test_ingest_integration.py -s
+```
 - **限流共享（Redis）**：LLM 网关的 RPM/TPM 令牌桶已从进程内 `TokenBucket` 升级为 `RedisTokenBucket`（Lua 原子操作）。多实例部署时全局配额一致，不再被放大 N 倍。未配置 Redis 时自动降级为内存桶并告警。
 
 ### 4. 调优参数（环境变量）
