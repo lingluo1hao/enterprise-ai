@@ -733,7 +733,7 @@ FIGURES_DIR = os.path.join(
 
 @app.route("/api/figures/<path:subpath>", methods=["GET"])
 def api_figures(subpath):
-    """安全返回 PDF 页面渲染图（pypdfium2 在 ingest 阶段预渲染到 assets/figures/）。
+    """安全返回 PDF 真图裁剪图（PyMuPDF 在 ingest 阶段连通分量抽取到 assets/figures/）。
 
     仅允许访问 .png 结尾、且 safe_join 校验在 FIGURES_DIR 内的文件，
     防止路径穿越（../、绝对路径等）。
@@ -3515,7 +3515,7 @@ function renderAssistantContent(text) {
       if (parts[i].trim()) out += simpleMarkdown(parts[i]);
     } else {
       // 图段：渲染 <img>
-      // 注意：rel 含中文/空格（如 assets/figures/27 【技术对接】.../page_001.png），
+      // 注意：rel 含中文/空格（如 assets/figures/27 【技术对接】.../fig_p001_1.png），
       // 旧正则 [\w\-./%]+ 不含中文与空格会整条判不通过导致图被静默丢弃。
       // 放宽到「assets/figures/ 开头 + .png 结尾」即可；越权防护由服务端
       // /api/figures 的 safe_join + abspath 包含校验兜底。

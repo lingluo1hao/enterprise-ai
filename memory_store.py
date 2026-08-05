@@ -360,23 +360,14 @@ class MySQLMemoryStore:
             except Exception:
                 summary = None
 
-            # 2) 取摘要覆盖之后的原始消息（covers_to 之后的 chat_messages.id）
-            covers_to = 0
-            if summary:
-                cursor.execute(
-                    "SELECT covers_to FROM chat_summaries "
-                    "WHERE user_id = %s AND session_id = %s "
-                    "ORDER BY covers_to DESC LIMIT 1",
-                    (user_id, session_id),
-                )
-                crow = cursor.fetchone()
-                covers_to = crow[0] if crow else 0
-
+            # 2) 取原始消息：始终返回最近 limit 条（不再用 covers_to 屏蔽，
+            #    否则历史会被越压越短，重启后只剩最后一轮）。
+            #    摘要仅作为“前情提要”前缀，不替代原始消息本身。
             cursor.execute(
                 "SELECT speaker_role, content FROM chat_messages "
-                "WHERE user_id = %s AND session_id = %s AND id > %s "
+                "WHERE user_id = %s AND session_id = %s "
                 "ORDER BY msg_order DESC LIMIT %s",
-                (user_id, session_id, covers_to, limit),
+                (user_id, session_id, limit),
             )
             rows = cursor.fetchall()
             cursor.close()

@@ -17,7 +17,8 @@ class RawDoc:
     page: Optional[int] = None  # PDF 等分页格式的来源页码（1-based，人类可读）
     figure_paths: List[str] = field(default_factory=list)
     # PDF 页面渲染图的文件路径（相对项目根），前端可直接 <img src> 引用。
-    # 缺失 pypdfium2 或非 PDF 来源时为 []。
+    # PDF 真图裁剪图的文件路径（相对项目根，PyMuPDF 连通分量抽取），前端可直接 <img src> 引用。
+    # 缺失 pymupdf/numpy/scipy 或非 PDF 来源时为 []。
 
 
 @dataclass

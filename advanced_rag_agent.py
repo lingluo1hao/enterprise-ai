@@ -122,7 +122,7 @@ from typing import List, Optional, Tuple, Any
 # ============================================================================
 # 配置区
 # ============================================================================
-DOC_FOLDER = "./docs"
+DOC_FOLDER = "./knowledge"
 DB_PATH = "./chroma_db"
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.200.128:11434")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2:7b")
@@ -741,7 +741,7 @@ class VectorStoreManager:
                          dry_run: bool = False, progress_cb=None):
         """数据面增量 ingestion（改造后统一入口）。
 
-        扫 docs/ → 指纹增量(mtime+size+md5) → 多格式 loader → 结构切分 →
+        扫 knowledge/ → 指纹增量(mtime+size+md5) → 多格式 loader → 结构切分 →
         批量 embedding(并发+重试) → 幂等 upsert。可重复触发、仅处理变更文件；
         force=True 全量重建；dry_run=True 只预检不落库。
 
@@ -773,6 +773,9 @@ class VectorStoreManager:
                 "access_level": entity.get("access_level", "public"),
                 "chunk_index": entity.get("chunk_index", 0),
                 "parent_id": entity.get("parent_id", ""),
+                "page": entity.get("page", None),
+                "chunk_type": entity.get("chunk_type", "prose"),
+                "figure_paths": list(entity.get("figure_paths") or []),
             }
             # small-to-big：优先返回父窗口上下文（更完整），
             # 旧实体无 parent_content 时回退到子片段 content
@@ -813,7 +816,9 @@ class VectorStoreManager:
         expr = ""
         if filter_role != ROLE_ADMIN:
             expr = f'(access_level == "public") or (user_id == "{user_id}")'
-        fields = ["content", "file_name", "file_path", "access_level", "chunk_index"]
+        fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
+                  "chunk_type", "figure_paths", "page",
+                  "parent_id", "parent_content", "is_parent"]
         top = max(k * 2, 8)  # 召回更多候选供 RRF 融合
 
         # 1) dense 向量召回
@@ -842,6 +847,40 @@ class VectorStoreManager:
             print(f"[VectorStore] ⚠ BM25 稀疏召回失败，回退纯 dense: {e}")
             dense_list.sort(key=lambda x: x[2])
             return [(doc, dist) for (_, doc, dist) in dense_list[:k]]
+
+    def search_figure_pages(self, query: str, k: int = 2,
+                            filter_role: str = None, user_id: str = "anonymous"):
+        """figure-aware 召回：仅在 chunk_type=="page" 的图页里做 BM25 稀疏检索。
+
+        用途：「通信流程图」「架构图」类查询——figure caption 文本极短（PyPDF 仅抽到几字），
+        常规 dense+BM25 混合 top-k 容易被同文档的正文页挤掉，导致 LLM 看不到 [[FIG:...]]。
+        这里用稀疏 BM25（caption 关键词精确匹配）在图页范围里召回，避开了正文页的稀释。
+
+        返回 [(Document, score), ...]，score 越小越相关；与 similarity_search_with_score 同语义。
+        Chroma 后端不支持，返回 []。
+        """
+        if self.backend != "milvus":
+            return []
+        # 权限 + chunk_type 双重过滤
+        if filter_role != ROLE_ADMIN:
+            expr = f'(chunk_type == "page") and ((access_level == "public") or (user_id == "{user_id}"))'
+        else:
+            expr = 'chunk_type == "page"'
+        fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
+                  "chunk_type", "figure_paths", "page",
+                  "parent_id", "parent_content", "is_parent"]
+        try:
+            hits = self.client.search(
+                collection_name=self.collection,
+                data=[query], anns_field="sparse", limit=max(k, 2),
+                filter=expr, output_fields=fields,
+            )[0]
+            parsed = self._parse_hits(hits)
+            parsed.sort(key=lambda x: x[2])
+            return [(doc, float(dist)) for (_, doc, dist) in parsed[:k]]
+        except Exception as e:
+            print(f"[VectorStore] ⚠ figure-page 召回失败: {e}")
+            return []
 
     # ------------------------------------------------------------------ #
     # 公共：文档加载 / 分片 / 统一检索接口
@@ -1118,8 +1157,13 @@ class DocSearchSkill(BaseSkill):
             # 截断文档内容，保留前 350 字符（足够包含协议号+描述+关键字段）
             content_truncated = doc.page_content[:350]
             result_parts.append(
-                f"[文档{i+1}] 来源:{os.path.basename(source)} 第{page}页\n{content_truncated}"
+                f"[{os.path.basename(source)} 第{page}页]\n{content_truncated}"
             )
+            # 如果该片段带了页面渲染图，前端可据此渲染 <img>；用 [[FIG:path]] 占位符
+            fig_paths = doc.metadata.get("figure_paths") or []
+            for fp in fig_paths:
+                if fp:
+                    result_parts.append(f"[[FIG:{fp}]]")
 
         if not result_parts:
             # 区分"没有相关文档"和"有文档但无权限访问"两种情况
@@ -1468,7 +1512,9 @@ Final Answer: 根据文档，JM-S509支持三种定位方式：GPS定位（协�
 3. 如果已有观察结果，直接给出 Final Answer，不要重复搜索
 4. Final Answer 要精炼（不超过200字），回答关键信息，如果问题包含多个部分请分别回答
 5. 回答必须基于检索到的实际内容，不要编造
-6. 回答用中文，引用协议号或文档章节有助于可信度"""
+6. 回答用中文，引用协议号或文档章节有助于可信度
+7. 引用具体文档时用其文件名（如 `JM-S509 学生证产品客户指令表_V1.0.pdf`），不要使用「文档1/文档2」这种笼统标签，以便用户核对来源
+8. 如果检索片段中包含 `[[FIG:assets/figures/...]]` 占位符（说明该页有真实图示），请在 Final Answer 里**原样保留**该占位符（按行放置即可），前端会自动渲染为图片；如果占位符对应的页面回答里应展示给用户，回复时附一句简短的图说明（如「参见第 X 页通信流程图」）。不要删除占位符、不要改写路径。"""
 
     # 当接近最大步数时，强制要求给出最终答案的提示
     FORCE_FINAL_PROMPT = """你已经有以下观察结果，请直接基于这些结果给出最终答案，不要再调用技能。
@@ -1800,7 +1846,8 @@ class PlanningAgent:
 - 对于"有几种/哪些方式"类问题，请明确列出每种方式及其协议号
 - 回答要精炼（不超过400字），只包含关键信息
 - 如果文档中确实没有某项信息，请如实说明，但尽量提供相关线索（如卫星状态、星数等间接信息）
-- 用中文回答"""
+- 用中文回答
+- 引用具体文档时，使用文档文件名（如 `JM-S509 学生证产品客户指令表_V1.0.pdf`），不要使用「文档1/文档2」这种笼统标签"""
 
 
         synthesis_user = f"用户问题：{user_query}\n\n各子任务检索结果：\n\n" + "\n\n".join(parts) + "\n\n请给出完整回答："

@@ -209,7 +209,7 @@ source venv/bin/activate
 pip install langchain langchain-community langgraph \
             chromadb "pymilvus~=2.5.0" redis pymysql dbutils \
             flask flask-cors \
-            pypdf pypdfium2 sentence-transformers \
+            pypdf pymupdf sentence-transformers \
             fastmcp mcp \
             pyyaml
 ```
@@ -230,7 +230,7 @@ pip install langchain langchain-community langgraph \
 | 持久化 | `pymysql` + `dbutils` | MySQL 连接池（对话历史 / 断点 / 任务队列） | 必需（开启断点重续时） |
 | Web | `flask` + `flask-cors` | Web 服务与跨域支持 | 必需（使用 Web 时） |
 | 文档处理 | `pypdf` | PDF 文本抽取 | 必需（使用 `knowledge/` 时） |
-| 文档图渲染 | `pypdfium2` | PDF 页面整页渲染成 PNG（用于回答里展示真图，PyPDF text 流不包含图 caption） | 可选（缺失时 `knowledge/` 内 PDF 仍可入库，仅图卡片不可见；`pip install pypdfium2`） |
+| 文档图渲染 | `pymupdf` + `numpy` + `scipy` | PDF 真图连通分量裁剪（`fig_p<NNN>_<k>.png`，与语言/caption 无关：靠像素墨迹识别图、长横线计数排除表格） | 可选（任一缺失则优雅降级，仅文字召回、图卡片不可见；`pip install pymupdf numpy scipy pillow`） |
 | Embedding | `sentence-transformers` | 仅 `EMBED_BACKEND=local` 时本地 torch 加载 BGE 等模型（自动带 `numpy` 等传递依赖）；默认 `ollama` 模式不装也能跑 | 可选 |
 | MCP | `fastmcp` | MCP Server 把 Skill 暴露为 Tools / Resource / Prompt | 可选（使用 MCP 时） |
 | MCP | `mcp` | MCP 客户端 SDK（外部调用测试） | 可选（使用 MCP 时） |
@@ -244,7 +244,8 @@ P1 混合检索（sparse BM25 + dense 向量 + RRF 融合）**已在代码中落
 
 ```bash
 # P2 摄取管线：多格式文档解析（PDF / Word / HTML 等）
-pip install pymupdf unstructured
+# P2 摄取管线：多格式文档解析（Word / HTML 等；pymupdf 已并入上方主命令）
+pip install unstructured
 ```
 
 **关于 Milvus（`pymilvus`）**：向量库服务端 **Milvus standalone 已在虚拟机 `192.168.200.128` 部署完成**（端口 19530，编排见 `deploy/docker-compose-milvus.yaml`，已端到端验证可用）。应用代码已在 P3 改造中完成接入并**默认 `milvus`**；`VectorStoreManager` 统一封装 Milvus / ChromaDB 两种后端，由 `VECTOR_BACKEND` 切换，Milvus 不可用时自动回退 ChromaDB 并打印警告。`pymilvus` 已是**必需依赖**，版本须锁定 **2.5.x**（见上方说明）。混合检索（Hybrid Search）默认开启，可用 `HYBRID_SEARCH=false` 关闭。验收与回滚说明见 `UPGRADE_PLAN_MEMORY_KB.md` §6。
@@ -356,7 +357,7 @@ mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"
 
 将企业 PDF 文档放入 `knowledge/` 目录下。首次运行 / 执行 `python -m ingest.cli ingest` 时会自动读取并构建向量索引（默认写入 Milvus，ChromaDB 兜底）。
 
-> **PDF 图示问答**：若安装了 `pypdfium2`，ingestion 阶段会同时把每页整页渲染成 PNG（存到 `assets/figures/<文件stem>/page_<NNN>.png`），向量库记录图路径。用户问"通信流程图""架构图"等时，召回页面后前端会自动渲染对应 PNG；未安装则该能力降级（仅文字召回，PDF 里的矢量图因 PyPDF 不暴露 caption，LLM 看不到具体图）。
+> **PDF 图示问答（通用图抽取）**：若安装了 `pymupdf` + `numpy` + `scipy`，ingestion 阶段会用 **PyMuPDF 渲染整页像素 → 文字块遮罩减法得到图形墨迹 → scipy 连通分量逐块判定**（面积 / 宽高比 / 墨迹密度 / 长横线计数排除表格），把每页里**真正的图**（流程图、架构图等，与语言/caption 无关）裁剪为 `assets/figures/<文件stem>/fig_p<NNN>_<k>.png`，向量库记录图路径。用户问"通信流程图""架构图"等时，召回页面后服务端确定性追加对应 PNG、前端渲染该真图；任一依赖缺失则优雅降级（仅文字召回，图卡片不可见）。
 
 ### 7. 修改配置
 

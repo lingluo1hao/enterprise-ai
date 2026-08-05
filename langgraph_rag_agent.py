@@ -225,6 +225,58 @@ class AgentState(TypedDict, total=False):
     error: Optional[str]
 
 
+# --------------------------------------------------------------------------- #
+# figure 查询识别（heuristic）— 模块级常量与函数（在 LangGraphRAGApp 类外定义）
+# --------------------------------------------------------------------------- #
+# 含图类名词 / 渲染动作的 query 走 figure-aware 召回路径——专门捞图页（chunk_type="page"），
+# 避免 caption 文本极短被正文页挤掉导致 [[FIG:...]] 缺失。
+_FIGURE_QUERY_KEYWORDS = (
+    # 中文：图类名词
+    "流程图", "架构图", "拓扑", "示意图", "框图", "时序图", "状态图",
+    "类图", "原理图", "接线图", "信号流", "数据流", "消息流", "协议栈",
+    "配图", "插图",
+    # 中文：渲染动作
+    "输出", "展示", "画出", "渲染", "看看",
+    # 英文
+    "diagram", "chart", "graph", "architecture", "topology",
+    "flowchart", "sequence", "render", "display",
+)
+
+
+def _is_figure_query(query: str) -> bool:
+    """识别「要图」的查询（大小写不敏感）。False 时走常规检索。"""
+    if not query:
+        return False
+    ql = query.lower()
+    return any(kw in ql for kw in _FIGURE_QUERY_KEYWORDS)
+
+
+def _norm_figs(val) -> List[str]:
+    """归一化 figure_paths：兼容 Milvus 动态字段返回 list / 字符串 JSON 两种形态。
+
+    - 已是 list/tuple：逐元素转 str 过滤空值；
+    - 是字符串：尝试 json.loads（如 '["a.png"]'），失败则当作单路径；
+    - 其余：返回 []。
+    """
+    if not val:
+        return []
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        try:
+            import json
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if x]
+        except Exception:
+            pass
+        return [s]
+    if isinstance(val, (list, tuple)):
+        return [str(x) for x in val if x]
+    return []
+
+
 # ============================================================================
 # LangGraph RAG 应用主类
 # ============================================================================
@@ -273,7 +325,7 @@ class LangGraphRAGApp:
         # 2. 向量数据库（复用现有 VectorStoreManager）
         # VectorStoreManager 封装了 Milvus / ChromaDB 的初始化、文档索引、向量检索，
         # 后端由 VECTOR_BACKEND 决定（默认 milvus，不可用时回退 chroma）。
-        # init_vector_store() 会扫描 docs/ 目录，首次运行时自动构建索引。
+        # init_vector_store() 会扫描 knowledge/ 目录，首次运行时自动构建索引。
         print("\n[2/3] 加载向量数据库...")
         self.vector_db = VectorStoreManager.init_vector_store()
 
@@ -1027,8 +1079,9 @@ class LangGraphRAGApp:
         """
         query = state.get("resolved_query", state["query"])
         docs = state.get("retrieved_docs", [])
+        role = state.get("role", DEFAULT_ROLE)
 
-        answer = self._do_generate(query, docs)
+        answer = self._do_generate(query, docs, role=role)
         print(f"  [generate_simple] 生成答案 ({len(answer)} 字)")
         return {"answer": answer}
 
@@ -1319,6 +1372,36 @@ class LangGraphRAGApp:
                 if content_key not in seen:
                     seen.add(content_key)
                     all_results.append((doc, score))
+
+        # ===== figure-aware 二次召回 =====
+        # 原始 query（rewrites 列表的最后一项 = 原句）含「图/流程图/架构图」等关键词时，
+        # 专门在 chunk_type=="page" 的图页里做 BM25 稀疏召回并顶到结果前面。
+        # 原因：figure caption 文本极短（PyPDF 仅抽到几字），常规 dense+BM25 混合检索
+        # 容易被同文档的正文页挤掉，导致 _do_generate 拿不到 figure_paths。
+        original_q = queries[-1] if queries else ""
+        figure_results = []
+        if _is_figure_query(original_q):
+            try:
+                figure_results = self.vector_db.search_figure_pages(
+                    original_q, k=2, filter_role=role, user_id="anonymous"
+                )
+                print(f"  [retrieve] figure-aware topk={len(figure_results)} (query={original_q[:30]!r})")
+            except Exception as e:
+                print(f"  [retrieve] figure-page 召回失败(忽略): {e}")
+        if figure_results:
+            merged = []
+            seen2 = set()
+            for doc, score in figure_results:
+                key = doc.page_content[:80]
+                if key not in seen2:
+                    seen2.add(key)
+                    merged.append((doc, score))
+            for doc, score in all_results:
+                key = doc.page_content[:80]
+                if key not in seen2:
+                    seen2.add(key)
+                    merged.append((doc, score))
+            all_results = merged
         return all_results
 
     def _do_grade(self, query: str, docs: List) -> List[bool]:
@@ -1375,7 +1458,7 @@ class LangGraphRAGApp:
                     grades[idx] = True
         return grades
 
-    def _do_generate(self, query: str, docs: List) -> str:
+    def _do_generate(self, query: str, docs: List, role: str = None) -> str:
         """
         【辅助：基于检索文档生成答案】
 
@@ -1402,10 +1485,24 @@ class LangGraphRAGApp:
         if not docs:
             return "未检索到与问题相关的文档内容，无法回答。"
 
-        # 构建上下文：最多 5 个文档，每个截断到 350 字符
-        context = "\n\n".join(
-            [f"[文档{i+1}] {d[0].page_content[:DOC_TRUNCATE]}" for i, d in enumerate(docs[:5])]
-        )
+        # 构建上下文：最多 5 个文档，每个截断到 DOC_TRUNCATE 字符。
+        # 带 figure_paths 的文档放宽到 2000 字符，避免 PyPDF 抽取的 caption
+        # （如「I 通信流程图」）落在截断点之后被吃掉，导致 LLM 看不到图上下文。
+        # 同时为每条带图文档追加 [[FIG:assets/figures/...]] 占位符，
+        # 由前端 renderAssistantContent 拆段渲染为 <img>（需 prompt_manager.generate_answer
+        # 规则「原样保留」配合）。
+        parts = []
+        for d in docs[:5]:
+            doc = d[0]
+            src = os.path.basename(doc.metadata.get("source", "未知"))
+            page = doc.metadata.get("page")
+            label = f"[{src} 第{page}页]" if page else f"[{src}]"
+            # 带图文档放宽截断，避免 caption 落在截断点之后
+            fig_paths = _norm_figs(doc.metadata.get("figure_paths"))
+            trunc = 2000 if fig_paths else DOC_TRUNCATE
+            body = doc.page_content[:trunc]
+            parts.append(f"{label} {body}")
+        context = "\n\n".join(parts)
         # 过滤后上下文仍为空（理论上不会，但做兜底）
         if not context.strip():
             return "未检索到与问题相关的文档内容，无法回答。"
@@ -1416,7 +1513,40 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, context=context
         )
-        return self.llm.chat(system, user, task="generate", user=self.user)
+        answer = self.llm.chat(system, user, task="generate", user=self.user)
+
+        # ===== 图渲染：服务端确定性追加，只取「最相关的一张」图，避免占位符刷屏 =====
+        # 之前把 [[FIG:...]] 放进 context 指望 LLM 原样保留，但 LLM 常把占位符当噪音删掉，
+        # 导致前端拿不到图。这里直接把「本次检索到的图页 + 图查询兜底召回到的图页」
+        # 全部收集并按相似度排序，取唯一最相关的一张拼到答案末尾。
+        figs_with_score = []  # (fp, score)
+        for d in docs:
+            sc = d[1] if len(d) > 1 else 0.0
+            for fp in _norm_figs(d[0].metadata.get("figure_paths")):
+                figs_with_score.append((fp, sc))
+        # figure 查询再兜底一次：覆盖 grade_docs 把 page chunk 过滤掉、主检索未带图页的情况
+        if _is_figure_query(query):
+            try:
+                rescued = self.vector_db.search_figure_pages(
+                    query, k=1, filter_role=role, user_id="anonymous"
+                )
+                for doc, sc in rescued:
+                    for fp in _norm_figs(doc.metadata.get("figure_paths")):
+                        figs_with_score.append((fp, sc))
+            except Exception as e:
+                print(f"  [generate] figure 兜底追加失败(忽略): {e}")
+
+        if figs_with_score:
+            # 同一 fp 保留最小 score（最相关）；整体按 score 升序；只取 top-1，避免无关页面刷屏
+            best = {}
+            for fp, sc in figs_with_score:
+                if fp not in best or sc < best[fp]:
+                    best[fp] = sc
+            figs = [fp for fp, _ in sorted(best.items(), key=lambda kv: kv[1])][:1]
+            answer += "\n\n" + "\n".join(f"[[FIG:{fp}]]" for fp in figs)
+            print(f"  [generate] 确定性追加 {len(figs)} 个图页占位符: {figs}")
+
+        return answer
 
     def _research_subtask(self, subtask: Dict, role: str) -> Dict:
         """
@@ -1483,7 +1613,7 @@ class LangGraphRAGApp:
         reranked = self._mmr_rerank(query, relevant)
 
         # 步骤 5：生成子回答
-        answer = self._do_generate(query, reranked)
+        answer = self._do_generate(query, reranked, role=role)
 
         return {
             "subtask": query,

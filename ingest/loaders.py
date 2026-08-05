@@ -12,7 +12,9 @@
 保证 ingest 引擎在无全套解析依赖的机器上仍能跑核心链路（txt/md/pdf）。
 """
 
+import glob
 import os
+import re
 from typing import List, Optional
 
 # 默认权限规则（与 advanced_rag_agent.DOC_ACCESS_RULES 语义一致）。
@@ -139,66 +141,143 @@ def load_file(path: str) -> List["object"]:
             file_name=os.path.basename(path),
             page=page,
         ))
-    # 给每页渲染 PNG（PyPDF text 流不包含真图 caption，必须靠渲染图让前端"看见"）
-    figures_dir = _render_pdf_pages(path, len(docs))
-    if figures_dir:
-        for raw_doc, pg_dir in zip(out, figures_dir):
-            # 单页对应一张 PNG
-            if pg_dir:
-                raw_doc.figure_paths.append(pg_dir)
+    # 通用 PDF 图抽取：每页可能多张图（PyMuPDF + 像素墨迹 + 连通分量）
+    # 与语言/排版/有无 caption 无关；表格自然被文字密度过滤；模板背景在像素层自动消失
+    figs_per_page = _extract_figures(path)
+    for raw_doc, figs in zip(out, figs_per_page):
+        if figs:
+            raw_doc.figure_paths.extend(figs)
     return out
 
 
 # --------------------------------------------------------------------------- #
-# PDF 页面渲染（图级检索可视化支撑）
+# 通用 PDF 图抽取（PyMuPDF + numpy + scipy，与语言/caption/排版无关）
 # --------------------------------------------------------------------------- #
-def _render_pdf_pages(path: str, page_count: int) -> List[Optional[str]]:
-    """把 PDF 每页渲染成 PNG，存到 assets/figures/<file_stem>/page_<p:03d>.png。
+# 算法：
+#   1) PyMuPDF 渲染整页 → 像素墨迹
+#   2) page.get_text("blocks") 拿文字块 bbox → 文字遮罩（膨胀 4-5 px）
+#   3) 图形墨迹 = 整页墨迹 − 文字墨迹
+#   4) scipy.ndimage.label 连通分量 → 逐分量判定面积/宽高比/墨迹密度/文字密度
+#   5) 通过的真图分量 → 从原图裁剪（保留图内文字标签）→ fig_p{NNN}_{k}.png
+#
+# 为什么通用：
+#   - 无 caption 正则：不依赖页面文本是否含「图N / XX图」，英文 PDF / 无 caption 图照样识别
+#   - 模板/背景图层自动消失：get_drawings 返回的伪图元在渲染像素层不存在，就不进 graphic ink
+#   - 表格自然被过滤：表格连通分量 bbox 内塞满文字（高密度）→ 丢弃
+#   - logo/分隔线/细线：面积阈值与墨迹密度过滤
+# --------------------------------------------------------------------------- #
+def _extract_figures(path: str) -> List[List[str]]:
+    """对 PDF 每一页做通用图抽取；每页返回 0..N 张裁剪图相对路径列表。
 
-    返回长度 == page_count 的列表；某页渲染失败/整体失败时对应位置为 None。
-    - 缺失 pypdfium2：返回 []（graceful 降级，pipeline 仍可运行，仅 figure 不可视）；
-    - 非 PDF 文件：返回 []；
-    - assets/figures/ 与同 stem 子目录自动创建。
+    - 缺失 fitz/numpy/scipy/Pillow：返回 []（graceful 降级，pipeline 仍可跑）
+    - 非 PDF：返回 []
+    - 自动清理旧版 page_*.png（整页渲染）与 fig_pNNN.png（旧单图命名）
     """
     if not path.lower().endswith(".pdf"):
         return []
     try:
-        import pypdfium2 as pdfium
-    except ImportError:
-        print(f"[ingest] 跳过 PDF 渲染 {os.path.basename(path)}：缺少 pypdfium2（pip install pypdfium2）")
+        import fitz  # PyMuPDF
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFilter
+        from scipy import ndimage
+    except ImportError as e:
+        print(f"[ingest] 跳过 PDF 图抽取 {os.path.basename(path)}：依赖缺失 {e.name}（pip install pymupdf numpy scipy pillow）")
         return []
 
     try:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        # 也兼容从项目根运行（__file__ 路径即项目根的子目录）
         if not os.path.isdir(os.path.join(project_root, "knowledge")):
             project_root = os.getcwd()
         stem = os.path.splitext(os.path.basename(path))[0]
         out_dir = os.path.join(project_root, "assets", "figures", stem)
         os.makedirs(out_dir, exist_ok=True)
+        # 清理旧版产物：page_*.png（整页渲染）、fig_pNNN.png（旧单图命名）
+        for old in (
+            glob.glob(os.path.join(out_dir, "page_*.png"))
+            + glob.glob(os.path.join(out_dir, "fig_p[0-9][0-9][0-9].png"))
+        ):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
-        # 用 with 上下文显式关闭 PdfDocument，避免函数返回后靠 GC 关闭时
-        # pypdfium2 打印 "still open" 警告（且警告里的文件名会被控制台误解码成乱码）。
-        with pdfium.PdfDocument(path) as pdf:
-            total = len(pdf)
-            results: List[Optional[str]] = []
-            for i in range(total):
-                rel = f"assets/figures/{stem}/page_{i+1:03d}.png"
-                abs_path = os.path.join(out_dir, f"page_{i+1:03d}.png")
-                if os.path.exists(abs_path) and os.path.getsize(abs_path) > 0:
-                    # 已渲染过：跳过（增量友好，避免每次重建都重渲染）
-                    results.append(rel)
-                    continue
+        scale = 2.0
+        pad = 24
+        MIN_AREA_RATIO = 0.01   # 图区面积 / 页面面积
+        MAX_INK_DENSITY = 0.12  # 墨迹密度上限（过高=填充色块/水印，非真图）
+        MIN_INK_DENSITY = 0.015 # 图区墨迹像素 / bbox 面积（过滤稀疏虚线）
+        MAX_LONG_ROWS = 0       # 跨 80% bbox 宽度的长横线行数（>此值=表格，丢弃）；流程图箭头是斜的→不存在长横线；表格分隔线是横的→必然命中
+
+        results: List[List[str]] = []
+        with fitz.open(path) as doc:
+            for i in range(doc.page_count):
+                page_figs: List[str] = []
                 try:
-                    page = pdf[i]
-                    # scale=1.5 ≈ 150 DPI，A4 渲染约 1240×1754 px，体积 200~500 KB
-                    pil = page.render(scale=1.5).to_pil()
-                    pil.save(abs_path, format="PNG", optimize=True)
-                    results.append(rel)
+                    page = doc[i]
+                    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+                    img = pix.pil_image()
+                    W, H = img.size
+                    # 文字遮罩
+                    blocks = page.get_text("blocks")
+                    m = Image.new("L", (W, H), 0)
+                    md = ImageDraw.Draw(m)
+                    for b in blocks:
+                        x0, y0, x1, y1 = b[:4]
+                        md.rectangle(
+                            [x0*scale-4, y0*scale-4, x1*scale+4, y1*scale+4],
+                            fill=255,
+                        )
+                    m = m.filter(ImageFilter.MaxFilter(5))
+                    tm = np.asarray(m) > 128
+                    ink = np.asarray(img.convert("L")) < 200
+                    graphic = ink & ~tm
+                    # 连通分量
+                    labeled, ncomp = ndimage.label(graphic)
+                    for k in range(1, ncomp + 1):
+                        ys, xs = np.where(labeled == k)
+                        if len(xs) == 0:
+                            continue
+                        bx0, bx1 = int(xs.min()), int(xs.max())
+                        by0, by1 = int(ys.min()), int(ys.max())
+                        bw, bh = bx1 - bx0, by1 - by0
+                        if bw <= 0 or bh <= 0:
+                            continue
+                        if (bw * bh) / (W * H) < MIN_AREA_RATIO:
+                            continue
+                        asp = bw / bh if bh else 0
+                        if asp < 0.1 or asp > 10:
+                            continue
+                        ink_density = len(xs) / (bw * bh)
+                        if ink_density < MIN_INK_DENSITY or ink_density > MAX_INK_DENSITY:
+                            continue
+                        # 表格判别：长横线（跨 80% bbox 宽度的连续墨迹行）数量
+                        sub = np.ascontiguousarray(graphic[by0:by1+1, bx0:bx1+1])
+                        long_rows = 0
+                        for row in sub:
+                            if not row.any():
+                                continue
+                            diffs = np.diff(np.r_[0, row.astype(np.int8), 0])
+                            starts = np.where(diffs == 1)[0]
+                            ends = np.where(diffs == -1)[0]
+                            max_run = max((e - s) for s, e in zip(starts, ends))
+                            if max_run >= 0.8 * bw:
+                                long_rows += 1
+                        if long_rows > MAX_LONG_ROWS:
+                            continue
+                        # 裁剪原图（保留图内文字标签）
+                        crop = img.crop((
+                            max(0, bx0 - pad),
+                            max(0, by0 - pad),
+                            min(W, bx1 + pad),
+                            min(H, by1 + pad),
+                        ))
+                        fname = f"fig_p{i+1:03d}_{len(page_figs)+1}.png"
+                        crop.save(os.path.join(out_dir, fname), format="PNG", optimize=True)
+                        page_figs.append(f"assets/figures/{stem}/{fname}")
                 except Exception as e:
-                    print(f"[ingest] PDF 第 {i+1} 页渲染失败: {e}")
-                    results.append(None)
-            return results
+                    print(f"[ingest] PDF 第 {i+1} 页图抽取失败: {e}")
+                results.append(page_figs)
+        return results
     except Exception as e:
-        print(f"[ingest] PDF 渲染异常 {os.path.basename(path)}: {e}")
+        print(f"[ingest] PDF 图抽取异常 {os.path.basename(path)}: {e}")
         return []
