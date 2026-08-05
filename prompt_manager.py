@@ -314,13 +314,23 @@ class PromptManager:
                 username    VARCHAR(64)   NOT NULL UNIQUE COMMENT '用户名',
                 password_hash VARCHAR(256) NOT NULL COMMENT '密码哈希(salt:hash)',
                 display_name VARCHAR(128) DEFAULT '' COMMENT '显示名称',
-                role        VARCHAR(32)   NOT NULL DEFAULT 'admin' COMMENT '角色',
+                role        VARCHAR(32)   NOT NULL DEFAULT 'admin' COMMENT '角色(admin/user/super_admin)',
+                tenant_id   VARCHAR(64)   NOT NULL DEFAULT 'default' COMMENT '所属租户(多租户隔离)',
                 is_active   TINYINT       NOT NULL DEFAULT 1 COMMENT '是否启用',
                 last_login  DATETIME      DEFAULT NULL COMMENT '最后登录时间',
                 created_at  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_username (username)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+        # 老库迁移：缺 tenant_id 列则补齐（不丢数据）
+        try:
+            cursor.execute("SELECT tenant_id FROM admin_users LIMIT 1")
+        except Exception:
+            cursor.execute(
+                "ALTER TABLE admin_users ADD COLUMN tenant_id "
+                "VARCHAR(64) NOT NULL DEFAULT 'default' "
+                "COMMENT '所属租户(多租户隔离)' AFTER role"
+            )
 
         cursor.close()
         conn.close()
@@ -786,17 +796,17 @@ class AuthManager:
             if username == "admin" and password == "admin123":
                 token = secrets.token_hex(32)
                 session = {"username": "admin", "display_name": "管理员",
-                           "role": "admin", "user_id": 0}
+                           "role": "admin", "user_id": 0, "tenant_id": "default"}
                 self._save_token(token, session)
                 return {"username": "admin", "display_name": "管理员",
-                        "role": "admin", "token": token}
+                        "role": "admin", "tenant_id": "default", "token": token}
             return None
 
         try:
             conn = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, username, password_hash, display_name, role "
+                "SELECT id, username, password_hash, display_name, role, tenant_id "
                 "FROM admin_users WHERE username=%s AND is_active=1",
                 (username,)
             )
@@ -813,6 +823,7 @@ class AuthManager:
                     "display_name": row[3] or row[1],
                     "role": row[4] or "user",
                     "user_id": row[0],
+                    "tenant_id": row[5] or "default",
                 }
                 self._save_token(token, session)
                 try:
@@ -829,6 +840,7 @@ class AuthManager:
                     "username": session["username"],
                     "display_name": session["display_name"],
                     "role": session["role"],
+                    "tenant_id": session["tenant_id"],
                     "token": token,
                 }
 

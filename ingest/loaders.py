@@ -19,7 +19,19 @@ from typing import List, Optional
 
 # 默认权限规则（与 advanced_rag_agent.DOC_ACCESS_RULES 语义一致）。
 # 生产路径下由 VectorStoreManager 传入 AccessControlFilter.get_access_level 覆盖。
+# 规则外置到 access_rules.yaml：filename 关键字 -> 级别（public/restricted）；
+# 缺失文件或 yaml 不可用则退化为空（默认全部 public）。
 DOC_ACCESS_RULES: dict = {}
+try:
+    import yaml  # 可选依赖：未安装时退化为全 public
+    _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "config", "access_rules.yaml")
+    if os.path.isfile(_cfg_path):
+        with open(_cfg_path, "r", encoding="utf-8") as _fh:
+            _cfg = yaml.safe_load(_fh) or {}
+        DOC_ACCESS_RULES = {str(k): v for k, v in (_cfg.get("access_rules") or {}).items()}
+except Exception:
+    DOC_ACCESS_RULES = {}
 
 
 def get_access_level(source: str) -> str:

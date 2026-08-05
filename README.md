@@ -43,7 +43,7 @@
 
 ## 界面预览
 
-![项目演示动画](screenshots/demo-v3.gif)
+![项目演示动画](assets/screenshots/demo-v3.gif)
 
 > 上图 GIF 为 **Enterprise AI** 项目真实页面录屏制作：管理员登录后进入 `/admin` 后台管理提示词、使用「管理员在线问答」调试知识库效果、查看全站 **Token 用量看板**（调用次数 / Token 消耗 / 累计成本 / 平均耗时 / 用户排行榜 / 每次调用明细），顶部 header 可直接「修改密码」与「退出」；普通用户在首页进行企业知识库问答并点击「我的用量」查询个人历史 Token 消耗。所有用量数据通过 SQLite 持久化落盘，重启不丢。
 
@@ -59,25 +59,21 @@ enterprise-ai/
 ├── rag_web_server.py       # Flask Web 服务 + SSE 进度推送 + 聊天界面 + 管理后台 + 安全中间件
 ├── skill_framework.py          # 【MCP 改造】协议无关的 Skill 共享内核（BaseSkill/CalculatorSkill/SkillRegistry/safe_eval）
 ├── mcp_server.py           # 【MCP 改造】MCP Server（FastMCP）：把 Skill 暴露为 Tools / Resource / Prompt
-├── mcp_client_example.py   # 【MCP 改造】外部调用示例：验证别的 AI 客户端如何复用工具
-├── MCP_README.md           # 【MCP 改造】改造说明（改造前后对比 / 能力映射 / 复用方式）
-├── llm_gateway.py         # 【LLM 网关】统一 LLM 出口：多模型路由/限流/熔断/连接池/Token 计费/热重载（纯标准库）
-├── llm_gateway.yaml       # 【LLM 网关】模型注册表 + 路由表 + 限流熔断配置（支持热切换）
-├── LLM_GATEWAY_README.md  # 【LLM 网关】改造说明（架构/路由/踩坑/验证）
-├── test_llm_gateway.py    # 【LLM 网关】网关端到端测试（运行 `python -m pytest test_llm_gateway.py -q` 查看真实断言数）
-├── test_llm_gateway_models.py # 【LLM 网关】小模型 vs 大模型任务对比验证
-├── bench_routing_speed.py # 【LLM 网关】路由改版前后时延基准
+├── llm_gateway.py          # 【LLM 网关】统一 LLM 出口：多模型路由/限流/熔断/连接池/Token 计费/热重载（纯标准库）
 ├── gunicorn_config.py      # 【高并发部署】gunicorn 多 worker 配置（4×8 gthread + post_worker_init 钩子）
-├── ingest/                 # 【百万级数据面】增量 ingestion 引擎：抽独立 CLI + mtime/size/md5 指纹增量 + 多格式 loader + 批量并发 embedding
+├── ingest/                 # 【百万级数据面】增量 ingestion 引擎：CLI + 指纹增量 + 多格式 loader + 批量并发 embedding
 ├── main.py                 # PyCharm 默认示例脚本（未使用）
-├── knowledge/             # 企业知识库 PDF 文档目录（ingestion 数据源，自动构建向量索引）
-├── docs/                   # 旧目录（已迁移至 knowledge/，仅作历史归档）
-├── chroma_db/              # ChromaDB 向量数据库持久化目录
-├── screenshots/            # 项目截图
+├── knowledge/             # 企业知识库文档目录（ingestion 数据源，自动构建向量索引）
+├── config/                # 配置中心：llm_gateway.yaml / access_rules.yaml / tenants.yaml / init_db.sql
+├── docs/                   # 文档中心：guides/（使用说明）+ reports/（方案与分析报告）
+├── scripts/               # 独立脚本：bench_routing_speed / mcp_client_example / test_llm_gateway*
+├── tests/                 # 测试套件：test_ingest / test_llm_gateway*
+├── assets/                # 静态资源：screenshots/（演示动画）+ proposal_images|proposal_video（提案素材）
+├── chroma_db/             # ChromaDB 向量数据库持久化目录
 ├── .env                    # 环境变量（MySQL/Redis/Ollama 密码等敏感配置，不提交 Git）
 ├── .env.example            # 环境变量模板（可提交 Git，部署时复制为 .env）
 ├── deploy/                 # 【部署】docker-compose 编排（MySQL / Milvus standalone 等）
-├── UPGRADE_PLAN_MEMORY_KB.md # 【记忆系统升级】分阶段改造方案（含 P0 落地记录与验证）
+├── docs/reports/UPGRADE_PLAN_MEMORY_KB.md # 【记忆系统升级】分阶段改造方案（含 P0 落地记录与验证）
 ├── .gitignore              # Git 排除规则（含 .env / chroma_db/ / logs/）
 └── README.md               # 本文件
 ```
@@ -95,9 +91,9 @@ enterprise-ai/
 | `gunicorn_config.py` | **高并发生产部署入口**。gunicorn 配置：默认 4 workers × 8 threads（gthread 模式，兼容 SSE 长连接 + 同步 LLM 调用），`post_worker_init` 钩子在**每个 worker 内**调 `init_system()` 完成向量库/编排器初始化——因为 gunicorn 不执行 `__main__`，否则各进程不会初始化、且顶层 `RAG_LANGGRAPH` 已正确默认开启 LangGraph。workers / threads / timeout / worker_class 均可经 `GUNICORN_*` 环境变量覆盖。Linux/VM 上用 `gunicorn -c gunicorn_config.py rag_web_server:app` 启动。注：gunicorn 仅支持 Linux/macOS（依赖 `fcntl`），Windows 本地请用 `waitress-serve` 调试。 |
 | `llm_gateway.py` | **企业级 LLM 网关**，统一所有 LLM 调用的出口。内含多模型路由、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载。纯标准库实现，零第三方依赖。 |
 | `ingest/` | **百万级 RAG 数据面引擎**（改造点落地）。`pipeline.IngestPipeline` 编排「扫 knowledge/ → 指纹增量(mtime+size+md5) → 多格式 loader(txt/md/pdf/html/docx/xlsx/pptx) → 结构切分 → 批量 embedding(并发池+重试) → 幂等 upsert」；`store.MilvusStoreBackend` 复用现有 Milvus 客户端；`cli` 提供 `ingest/status/delete/rebuild` 子命令。支持增量（仅处理变更文件）、`--force` 全量、`--dry-run` 预检。测试见 `tests/test_ingest.py`（零外部依赖，`python tests/test_ingest.py` 直接跑）。 |
-| `llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
+| `config/llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
 | `knowledge/` | 存放企业知识库 PDF 文档（ingestion 数据源），首次运行 / `ingest` 时自动构建向量索引（默认写入 Milvus，ChromaDB 兜底）。 |
-| `docs/` | 旧目录，已迁至 `knowledge/`，仅作历史归档。 |
+| `docs/` | 文档中心：`guides/`（MCP / LLM 网关使用说明）+ `reports/`（RAG 数据面改造、P0 修复、记忆系统升级等方案与分析报告）。 |
 | `chroma_db/` | ChromaDB 持久化目录（仅在 `VECTOR_BACKEND=chroma` 或 Milvus 不可用时使用），保存文档切片与向量。 |
 
 ## 技术架构
@@ -336,10 +332,10 @@ docker run -d --name mysql8 \
   --collation-server=utf8mb4_unicode_ci
 ```
 
-**建表职责统一由 `init_db.sql` 负责（单一权威源），服务启动不再自动建表。** 启动服务前请先执行仓库根目录的 **`init_db.sql`** 一次性建库 + 建表（含表/字段中文注释）+ 写入种子账号（默认 `admin/admin123`，以及两个普通用户 `reader/reader123`、`viewer/viewer123`，`role='user'`）：
+**建表职责统一由 `init_db.sql` 负责（单一权威源），服务启动不再自动建表。** 启动服务前请先执行 **`config/`** 目录下的 **`init_db.sql`** 一次性建库 + 建表（含表/字段中文注释）+ 写入种子账号（默认 `admin/admin123`，以及两个普通用户 `reader/reader123`、`viewer/viewer123`，`role='user'`）：
 
 ```bash
-mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 < init_db.sql
+mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 < config/init_db.sql
 ```
 
 > 若未初始化就直接启动服务，`memory_store` 会在日志中明确提示「缺失表：xxx，请先执行 init_db.sql」，并降级为内存模式（对话历史不落库，仅当前进程有效），不会崩溃。

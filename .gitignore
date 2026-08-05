@@ -1,27 +1,38 @@
-# ====== Python ======
+# Python 缓存
 __pycache__/
 *.pyc
 *.pyo
-*.egg-info/
-dist/
-build/
 
-# ====== 环境变量（含密钥，禁止提交） ======
-.env
+# 运行时数据库与日志
+*.db
+llm_usage.db
+*.log
 
-# ====== IDE ======
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# ====== 项目数据（本地构建产物 / 企业文档） ======
+# 向量库本地持久化目录
 chroma_db/
-server_startup.log
-logs/
 
-# ====== WorkBuddy ======
+# 环境变量（含密码，不提交 Git）
+.env
+.env.example
+
+# IDE / 编辑器配置
+.idea/
+
+# WorkBuddy 内部记忆目录（私有，不提交）
 .workbuddy/
 
-# ====== 演示动画生成脚本（本地工具，不提交） ======
-generate_demo_gif.py
+# 摄取运行时指纹缓存（可重建，不提交）
+knowledge/**/.ingest_manifest.sqlite
+
+# 提案视频/图片的渲染产物（大二进制；脚本可重生成，不提交）
+assets/proposal_video/*.mp4
+assets/proposal_video/*.mp3
+assets/proposal_video/*.srt
+assets/proposal_video/*.png
+assets/proposal_images/*.png
+
+# 规划/方案类分析文档（非交付代码，仅本地参考，不提交）
+docs/reports/
+
+# 自动生成的配图产物（程序运行时自动创建，可重建，不提交）
+assets/figures/

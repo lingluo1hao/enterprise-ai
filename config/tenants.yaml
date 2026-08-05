@@ -1,0 +1,18 @@
+# 租户注册表（多租户隔离）
+# 超级管理员（role=super_admin）可在此登记租户，并为用户账号指定 tenant_id。
+# 文档物理隔离由 Milvus partition_key(tenant_id) 保证；本文件用于运维登记与审计。
+#
+# 约定：
+#   - 每个租户对应 knowledge/{tenant}/ 目录（首次上传该租户文档时自动创建）。
+#   - 用户账号的 tenant_id 存于 admin_users.tenant_id 列。
+#   - 未登记的租户也可直接使用：上传时若指定新租户名，目录会自动创建（super-admin 适用）。
+tenants:
+  - name: "default"
+    display_name: "默认租户"
+    description: "存量/公共文档所在租户"
+  - name: "finance"
+    display_name: "财务租户"
+    description: "财务相关文档隔离域"
+  - name: "hr"
+    display_name: "人事租户"
+    description: "人事相关文档隔离域"

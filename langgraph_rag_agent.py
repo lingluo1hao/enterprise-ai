@@ -321,6 +321,7 @@ class LangGraphRAGApp:
         print("\n[1/3] 连接 LLM...")
         self.llm = create_llm()
         self.user = 1              # 当前调用用户的 ID（admin_users.id）；Web 模式会被覆盖为真实登录用户 ID
+        self.tenant_id = "default" # 当前调用用户所属租户；Web 模式会被覆盖为真实登录租户
 
         # 2. 向量数据库（复用现有 VectorStoreManager）
         # VectorStoreManager 封装了 Milvus / ChromaDB 的初始化、文档索引、向量检索，
@@ -1363,7 +1364,9 @@ class LangGraphRAGApp:
         for q in queries:
             # 向量库相似度检索（Chroma/Milvus 统一接口）：返回 (Document, 距离分数) 的列表
             # filter_role 透传给 Milvus 后端做 access_level 权限下推；Chroma 仍由下方兜底过滤
-            results = self.vector_db.similarity_search_with_score(q, k=RETRIEVE_TOP_K, filter_role=role)
+            results = self.vector_db.similarity_search_with_score(
+                q, k=RETRIEVE_TOP_K, filter_role=role,
+                user_id=self.user, tenant_id=self.tenant_id)
             # 根据用户角色过滤无权限文档
             results = AccessControlFilter.filter_results(results, role)
             for doc, score in results:
@@ -1383,7 +1386,8 @@ class LangGraphRAGApp:
         if _is_figure_query(original_q):
             try:
                 figure_results = self.vector_db.search_figure_pages(
-                    original_q, k=2, filter_role=role, user_id="anonymous"
+                    original_q, k=2, filter_role=role,
+                    user_id=self.user, tenant_id=self.tenant_id
                 )
                 print(f"  [retrieve] figure-aware topk={len(figure_results)} (query={original_q[:30]!r})")
             except Exception as e:
@@ -1528,7 +1532,8 @@ class LangGraphRAGApp:
         if _is_figure_query(query):
             try:
                 rescued = self.vector_db.search_figure_pages(
-                    query, k=1, filter_role=role, user_id="anonymous"
+                    query, k=1, filter_role=role,
+                    user_id=self.user, tenant_id=self.tenant_id
                 )
                 for doc, sc in rescued:
                     for fp in _norm_figs(doc.metadata.get("figure_paths")):
@@ -2008,6 +2013,7 @@ class LangGraphRAGApp:
         session_id: str = "default",
         user: str = None,
         user_id: int = None,
+        tenant_id: str = "default",
     ) -> str:
         """
         【对外入口：用户提问】
@@ -2040,6 +2046,8 @@ class LangGraphRAGApp:
         # 本次问答里所有 memory_store 写入都用它做用户隔离（不再冗余存用户名）。
         if user_id is not None:
             self.user = user_id
+        # 租户：记到实例上，检索下推隔离用（super-admin 传 "__global__" 做跨租户巡检）
+        self.tenant_id = tenant_id or "default"
         total_start = time.time()
 
         print("\n" + "=" * 70)

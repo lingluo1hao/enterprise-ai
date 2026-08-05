@@ -33,6 +33,8 @@ class IngestPipeline:
                  embedder: Callable[[List[str]], List[List[float]]],
                  store: StoreBackend,
                  manifest_path: Optional[str] = None,
+                 tenant_id: str = "default",
+                 user_id: str = "anonymous",
                  access_fn: Callable[[str], str] = None,
                  structure_aware: bool = True,
                  child_size: int = 400, child_overlap: int = 80,
@@ -61,6 +63,8 @@ class IngestPipeline:
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
         self.dry_run = dry_run
+        self.tenant_id = tenant_id      # 默认租户（供全量构建；上传时由调用方覆盖）
+        self.user_id = user_id          # 文档拥有者（供全量构建=anonymous；上传=真实上传者）
         self._manifest = ManifestStore(self.manifest_path)
         self._embedder = BatchEmbedder(
             embedder, batch_size=batch_size,
@@ -103,6 +107,20 @@ class IngestPipeline:
             "unchanged": unchanged, "removed": removed,
             "to_process": to_process, "all_paths": paths,
         }
+
+    def _derive_tenant(self, path: str) -> str:
+        """由文件相对 folder 的路径推断租户：首层子目录即租户名（knowledge/{tenant}/x.pdf）；
+
+        平铺文件（knowledge/x.pdf）归 default。
+        """
+        try:
+            rel = os.path.relpath(path, self.folder)
+        except ValueError:
+            return "default"
+        parts = rel.split(os.sep)
+        if len(parts) > 1 and parts[0]:
+            return parts[0]
+        return "default"
 
     # ------------------------------------------------------------------ #
     # 主运行
@@ -147,6 +165,9 @@ class IngestPipeline:
             for c, vec in zip(all_chunks, vectors):
                 # chunk_id = md5(content + source)：内容相同 → 同一 id → 幂等 upsert
                 cid = hashlib.md5((c.text + c.source).encode("utf-8")).hexdigest()
+                # 租户从文件相对 folder 的路径推断：首层子目录即租户名（knowledge/{tenant}/x.pdf），
+                # 平铺文件（knowledge/x.pdf）归 default。拥有者一律取 pipeline 构造时传入的 user_id。
+                tenant = self._derive_tenant(c.source)
                 entities.append({
                     "chunk_id": cid,
                     "content": c.text[:8192],
@@ -155,7 +176,8 @@ class IngestPipeline:
                     "file_name": c.file_name,
                     "access_level": c.access_level,
                     "chunk_index": c.chunk_index,
-                    "user_id": "anonymous",
+                    "user_id": self.user_id,
+                    "tenant_id": tenant,
                     "parent_id": c.parent_id or "",
                     "parent_content": (c.parent_content or c.text)[:8192],
                     "is_parent": c.is_parent,

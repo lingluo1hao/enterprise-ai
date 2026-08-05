@@ -25,6 +25,8 @@ import json
 import time
 import queue
 import threading
+import secrets
+import uuid
 from pathlib import Path
 
 # ====== 环境配置（必须在所有 import 之前） ======
@@ -34,12 +36,13 @@ warnings.filterwarnings("ignore")
 
 from flask import Flask, request, jsonify, Response, g, send_from_directory
 from werkzeug.security import safe_join
+from werkzeug.utils import secure_filename
 
 # ====== 导入核心模块 ======
 from audit_logger import get_audit_logger
 from advanced_rag_agent import (
     OLLAMA_URL, MODEL_NAME, DB_PATH,
-    ROLE_ADMIN, DEFAULT_ROLE,
+    ROLE_ADMIN, ROLE_SUPER_ADMIN, DEFAULT_ROLE, DOC_FOLDER,
     AccessControlFilter, CacheManager,
     RAGOrchestrator,
     OllamaLLM,
@@ -47,6 +50,11 @@ from advanced_rag_agent import (
     VectorStoreManager,
     REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB,
 )
+
+# ====== 导入摄取管线（数据面） ======
+from ingest.pipeline import IngestPipeline
+from ingest.store import MilvusStoreBackend
+from ingest.fingerprint import ManifestStore
 
 
 def _derive_session_id(user_id: str = "anonymous", role: str = "user") -> str:
@@ -71,12 +79,12 @@ class LangGraphEngine:
         # 兼容角色切换中的 skill_registry.get_skill() 调用
         self.skill_registry = type("SR", (), {"get_skill": lambda self, name: None})()
 
-    def query(self, question, user_role=None, user=None, user_id=None):
+    def query(self, question, user_role=None, user=None, user_id=None, tenant_id=None):
         role = user_role or self.user_role
         user = user or role
         return self.app.query(question, role=role,
                               session_id=_derive_session_id(user, role),
-                              user=user, user_id=user_id)
+                              user=user, user_id=user_id, tenant_id=tenant_id)
 
     def check_unfinished_tasks(self, session_id="web_session", user_id=0):
         """查询指定会话的未完成任务（断点检测）"""
@@ -299,16 +307,18 @@ def api_query():
         return auth_result
 
     question = data.get("question", "").strip()
-    # role/user/user_id 一律来自登录态，客户端不可伪造（防普通用户提权看受限文档）
+    # role/user/user_id/tenant_id 一律来自登录态，客户端不可伪造（防普通用户提权看受限文档）
     user_role = g.current_user["role"]
     user = g.current_user["username"]
     user_id = g.current_user["user_id"]
+    tenant_id = g.current_user.get("tenant_id", "default")
 
     err = validate_input(question, MAX_QUESTION_LEN, "问题")
     if err:
         return jsonify({"error": err}), 400
 
-    result = orchestrator.query(question, user_role=user_role, user=user, user_id=user_id)
+    result = orchestrator.query(question, user_role=user_role, user=user,
+                                user_id=user_id, tenant_id=tenant_id)
     _audit_log("query", target=question[:80], username=user)
     return jsonify({"answer": result, "role": user_role})
 
@@ -329,10 +339,11 @@ def api_query_stream():
         return auth_result
 
     question = data.get("question", "").strip()
-    # role/user/user_id 一律来自登录态，客户端不可伪造（防普通用户提权看受限文档）
+    # role/user/user_id/tenant_id 一律来自登录态，客户端不可伪造（防普通用户提权看受限文档）
     user_role = g.current_user["role"]
     user = g.current_user["username"]
     user_id = g.current_user["user_id"]
+    tenant_id = g.current_user.get("tenant_id", "default")
 
     err = validate_input(question, MAX_QUESTION_LEN, "问题")
     if err:
@@ -365,7 +376,8 @@ def api_query_stream():
             def run_query():
                 try:
                     result_holder["answer"] = orchestrator.query(
-                        question, user_role=user_role, user=user, user_id=user_id
+                        question, user_role=user_role, user=user,
+                        user_id=user_id, tenant_id=tenant_id
                     )
                 except Exception as e:
                     import traceback
@@ -477,8 +489,8 @@ def _require_admin():
     denied = _require_auth()
     if denied:
         return denied
-    if g.current_user.get("role") != ROLE_ADMIN:
-        return jsonify({"error": "需要管理员权限"}), 403
+    if g.current_user.get("role") not in (ROLE_ADMIN, ROLE_SUPER_ADMIN):
+        return jsonify({"error": "需要管理员或超级管理员权限"}), 403
     return None
 
 
@@ -635,6 +647,7 @@ def admin_login():
                 "username": user["username"],
                 "display_name": user["display_name"],
                 "role": user["role"],
+                "tenant_id": user.get("tenant_id", "default"),
             },
             "token": user["token"],
         })
@@ -662,6 +675,7 @@ def admin_me():
         "username": g.current_user["username"],
         "display_name": g.current_user.get("display_name"),
         "role": g.current_user["role"],
+        "tenant_id": g.current_user.get("tenant_id", "default"),
     })
 
 
@@ -701,6 +715,7 @@ def api_login():
                 "username": user["username"],
                 "display_name": user["display_name"],
                 "role": user["role"],
+                "tenant_id": user.get("tenant_id", "default"),
             },
         })
         resp.set_cookie("rag_token", user["token"], httponly=True,
@@ -764,6 +779,7 @@ def api_me():
         "username": g.current_user["username"],
         "display_name": g.current_user.get("display_name"),
         "role": g.current_user["role"],
+        "tenant_id": g.current_user.get("tenant_id", "default"),
     })
 
 
@@ -857,6 +873,379 @@ def change_password_api():
 
 
 # ---- 提示词管理 ----
+
+# ======================================================================
+# 知识库文档管理 API（P0-1：多租户隔离 + 角色感知上传/删除/重建）
+# ======================================================================
+
+SUPPORTED_UPLOAD_EXT = (".txt", ".md", ".pdf", ".html", ".htm",
+                        ".docx", ".xlsx", ".xls", ".pptx")
+
+
+def _kb_build_pipeline(tenant_id: str, user_id, access_level: str = "public"):
+    """构造一次摄取管线（单文件上传 / 全量重建共用）。"""
+    store = MilvusStoreBackend(vector_db.client, vector_db.collection)
+    return IngestPipeline(
+        folder=DOC_FOLDER,
+        embedder=vector_db._embed.embed_documents,
+        store=store,
+        tenant_id=tenant_id,
+        user_id=str(user_id),
+        access_fn=(lambda s: access_level),
+    )
+
+
+def _kb_derive_tenant(rel_path: str) -> str:
+    parts = rel_path.replace("\\", "/").split("/")
+    if len(parts) > 1 and parts[0]:
+        return parts[0]
+    return "default"
+
+
+def _kb_scan_files():
+    """递归扫描 knowledge/ 下受支持文件，附带 manifest 统计。"""
+    out = []
+    manifest = ManifestStore(os.path.join(DOC_FOLDER, ".ingest_manifest.sqlite"))
+    recs = manifest.load_all()
+    for root, _dirs, files in os.walk(DOC_FOLDER):
+        if os.path.basename(root).startswith("."):
+            continue
+        for name in sorted(files):
+            if os.path.splitext(name)[1].lower() not in SUPPORTED_UPLOAD_EXT:
+                continue
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, DOC_FOLDER).replace("\\", "/")
+            rec = recs.get(full) or recs.get(rel) or {}
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            out.append({
+                "path": rel,
+                "tenant": _kb_derive_tenant(rel),
+                "size": size,
+                "chunks": rec.get("chunk_count", 0),
+            })
+    manifest.close()
+    return out
+
+
+def _kb_file_owner(file_path: str):
+    """查询某文件首个 chunk 的拥有者（Milvus user_id），用于普通用户删除鉴权。"""
+    if vector_db.backend != "milvus":
+        return None
+    safe = file_path.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        res = vector_db.client.query(
+            vector_db.collection, f'file_path == "{safe}"',
+            output_fields=["user_id"], limit=1)
+        if res:
+            return res[0].get("user_id")
+    except Exception:
+        pass
+    return None
+
+
+@app.route("/api/docs", methods=["GET"])
+def api_docs_list():
+    """列出知识库文档（任意已登录用户；按角色可见范围由前端缩放）。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    files = _kb_scan_files()
+    return jsonify({"files": files, "count": len(files)})
+
+
+@app.route("/api/docs/upload", methods=["POST"])
+def api_docs_upload():
+    """上传并增量入库（角色感知）：
+    - 普通用户：落自己租户，仅能删自己上传的；
+    - 租户管理员：落本租户，可管理本租户全部；
+    - super-admin：可指定 tenant 表单字段，落到任意租户。
+    文档归属（tenant + owner）一律来自登录态/服务端，绝不信任客户端。
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    role = g.current_user["role"]
+    uid = g.current_user["user_id"]
+    my_tenant = g.current_user.get("tenant_id", "default")
+
+    if role == ROLE_SUPER_ADMIN:
+        tenant = (request.form.get("tenant", "") or "").strip() or my_tenant
+    else:
+        tenant = my_tenant  # 非超级管理员只能落到自己租户
+    if not tenant:
+        tenant = "default"
+
+    access_level = request.form.get("access_level", "public")
+    if access_level not in ("public", "restricted"):
+        access_level = "public"
+
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "未收到文件"}), 400
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in SUPPORTED_UPLOAD_EXT:
+        return jsonify({"error": f"不支持的格式：{ext}"}), 400
+
+    dest_dir = os.path.join(DOC_FOLDER, tenant)
+    os.makedirs(dest_dir, exist_ok=True)
+    filename = secure_filename(f.filename)
+    save_path = os.path.join(dest_dir, filename)
+    f.save(save_path)
+
+    try:
+        pipe = _kb_build_pipeline(tenant, uid, access_level)
+        rep = pipe.run(files=[save_path])
+        pipe.close()
+    except Exception as e:
+        return jsonify({"error": f"入库失败：{e}"}), 500
+    _audit_log("docs_upload", target=save_path, username=g.current_user["username"],
+               result="success")
+    return jsonify({
+        "success": True,
+        "file": os.path.relpath(save_path, DOC_FOLDER).replace("\\", "/"),
+        "tenant": tenant,
+        "access_level": access_level,
+        "chunks": rep.entities_upserted,
+    })
+
+
+@app.route("/api/docs/<path:file_id>", methods=["DELETE"])
+def api_docs_delete(file_id):
+    """删除文档（角色感知）：
+    - super-admin：任意；admin：同租户；普通用户：仅自己上传的。
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    role = g.current_user["role"]
+    uid = g.current_user["user_id"]
+    my_tenant = g.current_user.get("tenant_id", "default")
+
+    rel = file_id.replace("\\", "/")
+    full = os.path.normpath(os.path.join(DOC_FOLDER, rel))
+    base = os.path.normpath(DOC_FOLDER)
+    if not (full == base or full.startswith(base + os.sep)):
+        return jsonify({"error": "非法路径"}), 400
+
+    file_tenant = _kb_derive_tenant(rel)
+    if role not in (ROLE_ADMIN, ROLE_SUPER_ADMIN):
+        owner = _kb_file_owner(full)
+        if owner != str(uid):
+            return jsonify({"error": "只能删除自己上传的文档"}), 403
+    elif role == ROLE_ADMIN and file_tenant != my_tenant:
+        return jsonify({"error": "只能管理本租户文档"}), 403
+
+    deleted = 0
+    if os.path.isfile(full):
+        try:
+            store = MilvusStoreBackend(vector_db.client, vector_db.collection)
+            deleted = store.delete_by_file(full)
+        except Exception:
+            pass
+        try:
+            manifest = ManifestStore(os.path.join(DOC_FOLDER, ".ingest_manifest.sqlite"))
+            manifest.remove(full)
+            manifest.close()
+        except Exception:
+            pass
+        os.remove(full)
+    _audit_log("docs_delete", target=rel, username=g.current_user["username"],
+               result="success")
+    return jsonify({"success": True, "deleted": deleted})
+
+
+@app.route("/api/docs/rebuild", methods=["POST"])
+def api_docs_rebuild():
+    """全量重建（仅 admin/super-admin）：后台线程跑，返回 job_id。
+    注：仅重建默认命名空间（knowledge/ 平铺文件）；租户文档由上传 API 管理，避免覆盖 owner。
+    """
+    auth_result = _require_admin()
+    if auth_result:
+        return auth_result
+    job_id = uuid.uuid4().hex[:12]
+
+    def _do():
+        try:
+            pipe = _kb_build_pipeline("default", "anonymous", "public")
+            pipe.run(force=True)
+            pipe.close()
+            print(f"[docs] 全量重建完成 job={job_id}")
+        except Exception as e:
+            print(f"[docs] 全量重建失败 job={job_id}: {e}")
+
+    threading.Thread(target=_do, daemon=True).start()
+    return jsonify({"success": True, "job_id": job_id})
+
+
+@app.route("/api/docs/stats", methods=["GET"])
+def api_docs_stats():
+    """统计：总文档数、总 chunk 数、按租户拆分。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    files = _kb_scan_files()
+    by_tenant = {}
+    for fmeta in files:
+        by_tenant[fmeta["tenant"]] = by_tenant.get(fmeta["tenant"], 0) + 1
+    total_chunks = 0
+    try:
+        total_chunks = vector_db._milvus_count()
+    except Exception:
+        pass
+    return jsonify({
+        "total_docs": len(files),
+        "total_chunks": total_chunks,
+        "by_tenant": by_tenant,
+    })
+
+
+def _load_tenants():
+    """读取 config/tenants.yaml 的租户清单，供 /kb 超级管理员下拉选择。"""
+    try:
+        import yaml
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "config", "tenants.yaml")
+        if os.path.isfile(_p):
+            with open(_p, "r", encoding="utf-8") as _f:
+                _data = yaml.safe_load(_f) or {}
+            return [t.get("name") for t in (_data.get("tenants") or [])
+                    if t.get("name")]
+    except Exception:
+        pass
+    return ["default"]
+
+
+@app.route("/kb")
+def kb_page():
+    """知识库管理页（server-rendered，角色感知）。任意已登录用户可访问。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    role = g.current_user["role"]
+    is_admin = role in (ROLE_ADMIN, ROLE_SUPER_ADMIN)
+    can_choose_tenant = (role == ROLE_SUPER_ADMIN)
+    tenant_options = "".join(
+        f'<option value="{t}">{t}</option>' for t in _load_tenants())
+    html = '''<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>知识库管理</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,"Microsoft YaHei",sans-serif;margin:0;background:#f5f7fa;color:#222}
+  .wrap{max-width:960px;margin:0 auto;padding:24px}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+  h1{font-size:20px;margin:0}
+  .badge{font-size:12px;padding:2px 10px;border-radius:12px;background:#e6f1fb;color:#185fa5;border:1px solid #bcdcf5}
+  .card{background:#fff;border:1px solid #e6e8eb;border-radius:10px;padding:18px;margin-bottom:18px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  input[type=file]{font-size:14px}
+  select,input[type=text]{padding:7px 10px;border:1px solid #ccd2d9;border-radius:7px;font-size:14px}
+  button{background:#185fa5;color:#fff;border:none;padding:8px 16px;border-radius:7px;font-size:14px;cursor:pointer}
+  button.ghost{background:#fff;color:#185fa5;border:1px solid #185fa5}
+  button.danger{background:#fff;color:#a32d2d;border:1px solid #a32d2d}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:9px 8px;border-bottom:1px solid #eef0f2}
+  th{color:#666;font-weight:600}
+  .muted{color:#888;font-size:13px}
+  #msg{margin-top:10px;font-size:13px;color:#0f6e56}
+  #err{margin-top:10px;font-size:13px;color:#a32d2d}
+</style></head>
+<body><div class="wrap">
+  <header>
+    <h1>📚 知识库管理</h1>
+    <span class="badge" id="who"></span>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <input type="file" id="file">
+      <select id="access">
+        <option value="public">公开(本租户可读)</option>
+        <option value="restricted">受限(仅自己+管理员)</option>
+      </select>
+      <select id="tenant" style="display:''' + ("inline-block" if can_choose_tenant else "none") + '''">''' + tenant_options + '''</select>
+      <button onclick="upload()">⬆️ 上传并入库</button>
+    </div>
+    <div id="msg"></div><div id="err"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <strong>文档列表</strong>
+      ''' + ('''<button class="ghost" onclick="rebuild()">♻️ 全量重建</button>''' if is_admin else '') + '''
+    </div>
+    <div id="stats" class="muted" style="margin:8px 0"></div>
+    <table>
+      <thead><tr><th>路径</th><th>租户</th><th>分片</th><th>大小</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+const me = ''' + json.dumps({
+        "username": g.current_user["username"],
+        "role": role,
+        "tenant_id": g.current_user.get("tenant_id", "default"),
+        "tenants": _load_tenants(),
+    }) + ''';
+document.getElementById("who").textContent = me.username + " · " + me.role + " · 租户:" + me.tenant_id;
+load();
+
+function load(){
+  fetch("/api/docs").then(r=>r.json()).then(d=>{
+    const tb = document.getElementById("rows"); tb.innerHTML="";
+    (d.files||[]).forEach(f=>{
+      const tr=document.createElement("tr");
+      tr.innerHTML = "<td>"+f.path+"</td><td>"+f.tenant+"</td><td>"+f.chunks+"</td><td>"+(f.size/1024).toFixed(1)+"KB</td>";
+      const td=document.createElement("td");
+      const b=document.createElement("button"); b.className="danger"; b.textContent="删除";
+      b.onclick=()=>del(f.path); td.appendChild(b); tr.appendChild(td); tb.appendChild(tr);
+    });
+  });
+  fetch("/api/docs/stats").then(r=>r.json()).then(s=>{
+    document.getElementById("stats").textContent =
+      "共 "+s.total_docs+" 篇文档 · "+s.total_chunks+" 分片 · 租户分布: "+
+      Object.entries(s.by_tenant||{}).map(([k,v])=>k+":"+v).join("  ");
+  });
+}
+
+function upload(){
+  const fd=new FormData();
+  const file=document.getElementById("file").files[0];
+  if(!file){err("请选择文件");return;}
+  fd.append("file",file);
+  fd.append("access_level",document.getElementById("access").value);
+  const t=document.getElementById("tenant").value;
+  if(t) fd.append("tenant",t);
+  fetch("/api/docs/upload",{method:"POST",body:fd}).then(r=>r.json()).then(d=>{
+    if(d.success){msg("已入库: "+d.file+" ("+d.chunks+" 分片)");load();}
+    else err(d.error||"上传失败");
+  }).catch(e=>err(e));
+}
+
+function del(path){
+  if(!confirm("确认删除 "+path+"？")) return;
+  fetch("/api/docs/"+encodeURIComponent(path),{method:"DELETE"})
+    .then(r=>r.json()).then(d=>{ if(d.success){msg("已删除");load();} else err(d.error||"删除失败"); })
+    .catch(e=>err(e));
+}
+
+function rebuild(){
+  if(!confirm("全量重建将重刷默认命名空间，耗时较长，继续？")) return;
+  fetch("/api/docs/rebuild",{method:"POST"}).then(r=>r.json()).then(d=>{
+    if(d.success) msg("重建已启动 job="+d.job_id);
+  });
+}
+
+function msg(t){document.getElementById("msg").textContent=t;document.getElementById("err").textContent="";}
+function err(t){document.getElementById("err").textContent=t;document.getElementById("msg").textContent="";}
+</script>
+</body></html>'''
+    return html
+
 
 @app.route("/api/admin/prompts")
 def admin_list_prompts():

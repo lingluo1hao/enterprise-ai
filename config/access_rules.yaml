@@ -1,0 +1,11 @@
+# 文档访问权限规则（ACL）
+# 按文件名关键字匹配权限级别；命中 -> 对应级别，否则默认 public。
+# 关键字不区分大小写（匹配时统一转小写）。
+# 级别：public（本租户可读）/ restricted（仅拥有者 + 管理员可读）
+#
+# 示例：含 "JM-S509" 或 "指令表" 的文档自动判为受限。
+access_rules:
+  "JM-S509": "restricted"
+  "指令表": "restricted"
+  "confidential": "restricted"
+  "机密": "restricted"

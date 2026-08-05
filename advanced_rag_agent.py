@@ -155,6 +155,7 @@ DOC_ACCESS_RULES = {
 }
 
 ROLE_ADMIN = "admin"      # 特权用户：可访问所有文档（含 restricted）
+ROLE_SUPER_ADMIN = "super_admin"  # 超级管理员：跨租户巡检，可见全部文档
 ROLE_USER = "user"        # 普通用户：只能访问 public 文档
 DEFAULT_ROLE = ROLE_USER   # 默认角色
 
@@ -675,10 +676,12 @@ class VectorStoreManager:
                 existing_dim = None
                 if dense_field:
                     existing_dim = dense_field.get("params", {}).get("dim") or dense_field.get("dim")
-                if "sparse" in existing and existing_dim == dim:
+                if "sparse" in existing and existing_dim == dim and "tenant_id" in existing:
                     return
-                reason = "维度不匹配" if existing_dim != dim else "无 sparse 字段"
-                print(f"[VectorStore] 检测到集合需重建({reason}: 现有 dim={existing_dim}, 新 dim={dim})，重建以支持混合检索...")
+                reason = ("维度不匹配" if existing_dim != dim
+                          else ("缺 tenant_id 字段" if "tenant_id" not in existing
+                                else "无 sparse 字段"))
+                print(f"[VectorStore] 检测到集合需重建({reason}: 现有 dim={existing_dim}, 新 dim={dim})，重建以支持混合检索与多租户分区...")
             except Exception:
                 pass
             self.client.drop_collection(self.collection)
@@ -696,6 +699,10 @@ class VectorStoreManager:
             FieldSchema("access_level", DataType.VARCHAR, max_length=16),
             FieldSchema("chunk_index", DataType.INT64),
             FieldSchema("user_id", DataType.VARCHAR, max_length=64),
+            # 多租户物理隔离：partition_key=True 让 Milvus 按租户分片，
+            # 查询时引擎只扫描本租户分区，跨租户数据物理不可见（引擎级保证）。
+            FieldSchema("tenant_id", DataType.VARCHAR, max_length=64,
+                        partition_key=True, default_value="default"),
             # 父子文档（small-to-big）：子片段检索命中后，透传父窗口上下文
             FieldSchema("parent_id", DataType.VARCHAR, max_length=64),
             FieldSchema("parent_content", DataType.VARCHAR, max_length=8192),
@@ -805,17 +812,22 @@ class VectorStoreManager:
         ranked = sorted(score.keys(), key=lambda h: score[h], reverse=True)
         return [(docs[h], -score[h]) for h in ranked[:k]]
 
-    def _milvus_search(self, query, k, filter_role, user_id):
+    def _milvus_search(self, query, k, filter_role, user_id, tenant_id="default"):
         """混合检索：dense 向量 + sparse BM25 双路召回，RRF 融合。
 
-        - access_level 权限下推（expr 先于距离计算过滤）：admin 不过滤；
-          user 只看 public 或自己上传的。
+        - 多租户 + 密级 + 拥有者权限下推（expr 先于距离计算过滤）：
+          super_admin / __global__ 可见全部；admin 看本租户全部；
+          user 只看本租户 public 或自己上传的。
         - HYBRID_SEARCH=false 时仅做 dense。
         """
-        # 权限下推
-        expr = ""
-        if filter_role != ROLE_ADMIN:
-            expr = f'(access_level == "public") or (user_id == "{user_id}")'
+        # 权限下推（多租户隔离 + 密级 + 拥有者）
+        if filter_role == ROLE_SUPER_ADMIN or tenant_id == "__global__":
+            expr = ""  # super-admin / 跨租户巡检：可见全部
+        elif filter_role == ROLE_ADMIN:
+            expr = f'(tenant_id == "{tenant_id}")'  # 租户管理员：本租户全部
+        else:
+            expr = (f'(tenant_id == "{tenant_id}") and '
+                    f'((access_level == "public") or (user_id == "{user_id}"))')
         fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
                   "chunk_type", "figure_paths", "page",
                   "parent_id", "parent_content", "is_parent"]
@@ -849,7 +861,8 @@ class VectorStoreManager:
             return [(doc, dist) for (_, doc, dist) in dense_list[:k]]
 
     def search_figure_pages(self, query: str, k: int = 2,
-                            filter_role: str = None, user_id: str = "anonymous"):
+                            filter_role: str = None, user_id: str = "anonymous",
+                            tenant_id: str = "default"):
         """figure-aware 召回：仅在 chunk_type=="page" 的图页里做 BM25 稀疏检索。
 
         用途：「通信流程图」「架构图」类查询——figure caption 文本极短（PyPDF 仅抽到几字），
@@ -862,10 +875,13 @@ class VectorStoreManager:
         if self.backend != "milvus":
             return []
         # 权限 + chunk_type 双重过滤
-        if filter_role != ROLE_ADMIN:
-            expr = f'(chunk_type == "page") and ((access_level == "public") or (user_id == "{user_id}"))'
-        else:
+        if filter_role == ROLE_SUPER_ADMIN or tenant_id == "__global__":
             expr = 'chunk_type == "page"'
+        elif filter_role == ROLE_ADMIN:
+            expr = f'(chunk_type == "page") and (tenant_id == "{tenant_id}")'
+        else:
+            expr = (f'(chunk_type == "page") and (tenant_id == "{tenant_id}") and '
+                    f'((access_level == "public") or (user_id == "{user_id}"))')
         fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
                   "chunk_type", "figure_paths", "page",
                   "parent_id", "parent_content", "is_parent"]
@@ -919,14 +935,15 @@ class VectorStoreManager:
 
     def similarity_search_with_score(self, query: str, k: int = 4,
                                      filter_role: str = None,
-                                     user_id: str = "anonymous") -> List[Tuple[Any, float]]:
+                                     user_id: str = "anonymous",
+                                     tenant_id: str = "default") -> List[Tuple[Any, float]]:
         """
         统一向量检索接口，返回 [(Document, distance), ...]，distance 越小越相似。
-        Milvus 后端会按 filter_role 下推 access_level 权限过滤；
+        Milvus 后端会按 filter_role + tenant_id 下推租户/密级/拥有者权限过滤；
         Chroma 后端忽略 filter_role，由上层 AccessControlFilter 兜底。
         """
         if self.backend == "milvus":
-            return self._milvus_search(query, k, filter_role, user_id)
+            return self._milvus_search(query, k, filter_role, user_id, tenant_id)
         return self.db.similarity_search_with_score(query, k=k)
 
     @staticmethod
@@ -936,9 +953,11 @@ class VectorStoreManager:
 
     @staticmethod
     def search(db, query: str, k: int = 4, filter_role: str = None,
-               user_id: str = "anonymous") -> List[Tuple[Any, float]]:
+               user_id: str = "anonymous",
+               tenant_id: str = "default") -> List[Tuple[Any, float]]:
         """兼容旧静态调用：VectorStoreManager.search(self.db, q, k)"""
-        return db.similarity_search_with_score(query, k=k, filter_role=filter_role, user_id=user_id)
+        return db.similarity_search_with_score(query, k=k, filter_role=filter_role,
+                                               user_id=user_id, tenant_id=tenant_id)
 
 
 # ============================================================================
@@ -1020,8 +1039,8 @@ class AccessControlFilter:
         :param user_role: 用户角色 ("admin" 或 "user")
         :return: 过滤后的结果列表
         """
-        if user_role == ROLE_ADMIN:
-            # 特权用户可访问所有文档，无需过滤
+        if user_role in (ROLE_ADMIN, ROLE_SUPER_ADMIN):
+            # 特权用户 / 超级管理员可访问所有文档，无需过滤
             return results
 
         # 普通用户：过滤掉 restricted 文档
@@ -1044,9 +1063,11 @@ class AccessControlFilter:
     @staticmethod
     def get_role_description(user_role: str) -> str:
         """返回用户角色的中文描述"""
+        if user_role == ROLE_SUPER_ADMIN:
+            return "超级管理员（跨租户巡检，可访问全部文档）"
         if user_role == ROLE_ADMIN:
-            return "特权用户（可访问所有文档）"
-        return "普通用户（仅可访问公开文档）"
+            return "特权用户（可访问本租户所有文档）"
+        return "普通用户（仅可访问本租户公开文档或自己上传的文档）"
 
 
 # ============================================================================
@@ -1101,12 +1122,13 @@ class DocSearchSkill(BaseSkill):
     )
 
     def __init__(self, llm: BaseLLM, vector_db, fast_mode: bool = False,
-                 user_role: str = DEFAULT_ROLE):
+                 user_role: str = DEFAULT_ROLE, tenant_id: str = "default"):
         self.llm = llm          # 用于查询重写
         self.db = vector_db     # VectorStoreManager 实例（Milvus/Chroma 统一接口）
         self.fast_mode = fast_mode  # True=跳过查询重写，直接检索
         self.user_role = user_role  # 当前用户角色，用于文档访问权限过滤
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
+        self.tenant_id = tenant_id  # 当前用户所属租户，用于检索下推隔离
 
     def execute(self, query: str) -> str:
         """执行智能 RAG 检索流程"""
@@ -1332,7 +1354,9 @@ class DocSearchSkill(BaseSkill):
 
         for q in queries:
             try:
-                results = self.db.similarity_search_with_score(q, k=top_k, filter_role=self.user_role)
+                results = self.db.similarity_search_with_score(
+                    q, k=top_k, filter_role=self.user_role,
+                    user_id=self.user, tenant_id=self.tenant_id)
                 for doc, distance in results:
                     # 用内容前50字符作为去重键
                     key = doc.page_content[:50]

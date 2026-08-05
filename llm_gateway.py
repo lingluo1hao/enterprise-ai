@@ -234,7 +234,9 @@ def load_config(path: str = "") -> GatewayConfig:
     if env_path:
         candidates.append(env_path)
     here = os.path.dirname(os.path.abspath(__file__))
+    config_dir = os.path.join(here, "config")
     for name in ("llm_gateway.yaml", "llm_gateway.yml", "llm_gateway.json"):
+        candidates.append(os.path.join(config_dir, name))
         candidates.append(os.path.join(here, name))
 
     data: Optional[dict] = None
