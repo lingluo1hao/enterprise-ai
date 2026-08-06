@@ -1,11 +1,11 @@
 """
 ================================================================================
-  高级 RAG Agent — 真实环境版（Milvus / ChromaDB + Ollama LLM 网关）
+  高级 RAG Agent — 真实环境版（Milvus + Ollama LLM 网关）
 ================================================================================
 
   本文件是advanced_rag.py 的真实环境版本：
     - 不使用任何 Mock 数据或 Mock LLM
-    - 直接连接向量数据库（Milvus 默认，ChromaDB 兜底）
+    - 直接连接向量数据库（Milvus，唯一向量后端）
     - 推理经 LLM 网关（llm_gateway.create_llm）路由到本地 Ollama 多模型：
       qwen2:7b 负责生成/规划，qwen2.5:1.5b 负责分类打分/改写/压缩
     - 保留完整的 ReAct + Planning Agent + 智能 RAG + Skill 架构
@@ -41,7 +41,7 @@
   │       ▼                                                          │
   │  ┌──────────────────────────────┐                                │
   │  │ 查询重写 → 多跳检索 → 重排序   │  智能 RAG 内部流程              │
-  │  │     （向量库检索：Milvus / Chroma） │                            │
+  │  │     （向量库检索：Milvus） │                                      │
   │  └──────────────────────────────┘                                │
   │             │                                                    │
   │             ▼                                                    │
@@ -71,7 +71,7 @@
 
   环境要求：
     - Python 3.10（conda env: pythonspace）
-    - ChromaDB 已构建（./chroma_db）
+    - Milvus 已部署并可达（默认 http://192.168.200.128:19530）
     - Ollama 已启动并加载 qwen2:7b 与 qwen2.5:1.5b 模型（网关按任务路由）
 
 ================================================================================
@@ -123,7 +123,6 @@ from typing import List, Optional, Tuple, Any
 # 配置区
 # ============================================================================
 DOC_FOLDER = os.path.abspath(os.path.expanduser("./knowledge"))
-DB_PATH = os.path.abspath(os.path.expanduser("./chroma_db"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.200.128:11434")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2:7b")
 CHUNK_SIZE = 600
@@ -407,7 +406,7 @@ class CacheManager:
         把文本转为 embedding 向量（768 维）
 
         延迟加载 embedding 模型，避免 import 时触发模型下载。
-        使用与 ChromaDB 相同的 BAAI/bge-small-zh-v1.5 模型。
+        走 _make_embedder()：本地不加载 torch，embedding 由 Ollama 的 bge-m3 提供。
         """
         if self._embed_fn is None:
             self._embed_fn = _make_embedder()
@@ -542,8 +541,8 @@ def create_llm(verbose: bool = True):
 # ============================================================================
 # 第二部分：向量数据库管理
 # ============================================================================
-# 这部分封装了 ChromaDB 的初始化和检索操作。
-# 但封装成类方便 Skill 调用。
+# 这部分封装了 Milvus 向量库的初始化和检索操作。
+# 封装成类方便 Skill 调用。
 
 
 def _make_embedder():
@@ -575,87 +574,51 @@ def _make_embedder():
 
 class VectorStoreManager:
     """
-    向量数据库管理器 —— 统一封装 ChromaDB / Milvus 两种后端（方案 P3）
+    向量数据库管理器 —— 仅封装 Milvus 单一后端。
 
-    后端由环境变量 VECTOR_BACKEND 决定，默认 "milvus"：
-      - "milvus"：连接虚拟机 192.168.200.128 上的 Milvus standalone（默认向量库）
-      - "chroma"：本地嵌入式 ChromaDB（兜底 / 回滚，读路径完全一致）
+    本项目唯一向量后端为虚拟机 192.168.200.128 上的 Milvus standalone。
+    不再保留任何 ChromaDB 兜底 / 回滚路径：若 Milvus 不可达，初始化将直接
+    抛出异常并终止启动，避免「静默回退到本地 Chroma」导致的数据与权限不一致。
 
-    Milvus 不可用时自动回退 ChromaDB 并打印醒目警告，保证服务不中断。
-    对外暴露与 Chroma 一致的接口 similarity_search_with_score(query, k)，
-    上层 Agent 代码无需感知后端差异。
+    对外暴露接口 similarity_search_with_score(query, k)，上层 Agent 代码调用。
     """
 
     def __init__(self, backend: str = None):
-        self.backend = (backend or os.getenv("VECTOR_BACKEND", "milvus")).lower()
-        self.db = None            # Chroma 后端实例
+        # 仅支持 Milvus；若误传 chroma 或环境变量仍残留旧值，强制纠正并告警
+        requested = (backend or os.getenv("VECTOR_BACKEND", "milvus")).lower()
+        if requested != "milvus":
+            print(f"[VectorStore] 警告：VECTOR_BACKEND={requested!r} 已废弃，"
+                  f"本项目仅支持 milvus，已强制使用 milvus")
+        self.backend = "milvus"
         self.client = None        # MilvusClient 实例
         self.collection = os.getenv("MILVUS_COLLECTION", "rag_docs")
         # 混合检索开关：sparse BM25 + dense 向量 + RRF 融合（方案 P1 核心）
         self.hybrid = (os.getenv("HYBRID_SEARCH", "true").lower() != "false")
-        # embedding 函数与 Chroma 路径完全一致，保证向量空间统一
         self._embed = _make_embedder()
 
-        if self.backend == "milvus":
-            try:
-                from pymilvus import MilvusClient
-                uri = os.getenv("MILVUS_URI", "http://192.168.200.128:19530")
-                print(f"[VectorStore] 连接 Milvus: {uri} (collection={self.collection})")
-                self.client = MilvusClient(uri=uri)
-                self._ensure_collection()
-                if self._milvus_count() == 0:
-                    auto_build = os.getenv("AUTO_BUILD_KNOWLEDGE", "false").lower() == "true"
-                    if auto_build:
-                        print(f"[VectorStore] Milvus 集合为空，从 {DOC_FOLDER} 构建索引...")
-                        self._build_milvus()
-                    else:
-                        print(f"[VectorStore] Milvus 集合为空，跳过自动构建；请通过 /kb 页面上传文档，或设置 AUTO_BUILD_KNOWLEDGE=true 后重启")
+        try:
+            from pymilvus import MilvusClient
+            uri = os.getenv("MILVUS_URI", "http://192.168.200.128:19530")
+            print(f"[VectorStore] 连接 Milvus: {uri} (collection={self.collection})")
+            self.client = MilvusClient(uri=uri)
+            self._ensure_collection()
+            if self._milvus_count() == 0:
+                auto_build = os.getenv("AUTO_BUILD_KNOWLEDGE", "false").lower() == "true"
+                if auto_build:
+                    print(f"[VectorStore] Milvus 集合为空，从 {DOC_FOLDER} 构建索引...")
+                    self._build_milvus()
                 else:
-                    print(f"[VectorStore] 加载已有 Milvus 集合（{self._milvus_count()} 条）")
-                try:
-                    self.client.load_collection(self.collection)
-                except Exception as e:
-                    print(f"[VectorStore] 提示: load_collection 跳过 ({e})")
-            except Exception as e:
-                print(f"[VectorStore] ⚠ Milvus 初始化失败: {e}")
-                print(f"[VectorStore] ⚠ 自动回退到 ChromaDB 兜底（VECTOR_BACKEND=chroma）")
-                self.backend = "chroma"
-
-        if self.backend == "chroma":
-            self.db = self._init_chroma()
-
-    # ------------------------------------------------------------------ #
-    # Chroma 后端
-    # ------------------------------------------------------------------ #
-    def _init_chroma(self):
-        from langchain_chroma import Chroma
-        if os.path.exists(DB_PATH):
-            print(f"[VectorStore] 加载已有向量数据库: {DB_PATH}")
-            db = Chroma(persist_directory=DB_PATH, embedding_function=self._embed)
+                    print(f"[VectorStore] Milvus 集合为空，跳过自动构建；请通过 /kb 页面上传文档，或设置 AUTO_BUILD_KNOWLEDGE=true 后重启")
+            else:
+                print(f"[VectorStore] 加载已有 Milvus 集合（{self._milvus_count()} 条）")
             try:
-                db.similarity_search("测试", k=1)
-                print(f"[VectorStore] 向量数据库正常，包含文档片段")
+                self.client.load_collection(self.collection)
             except Exception as e:
-                print(f"[VectorStore] ⚠ 向量数据库可能损坏: {e}")
-                raise
-            return db
-        else:
-            print(f"[VectorStore] 首次运行，从 {DOC_FOLDER} 构建向量数据库...")
-            return self._build_chroma()
-
-    def _build_chroma(self):
-        from langchain_community.document_loaders import PyPDFLoader, TextLoader
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-        from langchain_chroma import Chroma
-        raw_docs = self._load_raw_docs()
-        if not raw_docs:
-            raise Exception(f"{DOC_FOLDER} 文件夹内没有可识别文档！")
-        split_docs = self._split(raw_docs)
-        db = Chroma.from_documents(
-            documents=split_docs, embedding=self._embed, persist_directory=DB_PATH
-        )
-        print(f"[VectorStore] 向量数据库构建完成")
-        return db
+                print(f"[VectorStore] 提示: load_collection 跳过 ({e})")
+        except Exception as e:
+            raise RuntimeError(
+                f"Milvus 初始化失败，系统无法启动（本项目仅支持 Milvus，无 Chroma 兜底）: {e}"
+            ) from e
 
     # ------------------------------------------------------------------ #
     # Milvus 后端
@@ -874,10 +837,7 @@ class VectorStoreManager:
         这里用稀疏 BM25（caption 关键词精确匹配）在图页范围里召回，避开了正文页的稀释。
 
         返回 [(Document, score), ...]，score 越小越相关；与 similarity_search_with_score 同语义。
-        Chroma 后端不支持，返回 []。
         """
-        if self.backend != "milvus":
-            return []
         # 权限 + chunk_type 双重过滤
         if filter_role == ROLE_SUPER_ADMIN or tenant_id == "__global__":
             expr = 'chunk_type == "page"'
@@ -943,12 +903,9 @@ class VectorStoreManager:
                                      tenant_id: str = "default") -> List[Tuple[Any, float]]:
         """
         统一向量检索接口，返回 [(Document, distance), ...]，distance 越小越相似。
-        Milvus 后端会按 filter_role + tenant_id 下推租户/密级/拥有者权限过滤；
-        Chroma 后端忽略 filter_role，由上层 AccessControlFilter 兜底。
+        按 filter_role + tenant_id 下推租户/密级/拥有者权限过滤（Milvus 原生 expr）。
         """
-        if self.backend == "milvus":
-            return self._milvus_search(query, k, filter_role, user_id, tenant_id)
-        return self.db.similarity_search_with_score(query, k=k)
+        return self._milvus_search(query, k, filter_role, user_id, tenant_id)
 
     @staticmethod
     def init_vector_store() -> "VectorStoreManager":
@@ -975,7 +932,7 @@ class VectorStoreManager:
 #  │  DocSearchSkill.execute(query)                                    │
 #  │     │                                                             │
 #  │     ▼                                                             │
-#  │  向量库向量检索（top_k=5，Milvus 或 Chroma，按 VECTOR_BACKEND）       │
+#  │  向量库向量检索（top_k=5，Milvus 单一后端）                         │
 #  │     │                                                             │
 #  │     ▼                                                             │
 #  │  AccessControlFilter.filter_results(results, user_role)           │
@@ -1039,7 +996,7 @@ class AccessControlFilter:
         """
         过滤检索结果，移除用户无权访问的文档
 
-        :param results: ChromaDB 检索结果 [(Document, score), ...]
+        :param results: Milvus 检索结果 [(Document, score), ...]
         :param user_role: 用户角色 ("admin" 或 "user")
         :return: 过滤后的结果列表
         """
@@ -1108,19 +1065,19 @@ class DocSearchSkill(BaseSkill):
     │  fast 模式下会跳过此步，直接用原始问题检索                     │
     │                                                              │
     │  第2步：多跳检索（Multi-hop Retrieval）                       │
-    │  第1跳：用重写后的查询检索 ChromaDB                           │
+    │  第1跳：用重写后的查询检索 Milvus                            │
     │  如果结果不足 → 从第1跳结果提取关键词 → 第2跳检索              │
     │  合并两跳结果并去重                                           │
     │                                                              │
     │  第3步：结果重排序（Reranking）                               │
     │  对所有检索片段按与原始问题的相关度重新排列                     │
-    │  综合 ChromaDB 距离分数 + 关键词匹配数                         │
+    │  综合 Milvus 距离分数 + 关键词匹配数                          │
     └─────────────────────────────────────────────────────────────┘
     """
 
     name = "doc_search"
     description = (
-        "搜索企业文档知识库（ChromaDB向量数据库），返回与查询相关的文档片段。"
+        "搜索企业文档知识库（Milvus 向量数据库），返回与查询相关的文档片段。"
         "适用于需要查找产品参数、协议说明、功能规格等文档内容时。"
         "输入：搜索关键词或问题描述。输出：相关文档片段列表。"
     )
@@ -1128,7 +1085,7 @@ class DocSearchSkill(BaseSkill):
     def __init__(self, llm: BaseLLM, vector_db, fast_mode: bool = False,
                  user_role: str = DEFAULT_ROLE, tenant_id: str = "default"):
         self.llm = llm          # 用于查询重写
-        self.db = vector_db     # VectorStoreManager 实例（Milvus/Chroma 统一接口）
+        self.db = vector_db     # VectorStoreManager 实例（Milvus 后端）
         self.fast_mode = fast_mode  # True=跳过查询重写，直接检索
         self.user_role = user_role  # 当前用户角色，用于文档访问权限过滤
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
@@ -1167,7 +1124,7 @@ class DocSearchSkill(BaseSkill):
         first_hop = self._diversity_hop(query, first_hop, rewrites)
 
         # ====== 第4步：重排序（含多样性提升）======
-        # 综合 ChromaDB 距离分数 + 关键词匹配数 + 多样性奖励，重新排列
+        # 综合 Milvus 距离分数 + 关键词匹配数 + 多样性奖励，重新排列
         reranked = self._rerank(query, first_hop)
         print(f"    [DocSearchSkill] 重排序完成，Top {len(reranked)} 结果:")
 
@@ -1177,7 +1134,7 @@ class DocSearchSkill(BaseSkill):
         for i, (doc, score) in enumerate(reranked):
             source = doc.metadata.get("source", "未知")
             page = doc.metadata.get("page", "?")
-            # ChromaDB 的 distance 越小越相似，转换为 0-100 的相关度分数
+            # Milvus 的 distance 越小越相似，转换为 0-100 的相关度分数
             relevance = max(0, round(100 - score * 50))
             print(f"      [{i+1}] {os.path.basename(source)} P{page} (相关度:{relevance}%)")
             # 截断文档内容，保留前 350 字符（足够包含协议号+描述+关键字段）
@@ -1348,10 +1305,10 @@ class DocSearchSkill(BaseSkill):
 
     def _retrieve(self, queries: List[str], top_k: int = 3) -> List[Tuple[Any, float]]:
         """
-        向量检索：用多个查询变体分别检索 ChromaDB，合并去重
+        向量检索：用多个查询变体分别检索 Milvus，合并去重
 
         真实实现：用 embedding 模型把 query 编码成向量，
-                  在 ChromaDB 中做余弦相似度搜索。
+                  在 Milvus 中做余弦相似度搜索。
         """
         all_results = []
         seen_contents = set()  # 用于去重
@@ -1916,7 +1873,7 @@ class RAGOrchestrator:
 
     职责：
       1. 初始化 LLM 后端（Ollama）
-      2. 初始化向量数据库（ChromaDB）
+      2. 初始化向量数据库（Milvus）
       3. 注册所有 Skill
       4. 创建 Planning Agent
       5. 提供统一的 query 入口
@@ -1938,7 +1895,7 @@ class RAGOrchestrator:
         print("\n[系统] 注册技能...")
         self.skill_registry = SkillRegistry()
 
-        # 文档检索技能（智能 RAG，使用真实 ChromaDB）
+        # 文档检索技能（智能 RAG，使用真实 Milvus）
         # fast_mode=True 时跳过查询重写，减少 LLM 调用
         # user_role 传入 DocSearchSkill，检索时按权限过滤结果
         self.skill_registry.register(
@@ -1962,7 +1919,7 @@ class RAGOrchestrator:
         完整流程：
           用户问题 → 检查 Redis 缓存（命中直接返回）
           → PlanningAgent 规划 → Sub Agent + ReAct 执行
-          → 智能 RAG 检索（ChromaDB）→ LLM 汇总答案
+          → 智能 RAG 检索（Milvus）→ LLM 汇总答案
           → 写入 Redis 缓存
 
         :param user_question: 用户问题
@@ -2076,7 +2033,7 @@ def run_interactive(orchestrator: RAGOrchestrator):
     print(f"""
     ╔══════════════════════════════════════════════════════════════════╗
     ║          高级 RAG Agent — 交互模式                               ║
-    ║     Milvus/Chroma + Ollama(LLM网关: qwen2.5:1.5b / qwen2:7b) + ReAct+Planning  ║
+    ║     Milvus + Ollama(LLM网关: qwen2.5:1.5b / qwen2:7b) + ReAct+Planning  ║
     ║          用户角色: {orchestrator.user_role}（{role_desc}）
     ╚══════════════════════════════════════════════════════════════════╝
 
@@ -2151,7 +2108,7 @@ def main():
     ╔══════════════════════════════════════════════════════════════════╗
     ║          高级 RAG Agent — 真实环境版                              ║
     ║          ReAct + Planning Agent + 智能 RAG + Skill 系统          ║
-    ║      Milvus/Chroma + Ollama(LLM网关: qwen2.5:1.5b / qwen2:7b)  [{mode_label}]           ║
+    ║      Milvus + Ollama(LLM网关: qwen2.5:1.5b / qwen2:7b)  [{mode_label}]           ║
     ║          用户角色: {user_role}（{role_desc}）
     ╚══════════════════════════════════════════════════════════════════╝
     """)
@@ -2170,7 +2127,7 @@ def main():
         vector_db = VectorStoreManager.init_vector_store()
     except Exception as e:
         print(f"\n❌ 初始化向量数据库失败: {e}")
-        print(f"   请确认 {DB_PATH} 存在或 {DOC_FOLDER} 中有文档")
+        print(f"   请确认 Milvus 已部署可达（MILVUS_URI），且 {DOC_FOLDER} 中有文档")
         return
 
     # 3. 创建编排器（传入 fast_mode 和 user_role）

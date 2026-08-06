@@ -8,9 +8,6 @@ __pycache__/
 llm_usage.db
 *.log
 
-# 向量库本地持久化目录
-chroma_db/
-
 # 环境变量（含密码，不提交 Git）
 .env
 .env.example

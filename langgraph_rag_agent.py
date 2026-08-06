@@ -19,7 +19,7 @@ LangGraph 版高级 RAG Agent
     qwen2.5:1.5b 负责 grade/rewrite/compress（见 create_llm()）。
   - Embedding：统一使用 Ollama bge-m3（advanced_rag_agent._make_embedder，主进程不加载
     torch，只提供 Ollama 模式，无本地 SentenceTransformer 回退）。
-  - 向量库：Milvus 默认，Chroma 兜底（VECTOR_BACKEND 切换，检索接口统一）。
+  - 向量库：Milvus（唯一向量后端，检索接口统一）。
 
 图结构：
   START → load_history → classify → [条件边]
@@ -104,7 +104,7 @@ HISTORY_MAX_TURNS = 8
 HISTORY_COMPRESS_TURNS = 6
 
 # 每次向量检索返回的文档片段数量。
-# 向量库（Milvus/Chroma 统一接口）的 similarity_search_with_score 的 k 参数。
+# 向量库（Milvus）的 similarity_search_with_score 的 k 参数。
 # 5 是一个平衡值：太少可能遗漏关键信息，太多会塞满 LLM 上下文窗口。
 RETRIEVE_TOP_K = 5
 
@@ -172,12 +172,12 @@ class AgentState(TypedDict, total=False):
 
     # 当前轮次的改写查询词列表。
     # 第 1 轮改写 2-3 个搜索词，后续轮次换角度重新改写。
-    # 每个搜索词都会分别去向量库（Milvus/Chroma）检索，结果合并去重。
+    # 每个搜索词都会分别去向量库（Milvus）检索，结果合并去重。
     rewritten_queries: List[str]
 
     # 累积检索到的文档列表，格式为 [(langchain Document, 距离分数), ...]。
     # 多轮检索的结果会不断追加（不会覆盖），所以叫"累积"。
-    # 距离分数越小表示越相似（ChromaDB 返回的是 L2 欧氏距离）。
+    # 距离分数越小表示越相似。
     retrieved_docs: List[Any]
 
     # 文档相关性评分列表，每个元素是 bool，与 retrieved_docs 一一对应。
@@ -303,7 +303,7 @@ class LangGraphRAGApp:
 
         执行顺序：
         1. 连接 Ollama LLM（复用 advanced_rag_agent 的 OllamaLLM 类）
-        2. 加载向量数据库（复用 VectorStoreManager，默认 Milvus，Chroma 兜底）
+        2. 加载向量数据库（复用 VectorStoreManager，唯一后端 Milvus）
         3. 初始化 Redis 缓存 + 内存对话历史存储
         4. 构建 LangGraph 状态图（注册节点 + 连线 + 条件边）
 
@@ -325,8 +325,8 @@ class LangGraphRAGApp:
         self.tenant_id = "default" # 当前调用用户所属租户；Web 模式会被覆盖为真实登录租户
 
         # 2. 向量数据库（复用现有 VectorStoreManager）
-        # VectorStoreManager 封装了 Milvus / ChromaDB 的初始化、文档索引、向量检索，
-        # 后端由 VECTOR_BACKEND 决定（默认 milvus，不可用时回退 chroma）。
+        # VectorStoreManager 封装了 Milvus 的初始化、文档索引、向量检索，
+        # 本项目仅此一个后端。
         # init_vector_store() 会扫描 knowledge/ 目录，首次运行时自动构建索引。
         print("\n[2/3] 加载向量数据库...")
         self.vector_db = VectorStoreManager.init_vector_store()
@@ -443,7 +443,7 @@ class LangGraphRAGApp:
             ├── query_type == "simple" ──► query_rewrite（多轮检索反馈循环）
             │                                  │
             │                                  ▼
-            │                               retrieve（向量库 Milvus/Chroma 检索）
+            │                               retrieve（向量库 Milvus 检索）
             │                                  │
             │                                  ▼
             │                               grade_docs（LLM 评分相关性）
@@ -721,7 +721,7 @@ class LangGraphRAGApp:
         作用：对问候、感谢等非知识类问题，直接用 LLM 回答，不触发检索。
 
         原理：
-        闲聊问题不需要查找企业文档，调用 ChromaDB 检索纯属浪费。
+        闲聊问题不需要查找企业文档，调用 Milvus 检索纯属浪费。
         这里直接让 LLM 以"友好助手"的角色简短自然地回答。
 
         为什么不用检索？
@@ -909,10 +909,10 @@ class LangGraphRAGApp:
         """
         【节点：向量检索 — 简单问题分支，simple】
 
-        作用：用改写后的查询词去向量库（Milvus/Chroma 统一接口）做向量相似度检索，并对结果做权限过滤。
+        作用：用改写后的查询词去向量库（Milvus）做向量相似度检索，并对结果做权限过滤。
 
         原理：
-        每个改写查询词独立发送到向量库（Milvus/Chroma 统一接口）的 similarity_search_with_score()。
+        每个改写查询词独立发送到向量库（Milvus）的 similarity_search_with_score()。
         这个函数先对查询词做 embedding（转为向量），然后在向量空间中找最近的 top-k 个文档。
         返回的是 (Document, 距离分数) 元组，距离越小表示越相似。
 
@@ -1343,7 +1343,7 @@ class LangGraphRAGApp:
         """
         【辅助：向量检索 + 去重 + 权限过滤】
 
-        作用：对多个查询词分别做向量库（Milvus/Chroma）向量检索，合并结果后去重。
+        作用：对多个查询词分别做向量库（Milvus）向量检索，合并结果后去重。
 
         原理：
         1. 每个查询词独立调用 similarity_search_with_score() 取 top-k 个文档
@@ -1363,8 +1363,8 @@ class LangGraphRAGApp:
         all_results = []
         seen = set()  # 去重集合：记录已经见过的文档内容摘要
         for q in queries:
-            # 向量库相似度检索（Chroma/Milvus 统一接口）：返回 (Document, 距离分数) 的列表
-            # filter_role 透传给 Milvus 后端做 access_level 权限下推；Chroma 仍由下方兜底过滤
+            # 向量库相似度检索（Milvus 接口）：返回 (Document, 距离分数) 的列表
+            # filter_role 透传给 Milvus 后端做 access_level 权限下推
             results = self.vector_db.similarity_search_with_score(
                 q, k=RETRIEVE_TOP_K, filter_role=role,
                 user_id=self.user, tenant_id=self.tenant_id)
@@ -1563,7 +1563,7 @@ class LangGraphRAGApp:
 
         流程（5 步）：
         1. query_rewrite — 将子任务改写为 2-3 个搜索词
-        2. retrieve — 向量库（Milvus/Chroma）向量检索 + 权限过滤
+        2. retrieve — 向量库（Milvus）向量检索 + 权限过滤
         3. grade_docs — LLM 批量评分文档相关性
         4. MMR 重排序 — 过滤不相关 + 去冗余
         5. generate — 基于最终文档生成子回答

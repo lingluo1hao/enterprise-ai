@@ -121,10 +121,22 @@ def _table_to_markdown(rows: List[List[Any]]) -> Optional[str]:
     return "\n".join(lines)
 
 
+def _figures_dir(path: str) -> tuple:
+    """返回 PDF 图/表输出目录的 (绝对路径, 相对项目根目录的 URL 前缀)。"""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if not os.path.isdir(os.path.join(project_root, "knowledge")):
+        project_root = os.getcwd()
+    stem = os.path.splitext(os.path.basename(path))[0]
+    out_dir = os.path.join(project_root, "assets", "figures", stem)
+    rel_prefix = f"assets/figures/{stem}"
+    return out_dir, rel_prefix
+
+
 def _load_pdf(path: str) -> Optional[list]:
     """使用 PyMuPDF 提取 PDF 文本与表格。
 
     - 优先把页面内表格识别出来并转为 Markdown 表格；
+    - 表格区域同时渲染为图片保存，作为 LLM 可视化兜底；
     - 表格区域从普通文本中剔除，避免重复；
     - 按阅读顺序（y 坐标）把段落与表格拼接；
     - 每页返回一个 RawDoc，便于与 figure_paths 按页对应；
@@ -135,6 +147,15 @@ def _load_pdf(path: str) -> Optional[list]:
     except ImportError:
         return None
     try:
+        out_dir, rel_prefix = _figures_dir(path)
+        os.makedirs(out_dir, exist_ok=True)
+        # 清理旧版表格图（避免同名文件重建后残留过期图片）
+        for old in glob.glob(os.path.join(out_dir, "table_p*.png")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
         pages: List["object"] = []
         with fitz.open(path) as doc:
             for page_idx, page in enumerate(doc, 1):
@@ -148,7 +169,8 @@ def _load_pdf(path: str) -> Optional[list]:
 
                 table_markdowns = []   # (Rect, markdown_text)
                 table_bboxes = []
-                for tab in table_objs:
+                table_fig_paths: List[str] = []
+                for tidx, tab in enumerate(table_objs):
                     try:
                         rows = tab.extract()
                     except Exception:
@@ -160,6 +182,23 @@ def _load_pdf(path: str) -> Optional[list]:
                     table_bboxes.append(bbox)
                     # 用 [TABLE] 标签包裹，便于 chunker 识别为保护片段
                     table_markdowns.append((bbox, f"\n\n[TABLE]\n{md}\n[/TABLE]\n\n"))
+
+                    # 把表格区域渲染成图片，作为 Markdown 表格的可视化兜底
+                    try:
+                        scale = 2.0
+                        pad = 6
+                        clip = fitz.Rect(
+                            max(0, bbox.x0 - pad),
+                            max(0, bbox.y0 - pad),
+                            min(page.rect.width, bbox.x1 + pad),
+                            min(page.rect.height, bbox.y1 + pad),
+                        )
+                        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip)
+                        fname = f"table_p{page_idx:03d}_{tidx+1}.png"
+                        pix.save(os.path.join(out_dir, fname))
+                        table_fig_paths.append(f"{rel_prefix}/{fname}")
+                    except Exception as te:
+                        print(f"[ingest] 第 {page_idx} 页表格 {tidx+1} 渲染失败: {te}")
 
                 # 2) 提取非表格文本块
                 text_blocks = []
@@ -188,6 +227,7 @@ def _load_pdf(path: str) -> Optional[list]:
                     source=path,
                     file_name=os.path.basename(path),
                     page=page_idx,
+                    figure_paths=table_fig_paths,
                 ))
 
         if not pages:

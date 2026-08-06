@@ -9,8 +9,8 @@
    - 既能被 in-process 的 ReAct / Planning Agent 直接调用
    - 也能被 MCP Server 包装成标准 MCP Tool，供任意 MCP 客户端复用
 
- 本模块只依赖 Python 标准库（re / ast / operator），不引入 chromadb /
- ollama 等重依赖，因此可以被 MCP Server、单元测试、其它客户端安全导入。
+ 本模块只依赖 Python 标准库（re / ast / operator），不引入向量库 /
+ollama 等重依赖，因此可以被 MCP Server、单元测试、其它客户端安全导入。
 
  安全机制（与全息安全加固一致）
  ------------------------------

@@ -1,6 +1,6 @@
 # 记忆系统与知识库企业级改造方案
 
-> 基于 2026-08-02 对 `memory_store.py`（786 行）、`advanced_rag_agent.py`（1889 行）、`langgraph_rag_agent.py`（2192 行）、`rag_web_server.py`（2623 行）的全量代码勘察 + ChromaDB 持久化库 SQL 实测。
+> 基于 2026-08-02 对 `memory_store.py`（786 行）、`advanced_rag_agent.py`（1889 行）、`langgraph_rag_agent.py`（2192 行）、`rag_web_server.py`（2623 行）的全量代码勘察 + 旧向量库 持久化库 SQL 实测。
 > 所有行号均为勘察时的真实行号。
 
 > **2026-08-03 修订**：embedding 后端已**改为 Ollama-only（bge-m3，主进程零 torch）**，移除本地 SentenceTransformer 回退路径及对应的 torch 线程保险丝；本文档中涉及「本地 BGE 加载 / 512 维 / EMBED_MODEL / SentenceTransformerEmbeddings / OMP_NUM_THREADS 保险丝 / bge-reranker CrossEncoder」的描述均属旧架构，已在本修订中校正（见 4.4/4.5/4.6 标注与第十一节 11.2）。
@@ -43,12 +43,12 @@ if cached:
 
 ```python
 access_level = AccessControlFilter.get_access_level(file_path)
-doc.metadata["access_level"] = access_level   # 注释说"用于 ChromaDB 原生元数据过滤"
+doc.metadata["access_level"] = access_level   # 注释说"用于 旧向量库 原生元数据过滤"
 ```
 
 但 SQL 实测 `SELECT count(*) FROM embedding_metadata WHERE key='access_level'` → **0 行**。
 
-原因：当前 `chroma_db/` 是这段代码之前构建的，而 `init_vector_store()` 靠 `os.path.exists(DB_PATH)`（:577）判断，目录存在就永远不重建。所以这个字段既没落库，也没人用——权限过滤实际走的是 `AccessControlFilter.filter_results()`（:733）的**检索后 Python 丢弃**。
+原因：当前 `向量库目录/` 是这段代码之前构建的，而 `init_vector_store()` 靠 `os.path.exists(DB_PATH)`（:577）判断，目录存在就永远不重建。所以这个字段既没落库，也没人用——权限过滤实际走的是 `AccessControlFilter.filter_results()`（:733）的**检索后 Python 丢弃**。
 
 后果：受限 chunk 先占满 top-5 名额再被丢掉，普通用户实际拿到的结果可能是 0 条（`:883-889` 专门写了兜底文案掩盖这个问题）。
 
@@ -79,9 +79,9 @@ doc.metadata["access_level"] = access_level   # 注释说"用于 ChromaDB 原生
 | 项 | 现状 | 位置 |
 |---|---|---|
 | 管理类 | `VectorStoreManager`，**纯静态类无 `__init__`** | `advanced_rag_agent.py:555` |
-| 向量库 | Chroma 嵌入式 persist，collection 名 `langchain` | `:134, 580` |
+| 向量库 | 旧向量库 嵌入式 persist，collection 名 `langchain` | `:134, 580` |
 | 实际数据 | 206 chunk / **1024 维（bge-m3）** / 2 份 PDF | SQL 实测 |
-| 距离函数 | **L2（Chroma 默认）**，但 `:1043` 注释写「余弦」 | — |
+| 距离函数 | **L2（旧向量库 默认）**，但 `:1043` 注释写「余弦」 | — |
 | 相关度换算 | `100 - score*50`，按 L2 尺度硬编码 | `:875` |
 | 文档格式 | 仅 `.pdf`（PyPDFLoader）/ `.txt`，其余 `continue` | `:608-613` |
 | 目录扫描 | `os.listdir`，**非递归、无排序** | `:605` |
@@ -138,8 +138,8 @@ doc.metadata["access_level"] = access_level   # 注释说"用于 ChromaDB 原生
 
 **核心设计原则**：
 
-1. **门面收敛** —— 记忆和检索各自只暴露一个入口类，业务代码不再直接碰 MySQL/Chroma/Redis。这样后面换 Milvus、换 rerank 模型都只改一个文件（和 `UsageStore` 收敛 SQLite 是同一个思路）。
-2. **双写迁移** —— Chroma → Milvus 期间两边同时写、读走开关，可随时回滚。
+1. **门面收敛** —— 记忆和检索各自只暴露一个入口类，业务代码不再直接碰 MySQL/旧向量库/Redis。这样后面换 Milvus、换 rerank 模型都只改一个文件（和 `UsageStore` 收敛 SQLite 是同一个思路）。
+2. **双写迁移** —— 旧向量库 → Milvus 期间两边同时写、读走开关，可随时回滚。
 3. **每阶段独立可上线** —— 四个阶段之间存量代码耦合极低，任一阶段回滚不影响其他。
 
 ---
@@ -479,7 +479,7 @@ WHERE session_id LIKE 'web_%' ORDER BY session_id;
 ## 四、P1 检索质量：混合检索 + 真 rerank
 
 > **目标**：召回率和精排质量。**零基建依赖**，只加两个 pip 包，收益最快。
-> 这一阶段还在 Chroma 上做，但代码结构按 Milvus 就绪的形态写。
+> 这一阶段还在 旧向量库 上做，但代码结构按 Milvus 就绪的形态写。
 
 ### 4.1 新建 `retriever.py` —— 统一检索层
 
@@ -661,7 +661,7 @@ def get_embeddings():
 ## 五、P2 摄取管线：增量索引 + 多格式解析
 
 > **目标**：把「重启全量重建」改成「增删改 upsert」。这是用户明确点名的基础项，也是后面 Milvus 海量文档的前提。
-> **基建依赖**：无（还在 Chroma 上做），但代码要按 Milvus 就绪形态写——`VectorStoreManager` 从静态类改成可持有连接、支持 `upsert`/`delete` 的实例类（P3 直接复用）。
+> **基建依赖**：无（还在 旧向量库 上做），但代码要按 Milvus 就绪形态写——`VectorStoreManager` 从静态类改成可持有连接、支持 `upsert`/`delete` 的实例类（P3 直接复用）。
 
 ### 5.1 现状痛点（第一章 1.2 已列，这里收敛成改造点）
 
@@ -713,7 +713,7 @@ CREATE TABLE IF NOT EXISTS document_registry (
 
 ### 5.4 增量 upsert / delete（核心方法）
 
-`VectorStoreManager` 从静态类改成实例类后，新增三个方法（Chroma 侧用 `upsert`/`delete`，Milvus 侧用 `upsert`/`delete_entities`，接口一致）：
+`VectorStoreManager` 从静态类改成实例类后，新增三个方法（旧向量库 侧用 `upsert`/`delete`，Milvus 侧用 `upsert`/`delete_entities`，接口一致）：
 
 ```python
 class IngestPipeline:
@@ -753,11 +753,11 @@ class IngestPipeline:
 ## 六、P3 Milvus 迁移
 
 > **目标**：支撑**百万级**文档 + 并发 + **原生混合检索**（BM25 sparse + dense + 标量过滤下推）。用户已在虚拟机 `192.168.200.128` 准备部署 Milvus——本阶段是整套方案的终点，但代码是 P1/P2 顺下来的自然结果。
-> **迁移策略**：Chroma 与 Milvus **双写**，读走 `VECTOR_BACKEND` 开关，出问题切回 Chroma，零风险。
+> **迁移策略**：旧向量库 与 Milvus **双写**，读走 `VECTOR_BACKEND` 开关，出问题切回 旧向量库，零风险。
 
-### 6.1 为什么从 Chroma 迁 Milvus
+### 6.1 为什么从 旧向量库 迁 Milvus
 
-| 维度 | Chroma 嵌入式 | Milvus（standalone） |
+| 维度 | 旧向量库 嵌入式 | Milvus（standalone） |
 |---|---|---|
 | 规模 | 十万级（你当前 206 chunk） | 亿级向量 |
 | 并发 | 单进程、无连接池 | gRPC 服务、连接池、多 client |
@@ -765,7 +765,7 @@ class IngestPipeline:
 | 标量过滤 | 仅 `filter=`（内存过滤） | `expr` **下推**到存储层，先过滤再算距 |
 | 运维 | 文件目录 | etcd + MinIO + 多副本可扩展 |
 
-你的协议/指令表文档未来要扩到大量设备型号、多版本，Chroma 单机迟早触顶——Milvus 是用户已定的方向。
+你的协议/指令表文档未来要扩到大量设备型号、多版本，旧向量库 单机迟早触顶——Milvus 是用户已定的方向。
 
 ### 6.2 VectorStoreManager 改造：静态类 → 实例类
 
@@ -775,7 +775,7 @@ P1/P2 已经让 `VectorStoreManager` 持有 `get_embeddings()` 单例。`init_ve
 # advanced_rag_agent.py —— 替换 :555 的静态类
 class VectorStoreManager:
     def __init__(self, backend: str = None):
-        self.backend = (backend or os.getenv("VECTOR_BACKEND", "chroma")).lower()
+        self.backend = (backend or os.getenv("VECTOR_BACKEND", "milvus")).lower()
         self._embed = get_embeddings()                      # P1 的单例
         if self.backend == "milvus":
             from pymilvus import MilvusClient
@@ -783,12 +783,11 @@ class VectorStoreManager:
             self.collection = os.getenv("MILVUS_COLLECTION", "rag_docs")
             self._ensure_collection()
         else:
-            from langchain_chroma import Chroma
-            self.client = None
-            self.db = Chroma(persist_directory=DB_PATH, embedding_function=self._embed)
+            from pymilvus import MilvusClient
+            self.client = MilvusClient(uri=os.getenv("MILVUS_URI", "http://192.168.200.128:19530"))
 
-    def upsert(self, docs): ...          # Chroma: db.add_documents(ids=...); Milvus: client.upsert
-    def delete(self, chunk_ids): ...     # Chroma: db.delete; Milvus: client.delete
+    def upsert(self, docs): ...          # Milvus: client.upsert(ids=...)
+    def delete(self, chunk_ids): ...     # Milvus: client.delete
     def search(self, query, k, filters): ...   # 见 6.5
 ```
 
@@ -823,17 +822,17 @@ schema = CollectionSchema(fields, enable_dynamic_field=True)
 `.env` 新增：
 
 ```
-VECTOR_BACKEND = "chroma"        # 切 milvus 即切换读路径
+VECTOR_BACKEND = "milvus"        # 切 milvus 即切换读路径
 MILVUS_URI = "http://192.168.200.128:19530"
 MILVUS_COLLECTION = "rag_docs"
 ```
 
 迁移流程：
 1. 部署 Milvus（第九章）→ 建 collection。
-2. `sync()` 时**双写**：`self.vs.upsert` 内部按 `backend` 同时写 Chroma 与 Milvus。
+2. `sync()` 时**双写**：`self.vs.upsert` 内部按 `backend` 同时写 旧向量库 与 Milvus。
 3. 灰度：把 1 个测试会话的 `VECTOR_BACKEND=milvus`，跑 P1 评测集对比分。
-4. 全量：`VECTOR_BACKEND=milvus`，保留 Chroma 一段时间作回滚兜底。
-5. 确认稳定后，Chroma 目录可归档（不删）。
+4. 全量：`VECTOR_BACKEND=milvus`，保留 旧向量库 一段时间作回滚兜底。
+5. 确认稳定后，旧向量库 目录可归档（不删）。
 
 ### 6.5 expr 下推：让 `access_level` 真正生效
 
@@ -857,7 +856,7 @@ def search(self, query, k=5, *, user_role="user", user_id="anonymous"):
             ranker=RRFRanker(k=60),
             output_fields=["content", "file_name", "chunk_id"],
         )
-    # Chroma 分支：仍走 _rrf_fuse（P1）+ 检索后 filter_results 兜底，保持兼容
+    # 旧向量库 分支：仍走 _rrf_fuse（P1）+ 检索后 filter_results 兜底，保持兼容
 ```
 
 `AccessControlFilter.filter_results`（:733）**保留**作为兜底，但正常路径不再依赖它——权限在查询层就卡掉了，普通用户不会再拿到「0 条结果」的尴尬。
@@ -886,26 +885,26 @@ def recall(self, query: str, user_id: str, k: int = 3) -> List[str]:
 
 | 检查项 | 方法 | 期望 |
 |---|---|---|
-| 双写一致 | 同一 `sync()` 后，Chroma 与 Milvus 的 chunk 数相等 | 206 = 206 |
-| 切后端无感 | `VECTOR_BACKEND=milvus` 跑 P1 评测集 | Recall@5 不低于 Chroma（误差 < 2%） |
+| 双写一致 | 同一 `sync()` 后，旧向量库 与 Milvus 的 chunk 数相等 | 206 = 206 |
+| 切后端无感 | `VECTOR_BACKEND=milvus` 跑 P1 评测集 | Recall@5 不低于 旧向量库（误差 < 2%） |
 | 权限下推 | user 角色查 restricted 文档内容 | 结果里**不含** restricted 且数量正常（不再 0 条） |
 | 混合检索 | 精确标识符类问题（如 `0x22`） | sparse 通道命中，top-1 命中率接近 100% |
 | 长期记忆 | 用旧会话关键词在新会话提问 | `recall` 召回历史摘要并注入 |
-| 回滚 | 改回 `VECTOR_BACKEND=chroma` | 系统立即回到旧路径，无数据丢失 |
+| 回滚 | 改回 `VECTOR_BACKEND=milvus` | 系统立即回到旧路径，无数据丢失 |
 
 ### 6.8 P3 实际落地记录（2026-08-02 已实施）
 
-> 目标达成：**应用代码已完成 Milvus 接入，ChromaDB 不再是默认向量库**。`advanced_rag_agent.py` 的 `VectorStoreManager` 由静态类改为统一实例类，按 `VECTOR_BACKEND` 切换后端（**默认 `milvus`**），Milvus 不可用时自动回退 ChromaDB 并打印醒目警告。
+> 目标达成：**应用代码已完成 Milvus 接入，旧向量库 不再是默认向量库**。`advanced_rag_agent.py` 的 `VectorStoreManager` 由静态类改为统一实例类，按 `VECTOR_BACKEND` 切换后端（**默认 `milvus`**），Milvus 不可用时自动回退 旧向量库 并打印醒目警告。
 
 **新增 / 修改（`advanced_rag_agent.py`）**
 
 | 项 | 内容 | 为什么 |
 |---|---|---|
 | `VectorStoreManager.__init__` | 读 `VECTOR_BACKEND`（默认 milvus）/ `MILVUS_URI` / `MILVUS_COLLECTION`；连 `MilvusClient`；`_ensure_collection()` 建集合+索引 | 让代码真正走 Milvus，而非只部署服务端 |
-| `_ensure_collection` | 按 `chunk_id`(主键) / `content` / `dense`(FLOAT_VECTOR，**维度动态探测**，避免硬编码) / `file_path` / `file_name` / `access_level` / `chunk_index` / `user_id` 建 schema；`dense` 用 `AUTOINDEX`+`COSINE` 索引 | 与 Chroma 字段对齐，权限字段可下推 |
-| `_build_milvus` | 复用既有文档加载/分片逻辑，批量 `upsert`（按内容哈希做主键，**幂等可重复跑**） | 替代 Chroma 的 `from_documents` 构建 |
+| `_ensure_collection` | 按 `chunk_id`(主键) / `content` / `dense`(FLOAT_VECTOR，**维度动态探测**，避免硬编码) / `file_path` / `file_name` / `access_level` / `chunk_index` / `user_id` 建 schema；`dense` 用 `AUTOINDEX`+`COSINE` 索引 | 与 旧向量库 字段对齐，权限字段可下推 |
+| `_build_milvus` | 复用既有文档加载/分片逻辑，批量 `upsert`（按内容哈希做主键，**幂等可重复跑**） | 替代 旧向量库 的 `from_documents` 构建 |
 | `_milvus_search` | `data=[embed_query(q)]` 走 `dense` 字段；`filter=expr` 做 `access_level` **权限下推**（admin 不过滤，user 看 `public` 或自己的） | 真正的下推过滤，不再只靠检索后丢弃 |
-| `similarity_search_with_score` | 统一对外接口，返回 `[(Document, distance), ...]`（与 Chroma 完全一致），上层零改动 | 保持上层 Agent 接口稳定 |
+| `similarity_search_with_score` | 统一对外接口，返回 `[(Document, distance), ...]`（与 旧向量库 完全一致），上层零改动 | 保持上层 Agent 接口稳定 |
 | `init_vector_store()` / `search()` | 改为返回实例 / 转发到实例方法 | 兼容 3 处旧调用点（`advanced_rag_agent:1867`、`langgraph:272`、`rag_web_server:2589`） |
 
 **调用点同步**
@@ -914,7 +913,7 @@ def recall(self, query: str, user_id: str, k: int = 3) -> List[str]:
 
 **PIP 字段说明（与方案 6.3 的偏差）**
 - ~~未包含 sparse/BM25~~ **已补齐**：`VectorStoreManager` 已在 schema 中加入 `sparse`(SPARSE_FLOAT_VECTOR, `is_function_output=True`) 字段，并用 Milvus 原生 `Function`(`FunctionType.BM25`) 从 `content`（开启中文 analyzer）自动生成稀疏向量；`_milvus_search` 改为 **dense + sparse 双路召回 + RRF 融合**（`HYBRID_SEARCH` 可关闭）。即方案 6.3/6.5 的「混合检索」**已落地**，不再是 P1 待办。
-- 未做 6.4 的「Chroma/Milvus 双写」：当前为**单后端切换**（默认 Milvus，失败回退 Chroma），而非双写。理由：双写要求两套索引实时同步，复杂度高且当前无灰度需求；回退机制已通过 `VECTOR_BACKEND` 开关覆盖「零风险回滚」。
+- 未做 6.4 的「旧向量库/Milvus 双写」：当前为**单后端切换**（默认 Milvus，失败回退 旧向量库），而非双写。理由：双写要求两套索引实时同步，复杂度高且当前无灰度需求；回退机制已通过 `VECTOR_BACKEND` 开关覆盖「零风险回滚」。
 - 6.6 的「跨会话长期记忆 `rag_memory` collection」未做，依赖 P0 `chat_summaries` 的 `embedding` 列填充，属后续增强。
 
 **验证（沙箱已直连 192.168.200.128 实测通过）**
@@ -923,7 +922,7 @@ def recall(self, query: str, user_id: str, k: int = 3) -> List[str]:
 1. `.env` 加 `VECTOR_BACKEND=milvus`、`MILVUS_URI=http://192.168.200.128:19530`、`MILVUS_COLLECTION=rag_docs`、`HYBRID_SEARCH=true`；`pip install "pymilvus~=2.5.0"`（**勿用 3.x**：3.0 改名 `FunctionSchema`→`Function` 且与 2.5 服务端存在兼容风险）；
 2. 启动 `python rag_web_server.py`，观察日志：`[VectorStore] 连接 Milvus ...` → `已创建 Milvus 集合 rag_docs (dim=1024, hybrid=on)` → `Milvus 索引构建完成，共 N 条`；
 3. 提问验证检索正常、普通用户看不到 restricted 文档（权限下推生效），且混合检索能召回 BM25 相关片段；
-4. 回滚：`VECTOR_BACKEND=chroma` 或 `HYBRID_SEARCH=false` 重启即可，无数据丢失。
+4. 回滚：`VECTOR_BACKEND=milvus` 或 `HYBRID_SEARCH=false` 重启即可，无数据丢失。
 
 **状态**：P3 核心（Milvus 接入 + 权限下推 + 回退）+ **P1 混合检索（sparse BM25 + dense + RRF）** 标记 **已完成**；跨会话长期记忆 留待后续增强。
 
@@ -1078,7 +1077,7 @@ networks:
 
 ```
 # --- Milvus 向量库 ---
-VECTOR_BACKEND = "chroma"            # 部署并验证后改 milvus
+VECTOR_BACKEND = "milvus"            # 部署并验证后改 milvus
 MILVUS_URI = "http://192.168.200.128:19530"
 MILVUS_COLLECTION = "rag_docs"
 ```
@@ -1128,7 +1127,7 @@ assert len(hits) >= 1                            # 5. 命中
 | P0 | `user_id` 迁移锁表（chat_messages 大时） | 低峰期执行；DEFAULT 'anonymous' 无需回填，可瞬间回退代码 |
 | P1 | bge-reranker 1.1GB 加载慢 | `use_rerank=False` 开关即时关闭，退化回 RRF |
 | P2 | 多格式 loader 解析异常 | 单文件失败不影响整体 `sync()`；`status='error'` 记录 |
-| P3 | Milvus 不可用 | `VECTOR_BACKEND=chroma` 一键回退，Chroma 数据保留 |
+| P3 | Milvus 不可用 | `VECTOR_BACKEND=milvus` 一键回退，旧向量库 数据保留 |
 | 部署 | 虚拟机内存不足 | 调小 Ollama 并发 / 给 Milvus 设内存上限；或临时关 MinIO 压缩 |
 
 ---

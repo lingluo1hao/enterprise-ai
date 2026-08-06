@@ -9,7 +9,7 @@
   - 自动连接 Redis 缓存加速重复问题
   - 后端：LangGraph 引擎（默认）+ LLM 网关多模型路由
     （qwen2:7b 生成/规划、qwen2.5:1.5b 打分/改写/压缩）
-  - 向量检索：Milvus 默认 + Chroma 兜底；Embedding 默认 Ollama bge-m3
+  - 向量检索：Milvus（唯一向量后端）；Embedding 默认 Ollama bge-m3
 
   启动方式：
     python rag_web_server.py              # 默认端口 8080
@@ -40,7 +40,7 @@ from werkzeug.security import safe_join
 # ====== 导入核心模块 ======
 from audit_logger import get_audit_logger
 from advanced_rag_agent import (
-    OLLAMA_URL, MODEL_NAME, DB_PATH,
+    OLLAMA_URL, MODEL_NAME,
     ROLE_ADMIN, ROLE_SUPER_ADMIN, DEFAULT_ROLE, DOC_FOLDER,
     AccessControlFilter, CacheManager,
     RAGOrchestrator,
@@ -286,7 +286,7 @@ def health():
     return jsonify({
         "status": "ok",
         "llm": MODEL_NAME,
-        "db_path": DB_PATH,
+        "vector_db": "milvus",
         "role": orchestrator.user_role if orchestrator else "unknown",
     })
 
@@ -5010,8 +5010,7 @@ def init_system():
     # 2. 向量数据库（多 worker 安全：Redis 锁防并发重建 Milvus 集合）
     try:
         vector_db = _init_vector_store_locked()
-        print(f"  ✓ 向量数据库: VECTOR_BACKEND={os.getenv('VECTOR_BACKEND', 'milvus')}"
-              f"（Chroma 兜底路径 {DB_PATH}）")
+        print(f"  ✓ 向量数据库: Milvus（唯一后端，URI={os.getenv('MILVUS_URI', 'http://192.168.200.128:19530')}）")
     except Exception as e:
         print(f"  ✗ 向量数据库初始化失败: {e}")
         sys.exit(1)

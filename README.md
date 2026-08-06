@@ -20,11 +20,11 @@
 
 本项目是一个面向企业文档的智能问答系统，能够对 PDF 文档进行向量化存储，并通过自然语言提问快速返回准确答案。核心已从 LangChain 迁移至 **LangGraph StateGraph**，实现了精细条件分支、多轮检索反馈循环、多智能体协作和多轮对话。
 
-后端使用本地部署的 **Ollama** 大模型进行推理，向量库默认使用虚拟机上的 **Milvus** standalone（ChromaDB 作为不可用时的自动回退），支持 **Redis 两级智能缓存**加速重复问题，并通过 **MySQL 多层记忆**实现对话历史持久化和任务断点重续。系统同时提供了命令行交互界面和 Web 图形界面。
+后端使用本地部署的 **Ollama** 大模型进行推理，向量库使用虚拟机上的 **Milvus** standalone（唯一向量后端），支持 **Redis 两级智能缓存**加速重复问题，并通过 **MySQL 多层记忆**实现对话历史持久化和任务断点重续。系统同时提供了命令行交互界面和 Web 图形界面。
 
 ## 核心特性
 
-- **真实环境，无 Mock**：直接连接 Milvus 向量库（ChromaDB 兜底）与 Ollama 大模型。
+- **真实环境，无 Mock**：直接连接 Milvus 向量库与 Ollama 大模型。
 - **企业级 LLM 网关（LLM Gateway）**：所有 LLM 调用经统一网关出口，支持多模型路由（小模型接管分类/打分/改写/压缩等高频任务，大模型负责生成/规划）、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载（改 yaml 不重启）。业务代码 16 个调用点零改动接入，可一键回退单模型直连。
 - **LangGraph 状态机驱动**：显式 StateGraph 替代手写 ReAct 循环，13 个节点 + 条件边精细路由。
 - **三路智能分支**：简单查询走「多轮检索」、复杂问题走「多智能体协作」、闲聊直接回答。
@@ -74,12 +74,11 @@ enterprise-ai/
 ├── scripts/               # 独立脚本：bench_routing_speed / mcp_client_example / test_llm_gateway*
 ├── tests/                 # 测试套件：test_ingest / test_llm_gateway*
 ├── assets/                # 静态资源：screenshots/（演示动画）+ proposal_images|proposal_video（提案素材）
-├── chroma_db/             # ChromaDB 向量数据库持久化目录
 ├── .env                    # 环境变量（MySQL/Redis/Ollama 密码等敏感配置，不提交 Git）
 ├── .env.example            # 环境变量模板（可提交 Git，部署时复制为 .env）
 ├── deploy/                 # 【部署】docker-compose 编排（MySQL / Milvus standalone 等）
 ├── docs/reports/UPGRADE_PLAN_MEMORY_KB.md # 【记忆系统升级】分阶段改造方案（含 P0 落地记录与验证）
-├── .gitignore              # Git 排除规则（含 .env / chroma_db/ / logs/）
+├── .gitignore              # Git 排除规则（含 .env / logs/）
 └── README.md               # 本文件
 ```
 
@@ -98,9 +97,8 @@ enterprise-ai/
 | `ingest/` | **百万级 RAG 数据面引擎**（改造点落地）。`pipeline.IngestPipeline` 编排「扫 knowledge/（递归 `os.walk`，含子目录）→ 指纹增量(mtime+size+md5) → 多格式 loader(txt/md/pdf/html/docx/xlsx/pptx) → 结构切分 → 批量 embedding(并发池+重试) → 幂等 upsert」；`store.MilvusStoreBackend` 复用现有 Milvus 客户端；`cli` 提供 `ingest/status/delete/rebuild` 子命令。支持增量（仅处理变更文件）、`--force` 全量、`--dry-run` 预检。**单文件上传不再误删其他文件**（显式传入 `files` 时 `removed=[]`）。`loaders._load_pdf` 用 PyMuPDF 抽取表格→Markdown `[TABLE]...[/TABLE]`、抽取插图并在 `chunk.py` 插入 `[[FIG:...]]` 占位符；缺 PyMuPDF 时优雅降级为纯文本。测试见 `tests/test_ingest.py`（零外部依赖，`python tests/test_ingest.py` 直接跑）。 |
 | `config/llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
 | `config/init_db.sql` | MySQL 建库建表脚本。`admin_users` 表含 `role`（admin/user/super_admin）与 `tenant_id`（多租户隔离）字段；已预置 `admin`(default)、`reader`/`viewer`(user,default)、`jm_admin`(admin,jm)、`yh_admin`(admin,yh)、`superadmin`(super_admin,default) 五类演示账号。 |
-| `knowledge/` | 存放企业知识库 PDF 文档（ingestion 数据源），首次运行 / `ingest` 时自动构建向量索引（默认写入 Milvus，ChromaDB 兜底）。 |
+| `knowledge/` | 存放企业知识库 PDF 文档（ingestion 数据源），首次运行 / `ingest` 时自动构建向量索引（写入 Milvus）。 |
 | `docs/` | 文档中心：`guides/`（MCP / LLM 网关使用说明）+ `reports/`（RAG 数据面改造、P0 修复、记忆系统升级等方案与分析报告）。 |
-| `chroma_db/` | ChromaDB 持久化目录（仅在 `VECTOR_BACKEND=chroma` 或 Milvus 不可用时使用），保存文档切片与向量。 |
 
 ## 技术架构
 
@@ -159,7 +157,7 @@ LLM Gateway（llm_gateway.yaml：多模型路由 / 限流 / 熔断 / 连接池 /
     └─ deepseek-chat / qwen-plus    ← 云端备选，主模型挂了顶上
     ▼
 Ollama（192.168.200.128:11434 / qwen2:7b 等）
-Milvus（192.168.200.128:19530，默认向量库；ChromaDB 兜底）
+Milvus（192.168.200.128:19530，唯一向量库）
 Redis（192.168.200.128:6379）
 MySQL（192.168.200.128:3306 / rag_agent）
 ```
@@ -171,7 +169,7 @@ MySQL（192.168.200.128:3306 / rag_agent）
 | `load_history` | 加载当前会话的对话历史 |
 | `classify` | 问题分类（simple/complex/chitchat）+ 上下文消解（追问补全） |
 | `query_rewrite` | 查询改写：第 1 轮正常改写，后续轮换角度改写 |
-| `retrieve` | 向量库检索（Milvus/Chroma）+ 权限过滤 |
+| `retrieve` | 向量库检索（Milvus）+ 权限过滤 |
 | `grade_docs` | LLM 批量评分文档相关性 |
 | `rerank_mmr` | MMR 重排序（过滤不相关 + 去冗余） |
 | `generate_simple` | 基于检索文档生成答案 |
@@ -209,7 +207,7 @@ source venv/bin/activate
 
 ```bash
 pip install langchain langchain-community langgraph \
-            chromadb "pymilvus~=2.5.0" redis pymysql dbutils \
+            "pymilvus~=2.5.0" redis pymysql dbutils \
             flask flask-cors \
             pypdf pymupdf sentence-transformers \
             fastmcp mcp \
@@ -226,8 +224,7 @@ pip install langchain langchain-community langgraph \
 |------|------|------|--------|
 | 核心 RAG | `langchain` / `langchain-community` | 向量检索、文档加载器等 LangChain 基础组件 | 必需 |
 | 核心 RAG | `langgraph` | LangGraph 状态图引擎（核心对话 / 多智能体流程） | 必需 |
-| 向量库 | `pymilvus` | **默认向量后端 Milvus**（standalone，192.168.200.128:19530）的连接客户端 | 必需（默认后端） |
-| 向量库 | `chromadb` | 本地向量库持久化，**Milvus 不可用时的自动回退后端** | 必需（兜底） |
+| 向量库 | `pymilvus` | **唯一向量后端 Milvus**（standalone，192.168.200.128:19530）的连接客户端 | 必需 |
 | 缓存 | `redis` + `dbutils` | Redis 连接池与两级问答缓存 | 必需（开启缓存时） |
 | 持久化 | `pymysql` + `dbutils` | MySQL 连接池（对话历史 / 断点 / 任务队列） | 必需（开启断点重续时） |
 | Web | `flask` + `flask-cors` | Web 服务与跨域支持 | 必需（使用 Web 时） |
@@ -250,7 +247,7 @@ P1 混合检索（sparse BM25 + dense 向量 + RRF 融合）**已在代码中落
 pip install unstructured
 ```
 
-**关于 Milvus（`pymilvus`）**：向量库服务端 **Milvus standalone 已在虚拟机 `192.168.200.128` 部署完成**（端口 19530，编排见 `deploy/docker-compose-milvus.yaml`，已端到端验证可用）。应用代码已在 P3 改造中完成接入并**默认 `milvus`**；`VectorStoreManager` 统一封装 Milvus / ChromaDB 两种后端，由 `VECTOR_BACKEND` 切换，Milvus 不可用时自动回退 ChromaDB 并打印警告。`pymilvus` 已是**必需依赖**，版本须锁定 **2.5.x**（见上方说明）。混合检索（Hybrid Search）默认开启，可用 `HYBRID_SEARCH=false` 关闭。验收与回滚说明见 `UPGRADE_PLAN_MEMORY_KB.md` §6。
+**关于 Milvus（`pymilvus`）**：向量库服务端 **Milvus standalone 已在虚拟机 `192.168.200.128` 部署完成**（端口 19530，编排见 `deploy/docker-compose-milvus.yaml`，已端到端验证可用）。应用代码已接入并**仅使用 Milvus 单一后端**（`VectorStoreManager` 不再保留任何本地兜底/回滚）；Milvus 不可达时启动直接失败并报错。`pymilvus` 已是**必需依赖**，版本须锁定 **2.5.x**（见上方说明）。混合检索（Hybrid Search）默认开启，可用 `HYBRID_SEARCH=false` 关闭。
 
 ### 3. 搭建 Ollama 服务
 
@@ -357,7 +354,7 @@ mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 -e "SHOW DATABASES;"
 
 ### 6. 准备文档
 
-将企业 PDF 文档放入 `knowledge/` 目录下。首次运行 / 执行 `python -m ingest.cli ingest` 时会自动读取并构建向量索引（默认写入 Milvus，ChromaDB 兜底）。
+将企业 PDF 文档放入 `knowledge/` 目录下。首次运行 / 执行 `python -m ingest.cli ingest` 时会自动读取并构建向量索引（写入 Milvus）。
 
 > **PDF 图示问答（通用图抽取）**：若安装了 `pymupdf` + `numpy` + `scipy`，ingestion 阶段会用 **PyMuPDF 渲染整页像素 → 文字块遮罩减法得到图形墨迹 → scipy 连通分量逐块判定**（面积 / 宽高比 / 墨迹密度 / 长横线计数排除表格），把每页里**真正的图**（流程图、架构图等，与语言/caption 无关）裁剪为 `assets/figures/<文件stem>/fig_p<NNN>_<k>.png`，向量库记录图路径。用户问"通信流程图""架构图"等时，召回页面后服务端确定性追加对应 PNG、前端渲染该真图；任一依赖缺失则优雅降级（仅文字召回，图卡片不可见）。
 
@@ -394,8 +391,7 @@ REDIS_DB="0"
 # Token 有效期（秒），默认 7 天；过期后需重新登录
 AUTH_TOKEN_TTL="604800"
 
-# --- 向量库后端（P3：Milvus / ChromaDB 双后端）---
-VECTOR_BACKEND="milvus"                       # milvus=默认向量库；chroma=本地兜底/回滚
+# --- 向量库后端（唯一后端：Milvus）---
 MILVUS_URI="http://192.168.200.128:19530"     # Milvus standalone 地址（与 deploy 编排一致）
 MILVUS_COLLECTION="rag_docs"                 # 文档向量集合名
 HYBRID_SEARCH="true"                          # 混合检索：sparse BM25 + dense 向量 + RRF 融合；false=仅 dense
@@ -414,7 +410,7 @@ OLLAMA_EMBED_MODEL="bge-m3"                      # 仅 ollama 时生效；VM 执
 
 ### 方式一：Web 界面（推荐，需账号密码登录）
 
-> 注意：在 Windows 上请使用 PowerShell 或 CMD 启动（Milvus 走 HTTP/gRPC 与 Shell 无关；若回退到 ChromaDB 本地模式，Git Bash 下其底层依赖可能异常退出）。
+> 注意：在 Windows 上请使用 PowerShell 或 CMD 启动（Milvus 走 HTTP/gRPC 与 Shell 无关）。
 
 ```bash
 # 默认使用 LangGraph 引擎（断点恢复可用），默认端口 8080
@@ -542,7 +538,7 @@ python mcp_client_example.py
    返回: 请对技能 `calculator` 做一次上线前安全体检……
 ```
 
-> 演示环境中 `mcp_server.py` 未挂载 ChromaDB / Ollama，故 `doc_search` 仅完成安全守门；在真实运行环境（已装 chromadb + ollama）中，按 `mcp_server.py` 内标注的接缝把 `DocSearchSkill(llm, vector_db, fast_mode=True)` 实例接上即可返回真实文档片段。
+> 演示环境中 `mcp_server.py` 未挂载 Ollama，故 `doc_search` 仅完成安全守门；在真实运行环境（已装 ollama）中，按 `mcp_server.py` 内标注的接缝把 `DocSearchSkill(llm, vector_db, fast_mode=True)` 实例接上即可返回真实文档片段。
 
 ### 别的 AI 客户端如何复用你的工具
 
@@ -765,7 +761,7 @@ DOC_ACCESS_RULES = {
 | 普通用户（user） | 仅公开文档（如 Jimi IoT 个人定位终端通讯协议） | 聊天页 `/` |
 | 特权用户（admin） | 全部文档（含 JM-S509 指令表） | 管理后台 `/admin` → 在线问答 |
 
-权限过滤：Milvus 后端在检索时通过 `expr` **下推** `access_level`（先过滤再算距离），ChromaDB 后端则在检索后过滤；两种后端最终都再由 `AccessControlFilter` 兜底。普通用户检索到受限文档片段时会被自动丢弃。同时 Redis 缓存也按角色隔离，避免 admin 的完整答案通过缓存泄漏给普通用户。
+权限过滤：Milvus 在检索时通过 `expr` **下推** `access_level`（先过滤再算距离），最终再由 `AccessControlFilter` 兜底。普通用户检索到受限文档片段时会被自动丢弃。同时 Redis 缓存也按角色隔离，避免 admin 的完整答案通过缓存泄漏给普通用户。
 
 ## 缓存机制
 
@@ -852,12 +848,11 @@ DOC_ACCESS_RULES = {
 ### 1. pip install 报错 / 依赖冲突
 
 - 确保已激活正确的虚拟环境（`conda activate pythonspace` 或 `venv\Scripts\activate`）
-- 尝试逐个安装：先装 `langchain`，再装 `langgraph`，再装 `chromadb`
-- Windows 上若 `chromadb` 装不上，需先安装 Visual C++ Redistributable
+- 尝试逐个安装：先装 `langchain`，再装 `langgraph`，再装 `pymilvus`
 
 ### 2. 启动 Web 服务后无法访问
 
-- **在 Windows 上必须用 PowerShell 或 CMD 启动**（回退到 ChromaDB 本地模式时，Git Bash 中其底层依赖会异常退出；Milvus 走网络不受此限）
+- **在 Windows 上必须用 PowerShell 或 CMD 启动**（Milvus 走网络不受 Shell 限制）
 - 确认端口未被占用：`netstat -ano | findstr :8080`
 
 ### 3. 连接 Ollama 失败
@@ -883,7 +878,7 @@ DOC_ACCESS_RULES = {
 - MySQL 不可用不影响核心问答功能，系统会自动降级为内存模式
 - 断点恢复仅在 LangGraph 引擎模式下可用（`python rag_web_server.py` 默认即为 LangGraph）
 
-### 6. 向量库未构建（Milvus / ChromaDB）
+### 6. 向量库未构建（Milvus）
 
 - 首次运行 / 执行 `python -m ingest.cli ingest` 会自动扫描 `knowledge/` 目录并构建索引，耐心等待即可
 - 如果 `knowledge/` 为空，系统会提示找不到文档
@@ -900,7 +895,7 @@ DOC_ACCESS_RULES = {
 
 - 若仍遇进程崩溃，按以下顺序排查（与 Embedding 无关的常见原因）：
   1. 确保运行在 **Python 3.10** 环境（本项目约定 `conda env: pythonspace`）；部分依赖在 3.12+ 上有兼容问题。
-  2. 启动方式：推荐 PowerShell / CMD；若向量库回退到 ChromaDB 本地模式，Git Bash 底层依赖可能异常退出（Milvus 走网络不受此限）。
+  2. 启动方式：推荐 PowerShell / CMD（Milvus 走网络不受 Shell 限制）。
   3. **Linux / 虚拟机（如 Rocky Linux 10）部署**：Web server 若用 `gunicorn` / `uvicorn` 的 fork 多 worker，注意子进程 fork 后再 import 重型库可能不稳定，稳妥做法用 `gunicorn --preload`（父进程先 import 应用再 fork）或限制 worker 数；多 worker 用 `--workers N` 横向扩展并发。
 
 ### 9. LangGraph 模式 vs 旧版模式如何选择？

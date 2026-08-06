@@ -65,10 +65,10 @@ def calculator(expression: str) -> str:
 @mcp.tool()
 def doc_search(query: str, top_k: int = 5) -> str:
     """
-    搜索企业文档知识库（ChromaDB 向量数据库），返回与查询相关的文档片段。
+    搜索企业文档知识库（Milvus 向量数据库），返回与查询相关的文档片段。
     输入：搜索关键词或问题描述。输出：相关文档片段列表。
     """
-    # 延迟导入：没有 chromadb/ollama 的环境也能正常启动 Server
+    # 延迟导入：没有 ollama 的环境也能正常启动 Server
     try:
         from advanced_rag_agent import DocSearchSkill
     except Exception as e:  # pragma: no cover
@@ -86,7 +86,7 @@ def doc_search(query: str, top_k: int = 5) -> str:
     # 当前演示环境未挂载向量库，故仅完成安全守门，证明「工具沙箱」被复用。
     return (
         f"[doc_search] 参数校验通过（top_k={top_k}）。"
-        "该工具在真实部署中连接 ChromaDB 返回文档片段；"
+        "该工具在真实部署中连接 Milvus 返回文档片段；"
         "当前演示环境未挂载向量库，已复用与 in-process Agent 同一份"
         "validate_params 安全守门。"
     )
