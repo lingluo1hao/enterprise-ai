@@ -15,7 +15,10 @@
 import glob
 import os
 import re
-from typing import List, Optional
+from typing import List, Optional, Any
+
+from .types import RawDoc
+from .chunk import FIGURE_ANCHOR_RE
 
 # 默认权限规则（与 advanced_rag_agent.DOC_ACCESS_RULES 语义一致）。
 # 生产路径下由 VectorStoreManager 传入 AccessControlFilter.get_access_level 覆盖。
@@ -94,6 +97,107 @@ def _load_pptx(path: str) -> Optional[list]:
     return _raw("\n\n".join(slides), path)
 
 
+def _table_to_markdown(rows: List[List[Any]]) -> Optional[str]:
+    """把 PyMuPDF 表格二维数组转成标准 Markdown 表格。"""
+    if not rows or len(rows) < 1:
+        return None
+    # 清理单元格：去空值、压平换行、转义 |
+    def _cell(v):
+        if v is None:
+            return ""
+        s = str(v).replace("\n", " ").replace("\r", " ").replace("|", "\\|")
+        return s.strip()
+    cleaned = [[_cell(c) for c in row] for row in rows]
+    n_cols = max(len(r) for r in cleaned)
+    # 补齐列数，避免 Markdown 格式错乱
+    for r in cleaned:
+        while len(r) < n_cols:
+            r.append("")
+    lines = []
+    for i, row in enumerate(cleaned):
+        lines.append("| " + " | ".join(row) + " |")
+        if i == 0:
+            lines.append("| " + " | ".join(["---"] * n_cols) + " |")
+    return "\n".join(lines)
+
+
+def _load_pdf(path: str) -> Optional[list]:
+    """使用 PyMuPDF 提取 PDF 文本与表格。
+
+    - 优先把页面内表格识别出来并转为 Markdown 表格；
+    - 表格区域从普通文本中剔除，避免重复；
+    - 按阅读顺序（y 坐标）把段落与表格拼接；
+    - 每页返回一个 RawDoc，便于与 figure_paths 按页对应；
+    - 缺失 PyMuPDF 或提取失败时返回 None，由调用方降级到 PyPDFLoader。
+    """
+    try:
+        import fitz
+    except ImportError:
+        return None
+    try:
+        pages: List["object"] = []
+        with fitz.open(path) as doc:
+            for page_idx, page in enumerate(doc, 1):
+                # 1) 找表格
+                table_objs = []
+                try:
+                    tabs = page.find_tables()
+                    table_objs = tabs.tables if tabs else []
+                except Exception as te:
+                    print(f"[ingest] 第 {page_idx} 页表格检测失败: {te}")
+
+                table_markdowns = []   # (Rect, markdown_text)
+                table_bboxes = []
+                for tab in table_objs:
+                    try:
+                        rows = tab.extract()
+                    except Exception:
+                        continue
+                    md = _table_to_markdown(rows)
+                    if not md:
+                        continue
+                    bbox = fitz.Rect(tab.bbox)
+                    table_bboxes.append(bbox)
+                    # 用 [TABLE] 标签包裹，便于 chunker 识别为保护片段
+                    table_markdowns.append((bbox, f"\n\n[TABLE]\n{md}\n[/TABLE]\n\n"))
+
+                # 2) 提取非表格文本块
+                text_blocks = []
+                for b in page.get_text("blocks"):
+                    bbox = fitz.Rect(b[:4])
+                    txt = b[4].strip()
+                    if not txt:
+                        continue
+                    # 若文本块与表格 bbox 显著相交，则视为表格内容，跳过
+                    if any(bbox.intersects(tb) for tb in table_bboxes):
+                        continue
+                    text_blocks.append((bbox.y0, txt))
+
+                # 3) 表格也作为独立块加入，按 y0 排序实现阅读顺序
+                for bbox, md in table_markdowns:
+                    text_blocks.append((bbox.y0, md))
+
+                text_blocks.sort(key=lambda x: x[0])
+                page_text = "\n\n".join(t for _, t in text_blocks if t.strip())
+                if page_text.strip():
+                    page_text = f"[Page {page_idx}]\n{page_text.strip()}"
+                else:
+                    page_text = f"[Page {page_idx}]"
+                pages.append(RawDoc(
+                    text=page_text,
+                    source=path,
+                    file_name=os.path.basename(path),
+                    page=page_idx,
+                ))
+
+        if not pages:
+            return None
+        return pages
+    except Exception as e:
+        print(f"[ingest] PyMuPDF 读取 PDF 失败 {os.path.basename(path)}: {e}")
+        return None
+
+
 def load_file(path: str) -> List["object"]:
     """加载单个文件，返回 RawDoc 列表。不支持/缺依赖的格式返回 []（打印警告）。"""
     from .types import RawDoc
@@ -103,8 +207,30 @@ def load_file(path: str) -> List["object"]:
             from langchain_community.document_loaders import TextLoader
             docs = TextLoader(path, encoding="utf-8").load()
         elif ext == ".pdf":
-            from langchain_community.document_loaders import PyPDFLoader
-            docs = PyPDFLoader(path).load()
+            res = _load_pdf(path)
+            if res is not None:
+                out = res
+            else:
+                # 降级：PyPDFLoader（纯文本，表格结构会丢失）
+                from langchain_community.document_loaders import PyPDFLoader
+                docs = PyPDFLoader(path).load()
+                out = []
+                for d in docs:
+                    pg = d.metadata.get("page") if hasattr(d, "metadata") else None
+                    page = (int(pg) + 1) if pg is not None else None
+                    out.append(RawDoc(
+                        text=d.page_content or "",
+                        source=path,
+                        file_name=os.path.basename(path),
+                        page=page,
+                    ))
+            # 通用 PDF 图抽取：每页可能多张图（PyMuPDF + 像素墨迹 + 连通分量）
+            # 按页对齐：out 已按 1-based 页码排序，figs_per_page[i] 对应第 i+1 页
+            figs_per_page = _extract_figures(path)
+            for raw_doc, figs in zip(out, figs_per_page):
+                if figs:
+                    raw_doc.figure_paths.extend(figs)
+            return out
         elif ext in (".html", ".htm"):
             try:
                 from langchain_community.document_loaders import BSHTMLLoader
@@ -286,6 +412,17 @@ def _extract_figures(path: str) -> List[List[str]]:
                         fname = f"fig_p{i+1:03d}_{len(page_figs)+1}.png"
                         crop.save(os.path.join(out_dir, fname), format="PNG", optimize=True)
                         page_figs.append(f"assets/figures/{stem}/{fname}")
+
+                    # 兜底：页面含图标题锚点但连通分量没抽出真图时（常见流程图/时序图
+                    # 被长横线过滤误伤），直接渲染整页作为 fallback 图，确保 LLM 能看到。
+                    if not page_figs and FIGURE_ANCHOR_RE.search(page.get_text() or ""):
+                        try:
+                            fname = f"page_{i+1:03d}.png"
+                            page.get_pixmap(matrix=fitz.Matrix(scale, scale)).save(
+                                os.path.join(out_dir, fname))
+                            page_figs.append(f"assets/figures/{stem}/{fname}")
+                        except Exception as fe:
+                            print(f"[ingest] PDF 第 {i+1} 页整页渲染兜底失败: {fe}")
                 except Exception as e:
                     print(f"[ingest] PDF 第 {i+1} 页图抽取失败: {e}")
                 results.append(page_figs)

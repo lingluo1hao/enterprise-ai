@@ -122,8 +122,8 @@ from typing import List, Optional, Tuple, Any
 # ============================================================================
 # 配置区
 # ============================================================================
-DOC_FOLDER = "./knowledge"
-DB_PATH = "./chroma_db"
+DOC_FOLDER = os.path.abspath(os.path.expanduser("./knowledge"))
+DB_PATH = os.path.abspath(os.path.expanduser("./chroma_db"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.200.128:11434")
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen2:7b")
 CHUNK_SIZE = 600
@@ -604,8 +604,12 @@ class VectorStoreManager:
                 self.client = MilvusClient(uri=uri)
                 self._ensure_collection()
                 if self._milvus_count() == 0:
-                    print(f"[VectorStore] Milvus 集合为空，从 {DOC_FOLDER} 构建索引...")
-                    self._build_milvus()
+                    auto_build = os.getenv("AUTO_BUILD_KNOWLEDGE", "false").lower() == "true"
+                    if auto_build:
+                        print(f"[VectorStore] Milvus 集合为空，从 {DOC_FOLDER} 构建索引...")
+                        self._build_milvus()
+                    else:
+                        print(f"[VectorStore] Milvus 集合为空，跳过自动构建；请通过 /kb 页面上传文档，或设置 AUTO_BUILD_KNOWLEDGE=true 后重启")
                 else:
                     print(f"[VectorStore] 加载已有 Milvus 集合（{self._milvus_count()} 条）")
                 try:

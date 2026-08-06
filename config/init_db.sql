@@ -4,10 +4,12 @@
 --   1. 在 MySQL 客户端执行本文件即可建立 rag_agent 库及全部业务表；
 --   2. 默认管理员 admin / admin123 若已存在则跳过（INSERT IGNORE）；
 --   3. 已预置两个普通用户（role='user'）：reader / reader123、viewer / viewer123；
+--   4. 已预置两个租户管理员（role='admin'，各属一个租户）：jm_admin(租户jm,密码jm123) / yh_admin(租户yh,密码yh123)；
 --      普通用户只能访问 public 文档，无法查看 restricted（受限）文档；
---   4. 登录 token 不落 MySQL，而是写入 Redis（见下方 .env 配置），本脚本不含；
---   5. usage_log 表由 LLM 网关用本地 SQLite 自动创建，不在此处。
---   6. 所有表与字段均带中文注释（COMMENT），便于阅读与维护。
+--   5. 已预置超级管理员 superadmin(role='super_admin',密码Super@2026)：可跨 jm/yh/default 全部租户查看与上传文档；
+--   6. 登录 token 不落 MySQL，而是写入 Redis（见下方 .env 配置），本脚本不含；
+--   7. usage_log 表由 LLM 网关用本地 SQLite 自动创建，不在此处。
+--   8. 所有表与字段均带中文注释（COMMENT），便于阅读与维护。
 -- ============================================================================
 
 CREATE DATABASE IF NOT EXISTS `rag_agent`
@@ -38,7 +40,8 @@ CREATE TABLE IF NOT EXISTS `admin_users` (
   `username`      VARCHAR(64)   NOT NULL UNIQUE COMMENT '用户名（登录名，唯一）',
   `password_hash` VARCHAR(256)  NOT NULL COMMENT '密码哈希（格式：salt:sha256(salt+password)）',
   `display_name`  VARCHAR(128)  DEFAULT '' COMMENT '显示名称',
-  `role`          VARCHAR(32)   NOT NULL DEFAULT 'admin' COMMENT '账号角色：admin(特权) / user(普通)',
+  `role`          VARCHAR(32)   NOT NULL DEFAULT 'admin' COMMENT '账号角色：admin(特权) / user(普通) / super_admin(跨租户)',
+  `tenant_id`     VARCHAR(64)   NOT NULL DEFAULT 'default' COMMENT '所属租户(多租户隔离，super_admin 可跨租户)',
   `is_active`     TINYINT       NOT NULL DEFAULT 1 COMMENT '是否启用（1=启用 / 0=禁用）',
   `last_login`    DATETIME      DEFAULT NULL COMMENT '最后登录时间',
   `created_at`    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -117,10 +120,13 @@ CREATE TABLE IF NOT EXISTS `chat_summaries` (
 -- 密码哈希算法：salt = 16字节十六进制；hash = sha256(salt + password)；格式 "salt:hash"
 -- 如需重置某账号密码，请用项目内 prompt_manager._hash_password 重新生成后 UPDATE。
 -- ============================================================================
-INSERT IGNORE INTO `admin_users` (`username`, `password_hash`, `display_name`, `role`, `is_active`) VALUES
-  ('admin',  '77163c0565c20104947c6d5a11cc1c07:63fff56895488aac04e0473dd4c5502eeb57a992e9ecbb483fc12c149e6bd78d', '系统管理员', 'admin', 1),
-  ('reader', '11576e1a65fe467d591628950dec7ad5:f9a10e3c305b4547e55bcc4a9fedb4200a520ce99467f4347614f5a4da0f21ab', '普通读者',   'user',  1),
-  ('viewer', '07a4b33c0ec699024ecd561dca87b6e5:e4516c5ffc42a3e616574b75bb436c96395c385ae7bca8c8ea119af031ac4221', '只读访客',   'user',  1);
+INSERT IGNORE INTO `admin_users` (`username`, `password_hash`, `display_name`, `role`, `tenant_id`, `is_active`) VALUES
+  ('admin',    '77163c0565c20104947c6d5a11cc1c07:63fff56895488aac04e0473dd4c5502eeb57a992e9ecbb483fc12c149e6bd78d', '系统管理员',   'admin', 'default', 1),
+  ('reader',   '11576e1a65fe467d591628950dec7ad5:f9a10e3c305b4547e55bcc4a9fedb4200a520ce99467f4347614f5a4da0f21ab', '普通读者',     'user',  'default', 1),
+  ('viewer',   '07a4b33c0ec699024ecd561dca87b6e5:e4516c5ffc42a3e616574b75bb436c96395c385ae7bca8c8ea119af031ac4221', '只读访客',     'user',  'default', 1),
+  ('jm_admin', '0ffbc101953c00d273d561c109ee6296:bb9b6b0e3bff6d157739c582cb06731877d3a6d153ab31a633b920ae941048c4', 'jm租户管理员', 'admin', 'jm',     1),
+  ('yh_admin', 'f5280115223307c9efa1de2153a68830:6de9b218cf902e5318379e462c07e64b12d3e281802ca76ca245173c465686b2', 'yh租户管理员', 'admin', 'yh',     1),
+  ('superadmin', '2dc9a3c36925e6b9a0096b1abfce01e2:6ed5f0d33448a4d4863d21143b0a72b1207b44c6031d6778a1aee08fe18c4d26', '超级管理员', 'super_admin', 'default', 1);
 
 -- 查看结果
 SELECT username, display_name, role, is_active FROM `admin_users`;

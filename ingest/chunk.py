@@ -303,6 +303,10 @@ class StructureAwareChunker:
     def _split_figure_aware(self, raw: RawDoc) -> List[Chunk]:
         """PDF 等无结构文本：抽出图块（图级召回）后，再切 child（细节召回）。
 
+        关键：把 figure_paths 转换成 [[FIG:...]] 文本占位符并写入 chunk.text，
+        这样 LLM 在 context 里能看到图引用，回答时按 prompt 保留占位符，
+        前端即可渲染为真实图片。
+
         入库三类 chunk（PDF 特有）：
         - figure_block：图标题 + 邻近上下文（或整页），负责「通信流程图」这类图查询；
           仅在锚点命中时存在（PyPDF text 流不含真图 caption 时可能为 0）。
@@ -311,7 +315,18 @@ class StructureAwareChunker:
         - child：常规 section 细切，负责协议字段、报文格式等细节查询。
         """
         out: List[Chunk] = []
-        fig_blocks = _extract_figure_blocks(raw.text)
+        # 把本页抽到的真图/渲染图路径转成 [[FIG:...]] 占位符，并插入到页文本开头。
+        # 这样 figure_block / page / 首个 child 都会携带占位符，确保 LLM 可见。
+        fig_placeholders = ""
+        if raw.figure_paths:
+            fig_placeholders = "\n".join(
+                f"[[FIG:{p}]]" for p in raw.figure_paths)
+        if fig_placeholders:
+            text_with_figs = fig_placeholders + "\n\n" + raw.text
+        else:
+            text_with_figs = raw.text
+
+        fig_blocks = _extract_figure_blocks(text_with_figs)
         base = hashlib.md5(
             (raw.source + "\n" + raw.text[:64]).encode("utf-8")).hexdigest()[:12]
         for i, fb in enumerate(fig_blocks):
@@ -335,7 +350,7 @@ class StructureAwareChunker:
         # 与 child 平级（is_parent=False），避免打乱原 parent-child 关系。
         if raw.page is not None and raw.text and raw.text.strip():
             out.append(Chunk(
-                text=raw.text,
+                text=text_with_figs,
                 source=raw.source,
                 file_name=raw.file_name,
                 access_level=raw.access_level,
@@ -348,8 +363,8 @@ class StructureAwareChunker:
                 page=raw.page,
                 figure_paths=list(raw.figure_paths),
             ))
-        # 常规 child 切分（细节召回）；page 随每块透传
-        out.extend(self._split_section(raw.text, [], raw))
+        # 常规 child 切分（细节召回）；基于带占位符的文本，首个 child 会携带占位符
+        out.extend(self._split_section(text_with_figs, [], raw))
         return out
 
 

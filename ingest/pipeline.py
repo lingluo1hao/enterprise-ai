@@ -80,11 +80,15 @@ class IngestPipeline:
         out = []
         if not os.path.isdir(self.folder):
             return out
-        for name in sorted(os.listdir(self.folder)):
-            if name.startswith("."):  # 跳过隐藏文件（含 .ingest_manifest.sqlite）
+        for root, _dirs, names in os.walk(self.folder):
+            # 跳过隐藏目录（如 .git）
+            if os.path.basename(root).startswith("."):
                 continue
-            if os.path.splitext(name)[1].lower() in SUPPORTED_EXT:
-                out.append(os.path.join(self.folder, name))
+            for name in sorted(names):
+                if name.startswith("."):
+                    continue
+                if os.path.splitext(name)[1].lower() in SUPPORTED_EXT:
+                    out.append(os.path.join(root, name))
         return out
 
     def scan_and_diff(self, files: Optional[List[str]] = None, force: bool = False) \
@@ -93,6 +97,9 @@ class IngestPipeline:
         current = {p: compute_fingerprint(p) for p in paths}
         manifest = self._manifest.load_all()
         added, updated, unchanged, removed = diff_fingerprints(current, manifest)
+        if files is not None:
+            # 单文件/指定文件上传：不推断磁盘删除，避免误删其他已入库文件
+            removed = []
         if force:
             # 全量：所有在盘文件都(重)处理；新增/更新仅用于报告展示
             to_process = list(current.keys())

@@ -35,7 +35,12 @@
 - **断点重续**：LangGraph 每个节点执行后自动保存 state 快照到 MySQL，服务宕机或用户关闭客户端后，下次登录可检测并恢复未完成的任务。
 - **MMR 重排序 & 多样性补搜**：最大边际相关性去冗余，避免信息遗漏。
 - **Redis 两级缓存**：精确匹配（SHA256 <1ms）+ 语义匹配（BGE embedding 余弦相似度 > 0.80）。
-- **文档级访问控制**：支持普通用户与特权用户，敏感文档按权限隔离，缓存也按角色隔离。
+- **多租户隔离 + 文档级访问控制**：基于 Milvus 标量过滤下推的三级权限模型——`super_admin` 跨租户全局可见、`admin` 仅本租户全量、`user` 仅本租户内「access_level=public 或本人上传」的文档；检索（向量层 expr）与知识库列表（Web 端按租户过滤）双重隔离，缓存按角色隔离。**不同租户可上传同名文件**（按 `knowledge/{tenant}/` 目录 + 路径含租户前缀的 chunk_id 隔离，互不越权）。
+- **预置多租户演示账号**：`config/init_db.sql` 已内置 `jm_admin/jm123`（租户 jm）、`yh_admin/yh123`（租户 yh）、`superadmin/Super@2026`（跨租户），`config/tenants.yaml` 同步登记 jm/yh 租户；`admin/admin123` 归属 default 租户。
+- **Token 用量按用户 / 租户归因**：Web 端 Token 用量看板与知识库列表均按 `user_id` / 角色下推过滤；管理员可审计各租户、各用户的调用次数、Token 消耗与成本。
+- **PDF 表格与图片感知解析**：摄取层用 PyMuPDF 抽取表格并保留为 Markdown `[TABLE]...[/TABLE]`，抽取插图（连通分量裁剪）并在 chunk 中插入 `[[FIG:assets/figures/...]]` 占位符，问答时可原样还原表格结构与配图（不再把表格压成纯文本、不再丢失流程图）。
+- **上传可观测性**：`/api/docs/upload` 增加实时进度日志（接收→保存→解析→分片→入库完成）与耗时统计，Web 端上传按钮状态 / 进度提示，大文件不再"无响应、无日志"。
+- **租户管理员用户管理**：管理后台支持按租户创建 / 管理本租户用户（`super_admin` 可跨租户、可建 `super_admin`；`admin` 锁定本租户且角色限 `user`/`admin`）。
 - **提示词工程管理系统**：11 个提示词模板存储于 MySQL，通过管理后台（`/admin`）在线 CRUD，修改后即时生效无需重启。内置管理员认证（salt:sha256），支持版本化默认提示词升级。
 - **安全沙箱加固**：密码 `.env` 环境变量管理（不落代码）、输入防护（长度/字符白名单/危险模式拦截）、API 令牌桶限流（4 档阈值 + HTTP 429）、结构化 JSON 审计日志（7 类操作）、工具沙箱（AST 安全求值器 + 参数白名单校验）。
 - **MCP 生态暴露**：Skill 内核抽到 `skill_framework.py`，经 `mcp_server.py`（FastMCP）暴露为标准 MCP `Tools` / `Resource` / `Prompt`，任意兼容 MCP 的 AI 客户端（Claude Desktop / Cursor / 自研 Agent）可零改造复用你的工具（详见下方「MCP 生态」章节）。
@@ -83,15 +88,16 @@ enterprise-ai/
 | 文件 | 作用 |
 |------|------|
 | `langgraph_rag_agent.py` | **核心引擎**，含 LangGraphRAGApp 类、AgentState 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。 |
-| `advanced_rag_agent.py` | 基础组件库，提供 OllamaLLM、VectorStoreManager、CacheManager、AccessControlFilter、DocSearchSkill 等可复用类。同时保留原 LangChain 版 RAGOrchestrator 实现（兼容旧模式）。 |
+| `advanced_rag_agent.py` | 基础组件库，提供 OllamaLLM、VectorStoreManager、CacheManager、AccessControlFilter、DocSearchSkill 等可复用类。**AccessControlFilter / `search()` / `search_figure_pages()` 的权限下推已扩展为 `tenant_id` + `user_id` + `access_level` 三级标量过滤**（super_admin 无 expr、admin 仅 `tenant_id`、user 加 `access_level/user_id` 约束），所有 LLM 调用统一带 `user=self.username` 以支撑 Token 用量归因。同时保留原 LangChain 版 RAGOrchestrator 实现（兼容旧模式）。 |
 | `memory_store.py` | **MySQL 持久化记忆模块**，含 MySQLMemoryStore 类，管理 4 张表：`chat_messages`（对话历史，按 `user_id` 外键→admin_users.id + `session_id` 隔离，列 `speaker_role`=消息说话方 user/assistant/system）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）、`chat_summaries`（对话摘要落库，进程重启不丢）。`save_message`/`save_checkpoint` 使用单条 SQL 原子取号（修复并发撞号）。支持连接池、线程安全、自动降级。 |
-| `prompt_manager.py` | **提示词工程管理模块**，含 PromptManager（11 个提示词模板的 CRUD + 动态加载）和 AuthManager（管理员 salt:sha256 密码认证）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务。 |
+| `prompt_manager.py` | **提示词工程管理模块**，含 PromptManager（11 个提示词模板的 CRUD + 动态加载）和 AuthManager（管理员 salt:sha256 密码认证 + `create_user()` 按租户创建用户）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务；启动时自动比对 `DEFAULT_PROMPTS` 与 DB 版本，代码更高则同步 MySQL。`generate_answer`/`writer_compose` 系统提示词已加入「保持 Markdown 表格输出 / 原样保留 `[[FIG:...]]` 占位符」要求，配合摄取层的表格与图片抽取。 |
 | `audit_logger.py` | **审计日志模块**，JSON Lines 结构化日志。覆盖 login/logout/query/query_stream/save_prompt/delete_prompt/import_defaults 7 类操作，字段含 timestamp/ip/username/action/target/result/detail。自动轮转（500KB/3 备份）。 |
-| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。**`app.run(threaded=True)` 仅为 Windows 本地开发 fallback**，生产请走下方「生产部署（高并发 · gunicorn）」章节。 |
+| `rag_web_server.py` | Web 入口。导入基础组件 + LangGraphRAGApp，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。**多租户能力集中在此**：`/api/docs` 按角色+租户过滤知识库列表（admin 直接按租户过滤、user 走 Milvus 标量下推）；`/api/admin/users` 支持按租户创建/管理用户；`/api/docs/upload` 增加实时进度日志（`[docs/upload]`）+ 上传耗时统计；`/api/token-usage` 按 `user_id` 过滤。**[docs/list] 日志已收敛**：全盘扫描阶段会标注 `[跨租户-将过滤]`，避免误判越权。**`app.run(threaded=True)` 仅为 Windows 本地开发 fallback**，生产请走下方「生产部署（高并发 · gunicorn）」章节。 |
 | `gunicorn_config.py` | **高并发生产部署入口**。gunicorn 配置：默认 4 workers × 8 threads（gthread 模式，兼容 SSE 长连接 + 同步 LLM 调用），`post_worker_init` 钩子在**每个 worker 内**调 `init_system()` 完成向量库/编排器初始化——因为 gunicorn 不执行 `__main__`，否则各进程不会初始化、且顶层 `RAG_LANGGRAPH` 已正确默认开启 LangGraph。workers / threads / timeout / worker_class 均可经 `GUNICORN_*` 环境变量覆盖。Linux/VM 上用 `gunicorn -c gunicorn_config.py rag_web_server:app` 启动。注：gunicorn 仅支持 Linux/macOS（依赖 `fcntl`），Windows 本地请用 `waitress-serve` 调试。 |
 | `llm_gateway.py` | **企业级 LLM 网关**，统一所有 LLM 调用的出口。内含多模型路由、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载。纯标准库实现，零第三方依赖。 |
-| `ingest/` | **百万级 RAG 数据面引擎**（改造点落地）。`pipeline.IngestPipeline` 编排「扫 knowledge/ → 指纹增量(mtime+size+md5) → 多格式 loader(txt/md/pdf/html/docx/xlsx/pptx) → 结构切分 → 批量 embedding(并发池+重试) → 幂等 upsert」；`store.MilvusStoreBackend` 复用现有 Milvus 客户端；`cli` 提供 `ingest/status/delete/rebuild` 子命令。支持增量（仅处理变更文件）、`--force` 全量、`--dry-run` 预检。测试见 `tests/test_ingest.py`（零外部依赖，`python tests/test_ingest.py` 直接跑）。 |
+| `ingest/` | **百万级 RAG 数据面引擎**（改造点落地）。`pipeline.IngestPipeline` 编排「扫 knowledge/（递归 `os.walk`，含子目录）→ 指纹增量(mtime+size+md5) → 多格式 loader(txt/md/pdf/html/docx/xlsx/pptx) → 结构切分 → 批量 embedding(并发池+重试) → 幂等 upsert」；`store.MilvusStoreBackend` 复用现有 Milvus 客户端；`cli` 提供 `ingest/status/delete/rebuild` 子命令。支持增量（仅处理变更文件）、`--force` 全量、`--dry-run` 预检。**单文件上传不再误删其他文件**（显式传入 `files` 时 `removed=[]`）。`loaders._load_pdf` 用 PyMuPDF 抽取表格→Markdown `[TABLE]...[/TABLE]`、抽取插图并在 `chunk.py` 插入 `[[FIG:...]]` 占位符；缺 PyMuPDF 时优雅降级为纯文本。测试见 `tests/test_ingest.py`（零外部依赖，`python tests/test_ingest.py` 直接跑）。 |
 | `config/llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
+| `config/init_db.sql` | MySQL 建库建表脚本。`admin_users` 表含 `role`（admin/user/super_admin）与 `tenant_id`（多租户隔离）字段；已预置 `admin`(default)、`reader`/`viewer`(user,default)、`jm_admin`(admin,jm)、`yh_admin`(admin,yh)、`superadmin`(super_admin,default) 五类演示账号。 |
 | `knowledge/` | 存放企业知识库 PDF 文档（ingestion 数据源），首次运行 / `ingest` 时自动构建向量索引（默认写入 Milvus，ChromaDB 兜底）。 |
 | `docs/` | 文档中心：`guides/`（MCP / LLM 网关使用说明）+ `reports/`（RAG 数据面改造、P0 修复、记忆系统升级等方案与分析报告）。 |
 | `chroma_db/` | ChromaDB 持久化目录（仅在 `VECTOR_BACKEND=chroma` 或 Milvus 不可用时使用），保存文档切片与向量。 |

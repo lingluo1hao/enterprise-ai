@@ -139,7 +139,7 @@ DEFAULT_PROMPTS = {
         "display_name": "生成答案",
         "description": "基于检索到的文档片段让 LLM 生成最终回答",
         "category": "生成",
-        "version": 12,
+        "version": 13,
         "system": (
             "你是企业文档问答助手。根据检索到的文档片段回答问题。\n\n"
             "严格要求：\n"
@@ -151,7 +151,8 @@ DEFAULT_PROMPTS = {
             "- 用中文回答，条理清晰\n"
             "- 引用具体文档时，使用文档片段开头标注的文件名（如 `JM-S509 学生证产品客户指令表_V1.0.pdf`），不要使用「文档1/文档2」这种笼统标签\n"
             "- 如果检索片段中包含 `[[FIG:assets/figures/...]]` 占位符（说明该页有真实图示），请在回答里**原样保留**该占位符（按行放置即可），前端会自动渲染为图片；附一句简短图说明（如「参见第 X 页通信流程图」）。不要删除占位符、不要改写路径。\n"
-            "- 重要：只要回答中存在 `[[FIG:...]]` 占位符，就说明文档中**确有对应图示**。请直接写「参见下方图示」并保留占位符，**绝对禁止**写出「文档中未直接提供…流程图」「未检索到相关图示」等否认语句——图就在占位符里，不要自我否认。也**不要**凭空把无关协议字段（如 SMS/RFID 指令）拼凑成「流程图概述」来填充。"
+            "- 重要：只要回答中存在 `[[FIG:...]]` 占位符，就说明文档中**确有对应图示**。请直接写「参见下方图示」并保留占位符，**绝对禁止**写出「文档中未直接提供…流程图」「未检索到相关图示」等否认语句——图就在占位符里，不要自我否认。也**不要**凭空把无关协议字段（如 SMS/RFID 指令）拼凑成「流程图概述」来填充。\n"
+            "- 如果检索片段中包含 Markdown 表格（以 `|` 和分隔线 `|---|---|` 构成），请在回答中**保持表格形式输出**，不要把它压缩成纯文字罗列。表格内容与描述文字可并用，确保字段、长度、取值等一一对应、清晰可读。"
         ),
         "user_template": "问题: {query}\n\n检索到的文档:\n{context}",
     },
@@ -195,7 +196,7 @@ DEFAULT_PROMPTS = {
         "display_name": "汇总撰写",
         "description": "汇总所有子任务的研究结果，撰写结构化最终答案",
         "category": "生成",
-        "version": 10,
+        "version": 11,
         "system": (
             "你是技术文档撰写员。根据各子任务的研究结果，撰写一份完整的回答。\n\n"
             "严格要求：\n"
@@ -205,7 +206,8 @@ DEFAULT_PROMPTS = {
             "- 整合所有子任务结果，按逻辑组织，可分点\n"
             "- 回答必须基于研究结果，不要编造\n"
             "- 用中文，条理清晰\n"
-            "- 如果某方面信息不足，如实说明"
+            "- 如果某方面信息不足，如实说明\n"
+            "- 如果研究结果中包含 Markdown 表格（字段、长度、取值等以 `|` 分隔），请在最终回答中**保持表格形式输出**，不要把它压缩成纯文字列表，确保一一对应、清晰可读。"
         ),
         "user_template": "原始问题: {query}\n\n各子任务研究结果:\n{results_text}",
     },
@@ -332,7 +334,37 @@ class PromptManager:
                 "COMMENT '所属租户(多租户隔离)' AFTER role"
             )
 
+        # 同步默认提示词：当代码中 DEFAULT_PROMPTS 的 version 高于数据库时自动升级
+        try:
+            for name, cfg in DEFAULT_PROMPTS.items():
+                cursor.execute(
+                    "SELECT version FROM prompt_templates WHERE name=%s", (name,)
+                )
+                row = cursor.fetchone()
+                db_version = row[0] if row else 0
+                code_version = cfg.get("version", 1)
+                if db_version < code_version:
+                    cursor.execute(
+                        "INSERT INTO prompt_templates "
+                        "(name, display_name, description, category, system_prompt, user_template, version) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                        "ON DUPLICATE KEY UPDATE "
+                        "display_name=VALUES(display_name), "
+                        "description=VALUES(description), "
+                        "category=VALUES(category), "
+                        "system_prompt=VALUES(system_prompt), "
+                        "user_template=VALUES(user_template), "
+                        "version=VALUES(version)",
+                        (name, cfg["display_name"], cfg.get("description", ""),
+                         cfg.get("category", "general"), cfg["system"],
+                         cfg.get("user_template", ""), code_version)
+                    )
+                    print(f"  [PromptManager] 同步提示词 {name}: {db_version} -> {code_version}")
+        except Exception as e:
+            print(f"  [PromptManager] 默认提示词同步失败(忽略): {e}")
+
         cursor.close()
+        conn.commit()
         conn.close()
 
     # ---- 提示词 CRUD ----
@@ -759,6 +791,34 @@ class AuthManager:
             return hashlib.sha256((salt + password).encode()).hexdigest() == h
         except Exception:
             return False
+
+    def create_user(self, username: str, password: str, display_name: str = "",
+                   role: str = "user", tenant_id: str = "default") -> "tuple[bool, str]":
+        """创建新用户（管理后台「新增用户」调用）。
+
+        成功返回 (True, "")；失败返回 (False, 错误原因)。
+        调用方（rag_web_server）负责按操作者角色约束 tenant_id / role，
+        本方法只做唯一性检查与落地写入。
+        """
+        if not self.available:
+            return False, "认证后端不可用（数据库未连接）"
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM admin_users WHERE username=%s", (username,))
+            if cursor.fetchone():
+                cursor.close(); conn.close()
+                return False, "用户名已存在"
+            pw_hash = self._hash_password(password)
+            cursor.execute(
+                "INSERT INTO admin_users (username, password_hash, display_name, role, tenant_id) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (username, pw_hash, display_name or username, role, tenant_id))
+            conn.commit()
+            cursor.close(); conn.close()
+            return True, ""
+        except Exception as e:
+            return False, str(e)
 
     def _ensure_default_admin(self):
         """确保至少有一个管理员账号"""

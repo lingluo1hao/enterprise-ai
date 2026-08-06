@@ -321,6 +321,7 @@ class LangGraphRAGApp:
         print("\n[1/3] 连接 LLM...")
         self.llm = create_llm()
         self.user = 1              # 当前调用用户的 ID（admin_users.id）；Web 模式会被覆盖为真实登录用户 ID
+        self.username = "anonymous"  # 当前调用用户的用户名，用于 token 用量归因
         self.tenant_id = "default" # 当前调用用户所属租户；Web 模式会被覆盖为真实登录租户
 
         # 2. 向量数据库（复用现有 VectorStoreManager）
@@ -680,7 +681,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             history=history_text, query=query
         )
-        result = self.llm.chat(system, user, task="classify", user=self.user)
+        result = self.llm.chat(system, user, task="classify", user=self.username)
 
         # 解析 LLM 输出的 JSON（含容错兜底）
         qtype, resolved = self._parse_classify(result, query)
@@ -737,7 +738,7 @@ class LangGraphRAGApp:
         prompt = self.pm.get_prompt("chitchat")
         system = prompt["system"]
         user = self.pm.format_user_message(prompt["user_template"], query=query)
-        answer = self.llm.chat(system, user, task="direct", user=self.user)
+        answer = self.llm.chat(system, user, task="direct", user=self.username)
         return {"answer": answer}
 
     # ========================================================================
@@ -1202,7 +1203,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, results_text=results_text
         )
-        result = self.llm.chat(system, user, task="review", user=self.user)
+        result = self.llm.chat(system, user, task="review", user=self.username)
 
         passed = "充分" in result
         print(f"  [reviewer] 审查结果: {'通过' if passed else '不通过'}")
@@ -1280,7 +1281,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, results_text=results_text
         )
-        answer = self.llm.chat(system, user, task="write", user=self.user)
+        answer = self.llm.chat(system, user, task="write", user=self.username)
         print(f"  [writer] 生成最终答案 ({len(answer)} 字)")
         return {"answer": answer}
 
@@ -1317,7 +1318,7 @@ class LangGraphRAGApp:
             prompt = self.pm.get_prompt("rewrite_first")
             system = prompt["system"]
             user = self.pm.format_user_message(prompt["user_template"], query=query)
-            result = self.llm.chat(system, user, task="rewrite", user=self.user)
+            result = self.llm.chat(system, user, task="rewrite", user=self.username)
         else:
             # 第 N 轮：基于之前的检索结果，换角度改写
             # 只取前 3 个文档的前 120 字符，避免 prompt 过长
@@ -1330,7 +1331,7 @@ class LangGraphRAGApp:
                 prompt["user_template"],
                 query=query, prev_text=prev_text
             )
-            result = self.llm.chat(system, user, task="rewrite", user=self.user)
+            result = self.llm.chat(system, user, task="rewrite", user=self.username)
 
         # 解析 LLM 输出：按行拆分，取前 3 个非空行
         queries = [q.strip() for q in result.strip().split("\n") if q.strip()][:3]
@@ -1447,7 +1448,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, docs="\n".join(doc_texts)
         )
-        result = self.llm.chat(system, user, task="grade", user=self.user)
+        result = self.llm.chat(system, user, task="grade", user=self.username)
 
         # 初始化：全部标记为 False
         grades = [False] * len(docs)
@@ -1517,7 +1518,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, context=context
         )
-        answer = self.llm.chat(system, user, task="generate", user=self.user)
+        answer = self.llm.chat(system, user, task="generate", user=self.username)
 
         # ===== 图渲染：服务端确定性追加，只取「最相关的一张」图，避免占位符刷屏 =====
         # 之前把 [[FIG:...]] 放进 context 指望 LLM 原样保留，但 LLM 常把占位符当噪音删掉，
@@ -1658,7 +1659,7 @@ class LangGraphRAGApp:
         prompt = self.pm.get_prompt("planner_decompose")
         system = prompt["system"]
         user = self.pm.format_user_message(prompt["user_template"], query=query)
-        result = self.llm.chat(system, user, task="plan", user=self.user)
+        result = self.llm.chat(system, user, task="plan", user=self.username)
         return self._parse_json_list(result, "subtasks", query)
 
     def _do_plan_supplement(self, query: str, existing: List[Dict]) -> List[Dict]:
@@ -1693,7 +1694,7 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, existing_text=existing_text
         )
-        result = self.llm.chat(system, user, task="plan", user=self.user)
+        result = self.llm.chat(system, user, task="plan", user=self.username)
         return self._parse_json_list(result, "subtasks", query)
 
     # ========================================================================
@@ -1772,7 +1773,7 @@ class LangGraphRAGApp:
         prompt = self.pm.get_prompt("compress_history")
         system = prompt["system"]
         user = self.pm.format_user_message(prompt["user_template"], history_text=old_text)
-        summary = self.llm.chat(system, user, task="compress", user=self.user)
+        summary = self.llm.chat(system, user, task="compress", user=self.username)
 
         print(f"  [save_history] 历史压缩: {len(old)} 条 → 1 条摘要")
         # 摘要放在最前面，近期消息附加在后面
@@ -2014,6 +2015,7 @@ class LangGraphRAGApp:
         user: str = None,
         user_id: int = None,
         tenant_id: str = "default",
+        username: str = None,
     ) -> str:
         """
         【对外入口：用户提问】
@@ -2046,6 +2048,8 @@ class LangGraphRAGApp:
         # 本次问答里所有 memory_store 写入都用它做用户隔离（不再冗余存用户名）。
         if user_id is not None:
             self.user = user_id
+        # 用户名：用于 token 用量归因（用量表按 username 关联租户）
+        self.username = username or user or str(self.user)
         # 租户：记到实例上，检索下推隔离用（super-admin 传 "__global__" 做跨租户巡检）
         self.tenant_id = tenant_id or "default"
         total_start = time.time()

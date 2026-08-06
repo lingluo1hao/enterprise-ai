@@ -36,7 +36,6 @@ warnings.filterwarnings("ignore")
 
 from flask import Flask, request, jsonify, Response, g, send_from_directory
 from werkzeug.security import safe_join
-from werkzeug.utils import secure_filename
 
 # ====== 导入核心模块 ======
 from audit_logger import get_audit_logger
@@ -81,10 +80,10 @@ class LangGraphEngine:
 
     def query(self, question, user_role=None, user=None, user_id=None, tenant_id=None):
         role = user_role or self.user_role
-        user = user or role
+        username = user or role
         return self.app.query(question, role=role,
-                              session_id=_derive_session_id(user, role),
-                              user=user, user_id=user_id, tenant_id=tenant_id)
+                              session_id=_derive_session_id(username, role),
+                              user=username, user_id=user_id, tenant_id=tenant_id)
 
     def check_unfinished_tasks(self, session_id="web_session", user_id=0):
         """查询指定会话的未完成任务（断点检测）"""
@@ -783,6 +782,15 @@ def api_me():
     })
 
 
+@app.route("/api/tenants")
+def api_tenants():
+    """返回已注册租户列表（任意登录用户可见，用于 /kb 等页面下拉框）。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    return jsonify({"tenants": _load_tenants()})
+
+
 def _get_memory_store():
     """兼容两种编排器，取到统一的 MySQLMemoryStore 实例。"""
     o = orchestrator
@@ -902,11 +910,33 @@ def _kb_derive_tenant(rel_path: str) -> str:
     return "default"
 
 
+def _kb_safe_name(filename: str) -> str:
+    """保留原文件名的安全文件名处理。
+
+    与 werkzeug.secure_filename 不同：不删除中文、空格、括号，
+    仅替换 Windows/Linux 路径非法字符，确保不同租户同名文件可共存。
+    """
+    forbidden = '\\/:*?"<>|'
+    for ch in forbidden:
+        filename = filename.replace(ch, '_')
+    filename = filename.strip('. ')
+    if not filename:
+        filename = "unnamed"
+    return filename
+
+
 def _kb_scan_files():
     """递归扫描 knowledge/ 下受支持文件，附带 manifest 统计。"""
     out = []
     manifest = ManifestStore(os.path.join(DOC_FOLDER, ".ingest_manifest.sqlite"))
     recs = manifest.load_all()
+    # 额外建立规范化查找表，处理 Windows 盘符大小写、正/反斜杠差异
+    norm_recs = {}
+    for k, v in recs.items():
+        try:
+            norm_recs[os.path.normcase(os.path.normpath(os.path.abspath(k)))] = v
+        except Exception:
+            norm_recs[os.path.normcase(k)] = v
     for root, _dirs, files in os.walk(DOC_FOLDER):
         if os.path.basename(root).startswith("."):
             continue
@@ -915,7 +945,18 @@ def _kb_scan_files():
                 continue
             full = os.path.join(root, name)
             rel = os.path.relpath(full, DOC_FOLDER).replace("\\", "/")
-            rec = recs.get(full) or recs.get(rel) or {}
+            # manifest key 可能是绝对路径、相对路径（正/反斜杠）或旧版的 ./knowledge\... 形式
+            keys = [full, rel, rel.lstrip("./"), "./" + rel,
+                    full.replace("/", "\\"), rel.replace("/", "\\"),
+                    ("./" + rel).replace("/", "\\")]
+            rec = {}
+            for k in keys:
+                if k in recs:
+                    rec = recs[k]
+                    break
+            if not rec:
+                # 兜底：按规范化绝对路径再匹配一次
+                rec = norm_recs.get(os.path.normcase(os.path.normpath(os.path.abspath(full))), {})
             try:
                 size = os.path.getsize(full)
             except OSError:
@@ -946,13 +987,123 @@ def _kb_file_owner(file_path: str):
     return None
 
 
+def _kb_visible_files(tenant, role, uid):
+    """通过 Milvus 标量过滤下推「角色 + 用户id」权限，返回可见文件集合与 ACL 元信息。
+
+    返回 (paths:set, meta:dict[path]={owner,access_level})；Milvus 不可用时抛异常，
+    由调用方回退到仅按租户过滤。
+    """
+    if vector_db.backend != "milvus":
+        raise RuntimeError("知识库后端非 Milvus，无法下推用户级权限")
+    if role == ROLE_ADMIN:
+        expr = f"(tenant_id == '{tenant}')"
+    else:
+        expr = (f"(tenant_id == '{tenant}') and "
+                f"((access_level == 'public') or (user_id == '{str(uid)}'))")
+    paths, meta = set(), {}
+    offset, page = 0, 1000
+    print(f"[docs/acl] query expr={expr!r}")
+    while True:
+        res = vector_db.client.query(
+            vector_db.collection, expr,
+            output_fields=["file_path", "user_id", "access_level"],
+            limit=page, offset=offset)
+        print(f"[docs/acl] query returned {len(res)} rows (offset={offset})")
+        if not res:
+            break
+        for r in res:
+            fp = (r.get("file_path") or "").replace("\\", "/")
+            print(f"[docs/acl] row file_path={fp!r} user_id={r.get('user_id')!r} access_level={r.get('access_level')!r}")
+            if fp:
+                paths.add(fp)
+                if fp not in meta:
+                    meta[fp] = {"owner": r.get("user_id"),
+                                "access_level": r.get("access_level")}
+        if len(res) < page:
+            break
+        offset += page
+    return paths, meta
+
+
 @app.route("/api/docs", methods=["GET"])
 def api_docs_list():
-    """列出知识库文档（任意已登录用户；按角色可见范围由前端缩放）。"""
+    """列出知识库文档（按 角色 + 用户id 下推隔离）：
+    - super_admin：全部租户文件；
+    - admin：本租户全部；
+    - 普通用户：本租户内 (access_level==public) 或 (user_id==本人) 的文件。
+    返回字段含 tenant / owner / access_level，前端可据此渲染归属与可见性。
+    """
     auth_result = _require_auth()
     if auth_result:
         return auth_result
+    role = g.current_user["role"]
+    uid = g.current_user["user_id"]
+    my_tenant = g.current_user.get("tenant_id", "default")
     files = _kb_scan_files()
+    print(f"[docs/list] user={g.current_user.get('username')} role={role} uid={uid} tenant={my_tenant} scanned={len(files)} (全盘扫描，后续按租户/权限过滤)")
+    for _f in files:
+        # 非 super_admin 看到的其他租户文件一定会被过滤掉，打标避免误判为越权可见
+        cross = (_f.get("tenant") != my_tenant and role != ROLE_SUPER_ADMIN)
+        tag = " [跨租户-将过滤]" if cross else ""
+        print(f"[docs/list] scan path={_f['path']!r} tenant={_f['tenant']}{tag}")
+
+    def _norm(p: str) -> str:
+        """把绝对/相对路径统一为相对 DOC_FOLDER 的 / 分隔路径。"""
+        try:
+            return os.path.relpath(os.path.abspath(p), DOC_FOLDER).replace("\\", "/")
+        except Exception:
+            return (p or "").replace("\\", "/")
+
+    if role == ROLE_SUPER_ADMIN:
+        # 全租户：附 ACL 元信息便于展示
+        try:
+            res = vector_db.client.query(
+                vector_db.collection, "",
+                output_fields=["file_path", "user_id", "access_level"],
+                limit=10000)
+            meta = {}
+            for r in res:
+                fp = _norm(r.get("file_path", ""))
+                if fp and fp not in meta:
+                    meta[fp] = {"owner": r.get("user_id"),
+                                "access_level": r.get("access_level")}
+            for f in files:
+                m = meta.get(f["path"].replace("\\", "/"))
+                if m:
+                    f["owner"] = m["owner"]
+                    f["access_level"] = m["access_level"]
+        except Exception as _e:
+            print(f"[docs] super_admin ACL 标注失败(忽略): {_e}")
+        return jsonify({"files": files, "count": len(files)})
+
+    # admin：本租户全部可见（直接按租户过滤，避免 Milvus expr/路径不一致导致空白）
+    if role == ROLE_ADMIN:
+        files = [f for f in files if f.get("tenant") == my_tenant]
+        print(f"[docs/list] admin role: return tenant={my_tenant} count={len(files)}")
+        return jsonify({"files": files, "count": len(files)})
+
+    # 普通用户：Milvus 下推「用户id + access_level」权限
+    try:
+        vis_paths, vis_meta = _kb_visible_files(my_tenant, role, uid)
+    except Exception as _e:
+        print(f"[docs] 权限下推失败，回退租户过滤: {_e}")
+        vis_paths, vis_meta = None, None
+
+    if vis_paths is None:
+        files = [f for f in files if f.get("tenant") == my_tenant]
+    else:
+        vis_rel = {_norm(p) for p in vis_paths}
+        vis_rel_meta = {}
+        for p, m in vis_meta.items():
+            vis_rel_meta[_norm(p)] = m
+        print(f"[docs/list] vis_rel={vis_rel!r}")
+        files = [f for f in files if f["path"].replace("\\", "/") in vis_rel]
+        for f in files:
+            m = vis_rel_meta.get(f["path"].replace("\\", "/"))
+            if m:
+                f["owner"] = m["owner"]
+                f["access_level"] = m["access_level"]
+    print(f"[docs/list] returning count={len(files)}")
     return jsonify({"files": files, "count": len(files)})
 
 
@@ -991,15 +1142,23 @@ def api_docs_upload():
 
     dest_dir = os.path.join(DOC_FOLDER, tenant)
     os.makedirs(dest_dir, exist_ok=True)
-    filename = secure_filename(f.filename)
+    filename = _kb_safe_name(f.filename)
     save_path = os.path.join(dest_dir, filename)
+    print(f"[docs/upload] 开始接收文件 user={g.current_user['username']} tenant={tenant} name={filename}")
     f.save(save_path)
+    print(f"[docs/upload] 已保存到 {save_path} ({os.path.getsize(save_path)} 字节)，开始解析入库...")
 
     try:
         pipe = _kb_build_pipeline(tenant, uid, access_level)
-        rep = pipe.run(files=[save_path])
+
+        def _progress(text: str):
+            print(f"[docs/upload] {text}")
+
+        rep = pipe.run(files=[save_path], progress_cb=_progress)
         pipe.close()
+        print(f"[docs/upload] 入库完成 file={save_path} chunks={rep.entities_upserted} duration={rep.duration_sec:.2f}s")
     except Exception as e:
+        print(f"[docs/upload] 入库失败: {e}")
         return jsonify({"error": f"入库失败：{e}"}), 500
     _audit_log("docs_upload", target=save_path, username=g.current_user["username"],
                result="success")
@@ -1152,12 +1311,33 @@ def kb_page():
   .muted{color:#888;font-size:13px}
   #msg{margin-top:10px;font-size:13px;color:#0f6e56}
   #err{margin-top:10px;font-size:13px;color:#a32d2d}
+  .topnav{display:flex;align-items:center;justify-content:space-between;background:#185fa5;color:#fff;padding:0 18px;height:54px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  .nav-left{display:flex;align-items:center;gap:10px}
+  .nav-left .logo{font-size:22px}
+  .nav-left h1{font-size:17px;margin:0;font-weight:600}
+  .nav-right{display:flex;align-items:center;gap:6px}
+  .nav-link{color:#fff;text-decoration:none;font-size:14px;padding:7px 12px;border-radius:7px;opacity:.85}
+  .nav-link:hover{background:rgba(255,255,255,.15);opacity:1}
+  .nav-link.active{background:rgba(255,255,255,.22);opacity:1;font-weight:600}
+  .nav-user{font-size:13px;padding:5px 10px;background:rgba(255,255,255,.15);border-radius:12px;margin-left:6px}
+  .nav-logout{background:rgba(255,255,255,.15);color:#fff;border:none;padding:7px 12px;border-radius:7px;font-size:13px;cursor:pointer;margin-left:6px}
+  .nav-logout:hover{background:rgba(255,255,255,.28)}
 </style></head>
-<body><div class="wrap">
-  <header>
-    <h1>📚 知识库管理</h1>
-    <span class="badge" id="who"></span>
-  </header>
+<body>
+<header class="topnav">
+  <div class="nav-left">
+    <div class="logo">📚</div>
+    <h1>企业知识库</h1>
+  </div>
+  <div class="nav-right">
+    <a href="/" class="nav-link">💬 问答</a>
+    <a href="/kb" class="nav-link active">📚 知识库</a>''' + ('''
+    <a href="/admin" class="nav-link">⚙️ 系统管理</a>''' if is_admin else '') + '''
+    <span class="nav-user" id="who"></span>
+    <button class="nav-logout" onclick="doLogout()">🚪 退出</button>
+  </div>
+</header>
+<div class="wrap">
 
   <div class="card">
     <div class="row">
@@ -1216,14 +1396,18 @@ function upload(){
   const fd=new FormData();
   const file=document.getElementById("file").files[0];
   if(!file){err("请选择文件");return;}
+  const btn=document.querySelector('button[onclick="upload()"]');
+  if(btn){btn.disabled=true;btn.textContent='⏳ 上传入库中...';}
+  msg('正在上传 '+file.name+'，请稍候（大文件 PDF 解析+向量化可能需要几十秒）...');
+  err('');
   fd.append("file",file);
   fd.append("access_level",document.getElementById("access").value);
   const t=document.getElementById("tenant").value;
   if(t) fd.append("tenant",t);
   fetch("/api/docs/upload",{method:"POST",body:fd}).then(r=>r.json()).then(d=>{
-    if(d.success){msg("已入库: "+d.file+" ("+d.chunks+" 分片)");load();}
-    else err(d.error||"上传失败");
-  }).catch(e=>err(e));
+    if(d.success){msg('✅ 已入库: '+d.file+' ('+d.chunks+' 分片)');load();}
+    else err(d.error||'上传失败');
+  }).catch(e=>err(e)).finally(()=>{if(btn){btn.disabled=false;btn.textContent='⬆️ 上传并入库';}});
 }
 
 function del(path){
@@ -1242,6 +1426,11 @@ function rebuild(){
 
 function msg(t){document.getElementById("msg").textContent=t;document.getElementById("err").textContent="";}
 function err(t){document.getElementById("err").textContent=t;document.getElementById("msg").textContent="";}
+function doLogout(){
+  fetch('/api/logout',{method:'POST'}).catch(function(){});
+  try{ localStorage.removeItem('rag_token'); }catch(e){}
+  location.replace('/login');
+}
 </script>
 </body></html>'''
     return html
@@ -1495,6 +1684,75 @@ def api_admin_usage_top():
         window = _summarize(all_rows)
         rows = all_rows[:limit]
 
+    # ===== 角色感知过滤：admin 仅看本租户用户，super_admin 看全部 =====
+    role = g.current_user.get("role")
+    my_tenant = g.current_user.get("tenant_id", "default")
+    if role != ROLE_SUPER_ADMIN:
+        try:
+            from prompt_manager import get_auth_manager
+            pool = get_auth_manager()._pool
+            if pool is not None:
+                conn = pool.connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT username, tenant_id FROM admin_users")
+                    tmap = {r[0]: (r[1] or "default") for r in cur.fetchall()}
+                finally:
+                    conn.close()
+                users = [u for u in users if tmap.get(u["user"], "default") == my_tenant]
+                rows = [r for r in rows if tmap.get(r.get("user"), "default") == my_tenant]
+                window = {
+                    "calls": sum(u["calls"] for u in users),
+                    "prompt_tokens": sum(u["prompt_tokens"] for u in users),
+                    "completion_tokens": sum(u["completion_tokens"] for u in users),
+                    "total_tokens": sum(u["total_tokens"] for u in users),
+                    "cost_usd": round(sum(u["cost_usd"] for u in users), 6),
+                    "avg_latency_s": round(sum(r["latency_s"] for r in rows) / len(rows), 3)
+                                     if rows else 0.0,
+                }
+        except Exception as _e:
+            print(f"[usage] 租户过滤失败(忽略): {_e}")
+
+    # ===== 可选：按用户筛选（user_id 或 username），非 super_admin 仍受本租户约束 =====
+    req_user = (request.args.get("user_id") or request.args.get("user") or "").strip()
+    if req_user:
+        target_username = req_user
+        try:
+            from prompt_manager import get_auth_manager
+            pool = get_auth_manager()._pool
+            if pool is not None:
+                conn = pool.connection()
+                try:
+                    cur = conn.cursor()
+                    if req_user.isdigit():
+                        cur.execute("SELECT username, tenant_id FROM admin_users WHERE id=%s", (int(req_user),))
+                    else:
+                        cur.execute("SELECT username, tenant_id FROM admin_users WHERE username=%s", (req_user,))
+                    row = cur.fetchone()
+                    if row:
+                        target_username = row[0]
+                        if role != ROLE_SUPER_ADMIN and (row[1] or "default") != my_tenant:
+                            target_username = None  # 跨租户越权，忽略筛选
+                    else:
+                        target_username = None
+                finally:
+                    conn.close()
+        except Exception as _e:
+            print(f"[usage] 用户解析失败(忽略筛选): {_e}")
+            target_username = None
+        if target_username:
+            users = [u for u in users if u["user"] == target_username]
+            rows = [r for r in rows if r.get("user") == target_username]
+            window = {
+                "calls": sum(u["calls"] for u in users),
+                "prompt_tokens": sum(u["prompt_tokens"] for u in users),
+                "completion_tokens": sum(u["completion_tokens"] for u in users),
+                "total_tokens": sum(u["total_tokens"] for u in users),
+                "cost_usd": round(sum(u["cost_usd"] for u in users), 6),
+                "avg_latency_s": round(sum(r["latency_s"] for r in rows) / len(rows), 3)
+                                 if rows else 0.0,
+            }
+
     m = gw.metrics()
     return jsonify({
         "range": rng,
@@ -1504,6 +1762,144 @@ def api_admin_usage_top():
         "persisted": m.get("usage_persisted", False),
         "db": m.get("usage_db", ""),
     })
+
+
+# ---- 用户管理 API（仅超级管理员，体现 tab/数据权限分层）----
+
+@app.route("/api/admin/users", methods=["GET"])
+def api_admin_users_list():
+    """列出用户：超级管理员看全部；租户管理员仅看本租户。"""
+    denied = _require_admin()
+    if denied:
+        return denied
+    role = g.current_user.get("role")
+    my_tenant = g.current_user.get("tenant_id", "default")
+    if role not in (ROLE_ADMIN, ROLE_SUPER_ADMIN):
+        return jsonify({"error": "无权限"}), 403
+    try:
+        from prompt_manager import get_auth_manager
+        pool = get_auth_manager()._pool
+        if pool is None:
+            return jsonify({"error": "数据库不可用"}), 503
+        conn = pool.connection()
+        try:
+            cur = conn.cursor()
+            if role == ROLE_SUPER_ADMIN:
+                cur.execute(
+                    "SELECT id, username, display_name, role, tenant_id, is_active "
+                    "FROM admin_users ORDER BY id")
+            else:
+                cur.execute(
+                    "SELECT id, username, display_name, role, tenant_id, is_active "
+                    "FROM admin_users WHERE tenant_id=%s ORDER BY id", (my_tenant,))
+            cols = ["id", "username", "display_name", "role", "tenant_id", "is_active"]
+            users = [dict(zip(cols, row)) for row in cur.fetchall()]
+        finally:
+            conn.close()
+        return jsonify({"users": users,
+                        "scope": "all" if role == ROLE_SUPER_ADMIN else "tenant",
+                        "can_create_super": role == ROLE_SUPER_ADMIN})
+    except Exception as e:
+        return jsonify({"error": f"查询失败：{e}"}), 500
+
+
+@app.route("/api/admin/users", methods=["POST"])
+def api_admin_users_create():
+    """新增用户。
+
+    - 超级管理员：可建任意租户、任意角色（user/admin/super_admin）。
+    - 租户管理员：仅能建本租户用户，角色限于 普通用户 / 租户管理员。
+    服务端强制约束，绝不信任客户端传入的 tenant_id / role。
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    role = g.current_user.get("role")
+    my_tenant = g.current_user.get("tenant_id", "default")
+    if role not in (ROLE_ADMIN, ROLE_SUPER_ADMIN):
+        return jsonify({"error": "无权限"}), 403
+
+    data = request.get_json(force=True, silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    display_name = (data.get("display_name") or "").strip()
+    new_role = (data.get("role") or "user").strip()
+    new_tenant = (data.get("tenant_id") or "").strip()
+
+    err = validate_input(username, MAX_USERNAME_LEN, "用户名")
+    if err:
+        return jsonify({"error": err}), 400
+    if len(password) < 6:
+        return jsonify({"error": "密码至少 6 位"}), 400
+
+    if role == ROLE_SUPER_ADMIN:
+        tenant = new_tenant or my_tenant
+        if new_role not in (ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER):
+            return jsonify({"error": "非法角色"}), 400
+    else:
+        # 租户管理员：锁定本租户，角色仅限 普通用户 / 租户管理员
+        tenant = my_tenant
+        if new_role not in (ROLE_ADMIN, ROLE_USER):
+            return jsonify({"error": "租户管理员只能创建普通用户或租户管理员"}), 400
+
+    from prompt_manager import get_auth_manager
+    ok, msg = get_auth_manager().create_user(username, password, display_name, new_role, tenant)
+    if not ok:
+        return jsonify({"error": msg}), 400
+    return jsonify({"success": True, "username": username, "tenant": tenant, "role": new_role})
+
+
+@app.route("/api/admin/users/<int:uid>", methods=["PATCH"])
+def api_admin_users_update(uid):
+    """修改用户角色 / 启用状态。
+
+    - 超级管理员：可改任意用户（含设为 super_admin）。
+    - 租户管理员：只能改本租户用户，且不能升为 super_admin。
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    role = g.current_user.get("role")
+    my_tenant = g.current_user.get("tenant_id", "default")
+    if role not in (ROLE_ADMIN, ROLE_SUPER_ADMIN):
+        return jsonify({"error": "无权限"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    new_role = data.get("role")
+    is_active = data.get("is_active")
+    sets, params = [], []
+    if new_role is not None:
+        if new_role not in (ROLE_ADMIN, ROLE_SUPER_ADMIN, ROLE_USER):
+            return jsonify({"error": "非法角色"}), 400
+        # 租户管理员不能赋予 super_admin 角色（防越权提权）
+        if role != ROLE_SUPER_ADMIN and new_role == ROLE_SUPER_ADMIN:
+            return jsonify({"error": "租户管理员不能赋予超级管理员角色"}), 403
+        sets.append("role=%s"); params.append(new_role)
+    if is_active is not None:
+        sets.append("is_active=%s"); params.append(1 if is_active else 0)
+    if not sets:
+        return jsonify({"error": "无可更新字段"}), 400
+    try:
+        from prompt_manager import get_auth_manager
+        pool = get_auth_manager()._pool
+        if pool is None:
+            return jsonify({"error": "数据库不可用"}), 503
+        conn = pool.connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT tenant_id FROM admin_users WHERE id=%s", (uid,))
+            trow = cur.fetchone()
+            if not trow:
+                return jsonify({"error": "用户不存在"}), 404
+            if role != ROLE_SUPER_ADMIN and (trow[0] or "default") != my_tenant:
+                return jsonify({"error": "无权修改其他租户用户"}), 403
+            cur.execute(
+                "UPDATE admin_users SET " + ", ".join(sets) + " WHERE id=%s",
+                params + [uid])
+        finally:
+            conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": f"更新失败：{e}"}), 500
 
 
 # ---- 管理后台页面 ----
@@ -1827,6 +2223,21 @@ _ADMIN_PAGE = r"""
   .qa-resume-bar .btn-resume-dismiss:hover{background:#f5f5f5}
   .qa-send-btn.stopping{background:var(--danger);color:#fff}
   .qa-send-btn.stopping:hover{background:var(--danger-hover,#dc2626)}
+  /* ===== KB Tab ===== */
+  .kb-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+  .kb-toolbar select,.kb-toolbar input[type=file]{padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text)}
+  .kb-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;flex:1;overflow:hidden;display:flex;flex-direction:column}
+  .kb-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .kb-card-header h2{font-size:17px;font-weight:600}
+  .kb-stats{color:var(--text-2);font-size:13px;margin-bottom:12px}
+  .kb-table{width:100%;border-collapse:collapse;font-size:14px}
+  .kb-table th,.kb-table td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border)}
+  .kb-table th{color:var(--text-2);font-weight:600;background:var(--bg)}
+  .kb-table tr:hover{background:var(--bg)}
+  .kb-msg{color:var(--success);font-size:13px;margin-top:8px}
+  .kb-err{color:var(--danger);font-size:13px;margin-top:8px}
+  .kb-btn-danger{border:1px solid var(--danger);color:var(--danger);background:#fff;padding:5px 12px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px}
+  .kb-btn-danger:hover{background:var(--danger-light)}
 </style>
 </head>
 <body>
@@ -1856,6 +2267,8 @@ _ADMIN_PAGE = r"""
     <div class="tab active" data-tab="prompts" onclick="switchTab('prompts')">📝 提示词管理</div>
     <div class="tab" data-tab="qa" onclick="switchTab('qa')">💬 在线问答</div>
     <div class="tab" data-tab="usage" onclick="switchTab('usage')">📊 Token 用量</div>
+    <div class="tab" data-tab="kb" onclick="switchTab('kb')">📚 知识库</div>
+    <div class="tab" data-tab="users" id="tabUsersBtn" style="display:none" onclick="switchTab('users')">👥 用户管理</div>
   </div>
   <div class="app-content">
     <!-- Prompt Management Tab -->
@@ -1926,6 +2339,99 @@ _ADMIN_PAGE = r"""
       <div id="adminUsageContent" style="overflow-y:auto;flex:1">
         <div class="usage-empty">加载中…</div>
       </div>
+    </div>
+    <!-- Knowledge Base Tab -->
+    <div id="tabKb" class="tab-panel">
+      <div class="toolbar kb-toolbar">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input type="file" id="kbFile">
+          <select id="kbAccess">
+            <option value="public">公开(本租户可读)</option>
+            <option value="restricted">受限(仅自己+管理员)</option>
+          </select>
+          <select id="kbTenant" style="display:none"></select>
+          <button class="btn btn-primary btn-sm" onclick="uploadKb()">⬆️ 上传并入库</button>
+        </div>
+      </div>
+      <div class="kb-card">
+        <div class="kb-card-header">
+          <h2>📚 文档列表</h2>
+          <button class="btn btn-sm btn-outline" onclick="rebuildKb()">♻️ 全量重建</button>
+        </div>
+        <div id="kbStats" class="kb-stats"></div>
+        <div style="overflow:auto;flex:1">
+          <table class="kb-table">
+            <thead>
+              <tr><th>路径</th><th>租户</th><th>分片</th><th>大小</th><th></th></tr>
+            </thead>
+            <tbody id="kbRows"></tbody>
+          </table>
+        </div>
+        <div id="kbMsg" class="kb-msg"></div>
+        <div id="kbErr" class="kb-err"></div>
+      </div>
+    </div>
+    <!-- User Management Tab (super_admin only) -->
+    <div id="tabUsers" class="tab-panel">
+      <div class="toolbar">
+        <div>
+          <h2>👥 用户管理</h2>
+          <p class="sub">管理本租户用户（超级管理员可管理全部租户）。可新增用户、调整角色与启用状态。</p>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm btn-primary" onclick="openCreateUser()">➕ 新增用户</button>
+          <button class="btn btn-sm btn-outline" onclick="loadUsers()">🔄 刷新</button>
+        </div>
+      </div>
+      <div style="overflow:auto;flex:1">
+        <table class="kb-table">
+          <thead>
+            <tr><th>ID</th><th>账号</th><th>显示名</th><th>角色</th><th>租户</th><th>状态</th><th></th></tr>
+          </thead>
+          <tbody id="usersRows"></tbody>
+        </table>
+      </div>
+      <div id="usersMsg" class="kb-msg"></div>
+      <div id="usersErr" class="kb-err"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 新增用户模态框 ===== -->
+<div id="createUserModal" class="modal-overlay hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>➕ 新增用户</h3>
+      <button class="btn btn-sm btn-outline" onclick="closeCreateUser()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>账号（登录用户名）</label>
+        <input id="cuUsername" placeholder="如: zhangsan" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>显示名称</label>
+        <input id="cuDisplayName" placeholder="如: 张三">
+      </div>
+      <div class="field">
+        <label>初始密码（至少 6 位）</label>
+        <input id="cuPassword" type="password" placeholder="至少 6 位">
+      </div>
+      <div class="field">
+        <label>角色</label>
+        <select id="cuRole"></select>
+      </div>
+      <div class="field" id="cuTenantWrap">
+        <label>所属租户</label>
+        <select id="cuTenant"></select>
+      </div>
+      <div class="field">
+        <div id="cuMsg" class="kb-msg"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline" onclick="closeCreateUser()">取消</button>
+      <button class="btn btn-primary" onclick="submitCreateUser()">💾 创建</button>
     </div>
   </div>
 </div>
@@ -2034,6 +2540,12 @@ function showApp() {
   document.getElementById('displayName').textContent = currentUser.display_name;
   document.documentElement.style.visibility = 'visible';  // 校验通过，显示页面
   document.getElementById('appPage').classList.remove('hidden');
+  // 超级管理员 / 租户管理员 均显示"用户管理"tab
+  const usersBtn = document.getElementById('tabUsersBtn');
+  if (usersBtn) {
+    const canManage = (currentUser.role === 'super_admin' || currentUser.role === 'admin');
+    usersBtn.style.display = canManage ? 'inline-flex' : 'none';
+  }
   loadPrompts();
   loadCategories();
   loadQAHistory();      // 在线问答：刷新/重登后恢复历史问答
@@ -2050,13 +2562,16 @@ async function tryAutoLogin() {
     });
     if (res.ok) {
       const u = await res.json();
-      if (u.role !== 'admin'){ showNoPermission(u); return; }  // 非 admin 提示无权限,不让页面"消失"
+      if (u.role !== 'admin' && u.role !== 'super_admin'){ showNoPermission(u); return; }  // 仅 admin/super_admin 可进后台
       token = savedToken;
       currentUser = {
         username: u.username,
-        display_name: u.display_name || '管理员'
+        display_name: u.display_name || '管理员',
+        role: u.role,
+        tenant_id: u.tenant_id || 'default'
       };
       showApp();
+      loadKbTenants();
     } else {
       localStorage.removeItem('rag_token');
       location.replace('/login');
@@ -2074,6 +2589,8 @@ function switchTab(name) {
   document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
   document.getElementById(`tab${name.charAt(0).toUpperCase() + name.slice(1)}`).classList.add('active');
   if (name === 'usage') loadAdminUsage();
+  if (name === 'kb') loadKb();
+  if (name === 'users') loadUsers();
 }
 
 // ===== Token 用量看板 =====
@@ -2728,6 +3245,220 @@ async function submitChangePwd() {
     msgEl.textContent = '网络错误：' + e.message;
   }
 }
+
+// ===== Knowledge Base Tab =====
+let kbTenants = ['default'];
+
+async function loadKbTenants() {
+  try {
+    const res = await fetch('/api/tenants', {headers: {'Authorization': 'Bearer ' + token}});
+    if (res.ok) {
+      const d = await res.json();
+      kbTenants = d.tenants && d.tenants.length ? d.tenants : ['default'];
+    }
+  } catch (e) { console.warn('加载租户列表失败', e); }
+  const sel = document.getElementById('kbTenant');
+  if (!currentUser || currentUser.role !== 'super_admin') {
+    sel.style.display = 'none';
+    return;
+  }
+  sel.innerHTML = '';
+  kbTenants.forEach(t => {
+    const opt = document.createElement('option');
+    opt.value = t; opt.textContent = t;
+    if (t === currentUser.tenant_id) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  sel.style.display = 'inline-block';
+}
+
+async function loadKb() {
+  try {
+    const res = await fetch('/api/docs', {headers: {'Authorization': 'Bearer ' + token}});
+    const d = await res.json();
+    const tb = document.getElementById('kbRows');
+    tb.innerHTML = '';
+    (d.files || []).forEach(f => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + escapeHtml(f.path) + '</td><td>' + escapeHtml(f.tenant) + '</td><td>' + f.chunks + '</td><td>' + (f.size / 1024).toFixed(1) + 'KB</td>';
+      const td = document.createElement('td');
+      const b = document.createElement('button');
+      b.className = 'kb-btn-danger';
+      b.textContent = '删除';
+      b.onclick = () => deleteKb(f.path);
+      td.appendChild(b);
+      tr.appendChild(td);
+      tb.appendChild(tr);
+    });
+  } catch (e) { kbErr('加载文档列表失败: ' + e.message); }
+  try {
+    const res = await fetch('/api/docs/stats', {headers: {'Authorization': 'Bearer ' + token}});
+    const s = await res.json();
+    document.getElementById('kbStats').textContent =
+      '共 ' + (s.total_docs || 0) + ' 篇文档 · ' + (s.total_chunks || 0) + ' 分片' +
+      (s.by_tenant ? ' · 租户分布: ' + Object.entries(s.by_tenant).map(([k, v]) => k + ':' + v).join('  ') : '');
+  } catch (e) { document.getElementById('kbStats').textContent = ''; }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function uploadKb() {
+  const file = document.getElementById('kbFile').files[0];
+  if (!file) { kbErr('请选择文件'); return; }
+  const btn = document.querySelector('#tabKb button[onclick="uploadKb()"]');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 上传入库中...'; }
+  kbMsg('正在上传 ' + file.name + '，请稍候（大文件 PDF 解析+向量化可能需要几十秒）...');
+  kbErr('');
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('access_level', document.getElementById('kbAccess').value);
+  const t = document.getElementById('kbTenant');
+  if (currentUser.role === 'super_admin' && t.value) fd.append('tenant', t.value);
+  try {
+    const res = await fetch('/api/docs/upload', {method: 'POST', headers: {'Authorization': 'Bearer ' + token}, body: fd});
+    const d = await res.json();
+    if (d.success) { kbMsg('✅ 已入库: ' + d.file + ' (' + d.chunks + ' 分片)'); loadKb(); }
+    else kbErr(d.error || '上传失败');
+  } catch (e) { kbErr('上传失败: ' + e.message); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '⬆️ 上传并入库'; } }
+}
+
+async function deleteKb(path) {
+  if (!confirm('确认删除 ' + path + ' ?')) return;
+  try {
+    const res = await fetch('/api/docs/' + encodeURIComponent(path), {method: 'DELETE', headers: {'Authorization': 'Bearer ' + token}});
+    const d = await res.json();
+    if (d.success) { kbMsg('已删除'); loadKb(); }
+    else kbErr(d.error || '删除失败');
+  } catch (e) { kbErr('删除失败: ' + e.message); }
+}
+
+async function rebuildKb() {
+  if (!confirm('全量重建将重刷默认命名空间，耗时较长，继续？')) return;
+  try {
+    const res = await fetch('/api/docs/rebuild', {method: 'POST', headers: {'Authorization': 'Bearer ' + token}});
+    const d = await res.json();
+    if (d.success) kbMsg('重建已启动 job=' + d.job_id);
+    else kbErr(d.error || '重建失败');
+  } catch (e) { kbErr('重建失败: ' + e.message); }
+}
+
+function kbMsg(t) { document.getElementById('kbMsg').textContent = t; document.getElementById('kbErr').textContent = ''; }
+function kbErr(t) { document.getElementById('kbErr').textContent = t; document.getElementById('kbMsg').textContent = ''; }
+
+// ===== User Management Tab (super_admin only) =====
+async function loadUsers() {
+  const tb = document.getElementById('usersRows');
+  tb.innerHTML = '<tr><td colspan="7">加载中…</td></tr>';
+  try {
+    const res = await fetch('/api/admin/users', {headers: {'Authorization': 'Bearer ' + token}});
+    const d = await res.json();
+    if (!res.ok) { usersErr(d.error || '加载失败'); tb.innerHTML = ''; return; }
+    tb.innerHTML = '';
+    (d.users || []).forEach(u => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + u.id + '</td><td>' + escapeHtml(u.username) + '</td><td>' + escapeHtml(u.display_name || '') + '</td>' +
+        '<td>' + userRoleSelect(u.id, u.role) + '</td><td>' + escapeHtml(u.tenant_id || 'default') + '</td>' +
+        '<td>' + userActiveSelect(u.id, u.is_active) + '</td><td><button class="btn btn-sm btn-primary" onclick="saveUser(' + u.id + ')">保存</button></td>';
+      tb.appendChild(tr);
+    });
+    usersMsg(''); usersErr('');
+  } catch (e) { usersErr('加载用户列表失败: ' + e.message); }
+}
+
+function userRoleSelect(id, role) {
+  let opts = [['user','普通用户'],['admin','租户管理员']];
+  // 仅超级管理员可把用户设为超级管理员（防租户管理员越权提权）
+  if (currentUser && currentUser.role === 'super_admin') {
+    opts.push(['super_admin','超级管理员']);
+  }
+  let html = '<select id="role_' + id + '">';
+  opts.forEach(([v, l]) => { html += '<option value="' + v + '"' + (role === v ? ' selected' : '') + '>' + l + '</option>'; });
+  return html + '</select>';
+}
+
+function userActiveSelect(id, isActive) {
+  const opts = [[1,'启用'],[0,'禁用']];
+  let html = '<select id="active_' + id + '">';
+  opts.forEach(([v, l]) => { html += '<option value="' + v + '"' + (isActive == v ? ' selected' : '') + '>' + l + '</option>'; });
+  return html + '</select>';
+}
+
+async function saveUser(id) {
+  const role = document.getElementById('role_' + id).value;
+  const isActive = parseInt(document.getElementById('active_' + id).value, 10);
+  try {
+    const res = await fetch('/api/admin/users/' + id, {
+      method: 'PATCH',
+      headers: {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'},
+      body: JSON.stringify({role: role, is_active: isActive})
+    });
+    const d = await res.json();
+    if (res.ok) { usersMsg('用户 #' + id + ' 已更新'); loadUsers(); }
+    else usersErr(d.error || '保存失败');
+  } catch (e) { usersErr('保存失败: ' + e.message); }
+}
+
+function usersMsg(t) { document.getElementById('usersMsg').textContent = t; document.getElementById('usersErr').textContent = ''; }
+function usersErr(t) { document.getElementById('usersErr').textContent = t; document.getElementById('usersMsg').textContent = ''; }
+
+// ===== 新增用户 =====
+async function openCreateUser() {
+  const modal = document.getElementById('createUserModal');
+  modal.classList.remove('hidden');
+  // 角色选项按当前操作者权限：超级管理员多一个「超级管理员」
+  const roleSel = document.getElementById('cuRole');
+  roleSel.innerHTML = '<option value="user">普通用户</option><option value="admin">租户管理员</option>'
+    + ((currentUser && currentUser.role === 'super_admin') ? '<option value="super_admin">超级管理员</option>' : '');
+  // 租户：超级管理员可选全部租户；租户管理员锁定本租户
+  const tenantWrap = document.getElementById('cuTenantWrap');
+  const tenantSel = document.getElementById('cuTenant');
+  if (currentUser && currentUser.role === 'super_admin') {
+    tenantWrap.style.display = 'block';
+    try {
+      const res = await fetch('/api/tenants', {headers: {'Authorization': 'Bearer ' + token}});
+      const d = await res.json();
+      tenantSel.innerHTML = (d.tenants || []).map(t => '<option value="' + t + '">' + t + '</option>').join('');
+    } catch (e) { tenantSel.innerHTML = '<option value="default">default</option>'; }
+  } else {
+    tenantWrap.style.display = 'none';
+  }
+  document.getElementById('cuMsg').textContent = '';
+}
+
+function closeCreateUser() {
+  document.getElementById('createUserModal').classList.add('hidden');
+}
+
+async function submitCreateUser() {
+  const username = document.getElementById('cuUsername').value.trim();
+  const displayName = document.getElementById('cuDisplayName').value.trim();
+  const password = document.getElementById('cuPassword').value;
+  const role = document.getElementById('cuRole').value;
+  const tenant = (currentUser && currentUser.role === 'super_admin')
+    ? document.getElementById('cuTenant').value : (currentUser ? currentUser.tenant_id : 'default');
+  const msg = document.getElementById('cuMsg');
+  if (!username) { msg.style.color = 'crimson'; msg.textContent = '请填写账号'; return; }
+  if (password.length < 6) { msg.style.color = 'crimson'; msg.textContent = '密码至少 6 位'; return; }
+  try {
+    const res = await fetch('/api/admin/users', {
+      method: 'POST',
+      headers: {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'},
+      body: JSON.stringify({username: username, display_name: displayName, password: password, role: role, tenant_id: tenant})
+    });
+    const d = await res.json();
+    if (res.ok) {
+      msg.style.color = 'green';
+      msg.textContent = '已创建：' + d.username + '（' + d.role + ' / 租户 ' + d.tenant + '）';
+      closeCreateUser();
+      loadUsers();
+    } else {
+      msg.style.color = 'crimson'; msg.textContent = d.error || '创建失败';
+    }
+  } catch (e) { msg.style.color = 'crimson'; msg.textContent = '创建失败: ' + e.message; }
+}
 </script>
 
 <!-- 修改密码模态框（admin 后台用） -->
@@ -3115,6 +3846,33 @@ _HTML_PAGE = r"""
     padding:5px 12px;border-radius:7px;cursor:pointer;font-size:13px
   }
   .resume-bar .btn-resume-dismiss:hover{background:#f5f5f5}
+
+  /* ===== Tabs（与 /admin 风格一致） ===== */
+  .tabs{display:flex;gap:2px;padding:0 24px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
+  .tab{padding:13px 18px;font-size:14px;font-weight:500;color:var(--text-2);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;user-select:none;white-space:nowrap}
+  .tab:hover{color:var(--text)}
+  .tab.active{color:var(--primary);border-bottom-color:var(--primary)}
+  .tab-panel{display:none;flex:1;min-height:0;flex-direction:column}
+  .tab-panel.active{display:flex}
+
+  /* ===== 知识库 tab 内嵌 ===== */
+  .kb-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:16px 24px 0;max-width:1100px;width:100%;margin:0 auto}
+  .kb-toolbar select,.kb-toolbar input[type=file]{padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;background:var(--surface);color:var(--text)}
+  .kb-body{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin:16px 24px 24px;flex:1;overflow:hidden;display:flex;flex-direction:column;max-width:1100px;width:100%;margin-left:auto;margin-right:auto}
+  .kb-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .kb-card-header h2{font-size:17px;font-weight:600}
+  .kb-stats{color:var(--text-2);font-size:13px;margin-bottom:12px}
+  .kb-table{width:100%;border-collapse:collapse;font-size:14px}
+  .kb-table th,.kb-table td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border)}
+  .kb-table th{color:var(--text-2);font-weight:600;background:var(--bg)}
+  .kb-table tr:hover{background:var(--bg)}
+  .kb-msg{color:var(--success);font-size:13px;margin-top:8px}
+  .kb-err{color:var(--danger);font-size:13px;margin-top:8px}
+  .kb-btn-danger{border:1px solid var(--danger);color:var(--danger);background:#fff;padding:5px 12px;border-radius:var(--radius-sm);cursor:pointer;font-size:13px}
+  .kb-btn-danger:hover{background:var(--danger-light)}
+
+  /* ===== 用量 tab 内嵌 ===== */
+  .usage-wrap{padding:20px 24px;flex:1;overflow-y:auto;max-width:1100px;width:100%;margin:0 auto}
 </style>
 </head>
 <body>
@@ -3139,9 +3897,6 @@ _HTML_PAGE = r"""
     <div class="user-chip" id="userChip" title="当前登录账号(只读)">
       <span>👤</span><span class="uname" id="userLabel">guest</span>
     </div>
-    <div class="btn-usage" onclick="openUsage()" title="查看我的 Token 使用记录">
-      <span>📊</span><span>我的用量</span>
-    </div>
     <div class="status-indicator">
       <div class="status-dot"></div>
       <span>服务就绪</span>
@@ -3158,6 +3913,13 @@ _HTML_PAGE = r"""
     </button>
   </div>
 </header>
+
+<!-- Tabs（与 /admin 风格一致） -->
+<div class="tabs">
+  <div class="tab active" data-tab="chat" onclick="switchTab('chat')">💬 知识问答</div>
+  <div class="tab" data-tab="kb" onclick="switchTab('kb')">📚 知识库</div>
+  <div class="tab" data-tab="usage" onclick="switchTab('usage')">📊 我的用量</div>
+</div>
 
 <!-- Token 用量弹窗 -->
 <div class="modal-mask" id="usageModal" onclick="if(event.target===this)closeUsage()">
@@ -3207,38 +3969,87 @@ _HTML_PAGE = r"""
   </div>
 </div>
 
-<!-- Main Chat -->
-<div class="main">
-  <div class="chat-area" id="chatArea">
-    <!-- Welcome -->
-    <div class="welcome" id="welcome">
-      <div class="welcome-icon">📚</div>
-      <h2>欢迎使用企业知识库问答</h2>
-      <p>基于 AI 的智能文档问答系统，支持自然语言提问，从企业文档中精准检索答案。</p>
-      <div class="suggestions">
-        <div class="suggestion" onclick="askSuggestion(this)">定位精度多少？几种定位方式？续航如何？</div>
-        <div class="suggestion" onclick="askSuggestion(this)">通讯协议端口和心跳间隔是多少？</div>
-        <div class="suggestion" onclick="askSuggestion(this)">设备支持哪些报警功能？</div>
-        <div class="suggestion" onclick="askSuggestion(this)">待机时间120小时换算成天是多少？</div>
+<!-- Tab: 知识问答 -->
+<div id="tabChat" class="tab-panel active">
+  <div class="main">
+    <div class="chat-area" id="chatArea">
+      <!-- Welcome -->
+      <div class="welcome" id="welcome">
+        <div class="welcome-icon">📚</div>
+        <h2>欢迎使用企业知识库问答</h2>
+        <p>基于 AI 的智能文档问答系统，支持自然语言提问，从企业文档中精准检索答案。</p>
+        <div class="suggestions">
+          <div class="suggestion" onclick="askSuggestion(this)">定位精度多少？几种定位方式？续航如何？</div>
+          <div class="suggestion" onclick="askSuggestion(this)">通讯协议端口和心跳间隔是多少？</div>
+          <div class="suggestion" onclick="askSuggestion(this)">设备支持哪些报警功能？</div>
+          <div class="suggestion" onclick="askSuggestion(this)">待机时间120小时换算成天是多少？</div>
+        </div>
       </div>
     </div>
-  </div>
 
-    <!-- Input -->
-  <div class="input-area">
-    <!-- 断点重续横条：检测到上次未完成任务时显示 -->
-    <div id="resumeBar" class="resume-bar" style="display:none">
-      <span class="resume-icon">⏸️</span>
-      <span class="resume-text">检测到上次未完成的任务：<b class="resume-query"></b></span>
-      <button class="btn-resume" onclick="resumeFromBar()">继续</button>
-      <button class="btn-resume-dismiss" onclick="dismissResumeBar()">忽略</button>
+      <!-- Input -->
+    <div class="input-area">
+      <!-- 断点重续横条：检测到上次未完成任务时显示 -->
+      <div id="resumeBar" class="resume-bar" style="display:none">
+        <span class="resume-icon">⏸️</span>
+        <span class="resume-text">检测到上次未完成的任务：<b class="resume-query"></b></span>
+        <button class="btn-resume" onclick="resumeFromBar()">继续</button>
+        <button class="btn-resume-dismiss" onclick="dismissResumeBar()">忽略</button>
+      </div>
+      <div class="input-row">
+        <textarea id="questionInput" rows="1" placeholder="输入您的问题，按 Enter 发送（Shift+Enter 换行）..."
+          onkeydown="handleKeydown(event)"></textarea>
+        <button class="btn-send" id="sendBtn" onclick="onSendBtnClick()" title="发送">➤</button>
+      </div>
+      <div class="input-hint" id="docHint">当前为普通用户模式，仅可访问公开文档；管理员请从右上角进入系统管理</div>
     </div>
-    <div class="input-row">
-      <textarea id="questionInput" rows="1" placeholder="输入您的问题，按 Enter 发送（Shift+Enter 换行）..."
-        onkeydown="handleKeydown(event)"></textarea>
-      <button class="btn-send" id="sendBtn" onclick="onSendBtnClick()" title="发送">➤</button>
+  </div>
+</div>
+
+<!-- Tab: 知识库 -->
+<div id="tabKb" class="tab-panel">
+  <div class="kb-toolbar">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="file" id="kbFile">
+      <select id="kbAccess">
+        <option value="public">公开(本租户可读)</option>
+        <option value="restricted">受限(仅自己+管理员)</option>
+      </select>
+      <button class="btn btn-primary btn-sm" onclick="uploadKb()">⬆️ 上传并入库</button>
     </div>
-    <div class="input-hint" id="docHint">当前为普通用户模式，仅可访问公开文档；管理员请从右上角进入系统管理</div>
+  </div>
+  <div class="kb-body">
+    <div class="kb-card-header">
+      <h2>📚 文档列表</h2>
+      <button class="btn btn-sm btn-outline" onclick="rebuildKb()">♻️ 全量重建</button>
+    </div>
+    <div id="kbStats" class="kb-stats"></div>
+    <div style="overflow:auto;flex:1">
+      <table class="kb-table">
+        <thead>
+          <tr><th>路径</th><th>租户</th><th>分片</th><th>大小</th><th></th></tr>
+        </thead>
+        <tbody id="kbRows"></tbody>
+      </table>
+    </div>
+    <div id="kbMsg" class="kb-msg"></div>
+    <div id="kbErr" class="kb-err"></div>
+  </div>
+</div>
+
+<!-- Tab: 我的用量 -->
+<div id="tabUsage" class="tab-panel">
+  <div class="usage-wrap">
+    <div class="usage-toolbar">
+      <div class="range-btn active" data-range="today" onclick="setRangeInline('today')">今日</div>
+      <div class="range-btn" data-range="7d" onclick="setRangeInline('7d')">近 7 天</div>
+      <div class="range-btn" data-range="30d" onclick="setRangeInline('30d')">近 30 天</div>
+      <div class="range-btn" data-range="all" onclick="setRangeInline('all')">全部</div>
+      <div class="usage-db-tag" id="usageDbTagInline">—</div>
+    </div>
+    <div id="usageInline">
+      <div class="usage-empty">加载中…</div>
+    </div>
   </div>
 </div>
 
@@ -3304,6 +4115,91 @@ function doLogout(){
   setRagToken('');
   location.replace('/login');
 }
+
+// ============================================================
+// 顶部 Tab 切换（与 /admin 风格一致：知识问答 / 知识库 / 我的用量）
+// ============================================================
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('active'); });
+  document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active'); });
+  document.querySelector('.tab[data-tab="' + name + '"]').classList.add('active');
+  document.getElementById('tab' + name.charAt(0).toUpperCase() + name.slice(1)).classList.add('active');
+  if (name === 'usage') loadUsage('#usageInline', '#usageDbTagInline');
+  if (name === 'kb') loadKb();
+}
+
+// ============================================================
+// 知识库 tab（内嵌上传 / 列表 / 删除 / 重建，隔离规则与普通用户一致）
+// ============================================================
+async function loadKb() {
+  try {
+    const res = await fetch('/api/docs', {headers: {'Authorization': 'Bearer ' + getRagToken()}});
+    const d = await res.json();
+    const tb = document.getElementById('kbRows');
+    tb.innerHTML = '';
+    (d.files || []).forEach(function(f) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + escapeHtml(f.path) + '</td><td>' + escapeHtml(f.tenant) + '</td><td>' + f.chunks + '</td><td>' + (f.size / 1024).toFixed(1) + 'KB</td>';
+      const td = document.createElement('td');
+      const b = document.createElement('button');
+      b.className = 'kb-btn-danger';
+      b.textContent = '删除';
+      b.onclick = function() { deleteKb(f.path); };
+      td.appendChild(b);
+      tr.appendChild(td);
+      tb.appendChild(tr);
+    });
+  } catch (e) { kbErr('加载文档列表失败: ' + e.message); }
+  try {
+    const res = await fetch('/api/docs/stats', {headers: {'Authorization': 'Bearer ' + getRagToken()}});
+    const s = await res.json();
+    document.getElementById('kbStats').textContent =
+      '共 ' + (s.total_docs || 0) + ' 篇文档 · ' + (s.total_chunks || 0) + ' 分片' +
+      (s.by_tenant ? ' · 租户分布: ' + Object.entries(s.by_tenant).map(function(kv){return kv[0] + ':' + kv[1];}).join('  ') : '');
+  } catch (e) { document.getElementById('kbStats').textContent = ''; }
+}
+
+async function uploadKb() {
+  const file = document.getElementById('kbFile').files[0];
+  if (!file) { kbErr('请选择文件'); return; }
+  const btn = document.querySelector('#tabKb button[onclick="uploadKb()"]');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 上传入库中...'; }
+  kbMsg('正在上传 ' + file.name + '，请稍候（大文件 PDF 解析+向量化可能需要几十秒）...');
+  kbErr('');
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('access_level', document.getElementById('kbAccess').value);
+  try {
+    const res = await fetch('/api/docs/upload', {method: 'POST', headers: {'Authorization': 'Bearer ' + getRagToken()}, body: fd});
+    const d = await res.json();
+    if (d.success) { kbMsg('✅ 已入库: ' + d.file + ' (' + d.chunks + ' 分片)'); loadKb(); }
+    else kbErr(d.error || '上传失败');
+  } catch (e) { kbErr('上传失败: ' + e.message); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = '⬆️ 上传并入库'; } }
+}
+
+async function deleteKb(path) {
+  if (!confirm('确认删除 ' + path + ' ?')) return;
+  try {
+    const res = await fetch('/api/docs/' + encodeURIComponent(path), {method: 'DELETE', headers: {'Authorization': 'Bearer ' + getRagToken()}});
+    const d = await res.json();
+    if (d.success) { kbMsg('已删除'); loadKb(); }
+    else kbErr(d.error || '删除失败');
+  } catch (e) { kbErr('删除失败: ' + e.message); }
+}
+
+async function rebuildKb() {
+  if (!confirm('全量重建将重刷默认命名空间，耗时较长，继续？')) return;
+  try {
+    const res = await fetch('/api/docs/rebuild', {method: 'POST', headers: {'Authorization': 'Bearer ' + getRagToken()}});
+    const d = await res.json();
+    if (d.success) kbMsg('重建已启动 job=' + d.job_id);
+    else kbErr(d.error || '重建失败');
+  } catch (e) { kbErr('重建失败: ' + e.message); }
+}
+
+function kbMsg(t) { document.getElementById('kbMsg').textContent = t; document.getElementById('kbErr').textContent = ''; }
+function kbErr(t) { document.getElementById('kbErr').textContent = t; document.getElementById('kbMsg').textContent = ''; }
 
 // ============================================================
 // 修改密码（聊天页，普通用户/任意登录用户通用）
@@ -3438,8 +4334,8 @@ function fmtTime(ts) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-async function loadUsage() {
-  const box = document.getElementById('usageContent');
+async function loadUsage(boxSel, dbTagSel) {
+  const box = document.getElementById(boxSel || 'usageContent');
   box.innerHTML = '<div class="usage-empty">加载中…</div>';
   try {
     const url = `/api/usage/me?user=${encodeURIComponent(currentUser)}&range=${usageRange}&limit=100`;
@@ -3449,12 +4345,20 @@ async function loadUsage() {
       box.innerHTML = `<div class="usage-empty">❌ ${data.error || '查询失败'}</div>`;
       return;
     }
-    document.getElementById('usageDbTag').textContent =
-      data.persisted ? `已持久化 · ${data.db}` : '仅内存（重启即丢）';
+    const tag = document.getElementById(dbTagSel || 'usageDbTag');
+    if (tag) tag.textContent = data.persisted ? `已持久化 · ${data.db}` : '仅内存（重启即丢）';
     renderUsage(box, data);
   } catch (e) {
     box.innerHTML = '<div class="usage-empty">❌ 网络异常，无法获取用量</div>';
   }
+}
+
+// 用量 tab 内联切换（与弹窗 openUsage 共用 loadUsage/renderUsage）
+function setRangeInline(r) {
+  usageRange = r;
+  document.querySelectorAll('#tabUsage .range-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.range === r));
+  loadUsage('#usageInline', '#usageDbTagInline');
 }
 
 function renderUsage(box, data) {

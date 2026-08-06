@@ -24,6 +24,9 @@ chroma_db/
 # 摄取运行时指纹缓存（可重建，不提交）
 knowledge/**/.ingest_manifest.sqlite
 
+# 用户上传的知识库文档（租户数据，含 PDF/Word 等大二进制，不提交 Git；运行时自动创建）
+knowledge/
+
 # 提案视频/图片的渲染产物（大二进制；脚本可重生成，不提交）
 assets/proposal_video/*.mp4
 assets/proposal_video/*.mp3
