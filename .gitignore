@@ -32,7 +32,8 @@ assets/proposal_video/*.png
 assets/proposal_images/*.png
 
 # 规划/方案类分析文档（非交付代码，仅本地参考，不提交）
-docs/reports/
+# 注：RAG数据面改造方案.md / P0_FIX_PLAN.md 及其配图现需随仓库提交，已放开此规则
+# docs/reports/
 
 # 自动生成的配图产物（程序运行时自动创建，可重建，不提交）
 assets/figures/

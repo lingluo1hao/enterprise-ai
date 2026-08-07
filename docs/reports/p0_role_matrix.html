@@ -1,0 +1,38 @@
+<div style="font-family:Segoe UI,Helvetica,Arial,sans-serif;background:#FFFFFF;padding:8px 12px;border-radius:10px;">
+  <div style="font-size:18px;font-weight:700;color:#0C447C;margin-bottom:6px;">角色 × 操作权限矩阵</div>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;">
+    <thead>
+      <tr style="background:#185FA5;color:#FFFFFF;">
+        <th style="padding:8px 10px;text-align:left;border:1px solid #0C447C;">角色</th>
+        <th style="padding:8px 10px;text-align:left;border:1px solid #0C447C;">上传落点</th>
+        <th style="padding:8px 10px;text-align:left;border:1px solid #0C447C;">可见范围</th>
+        <th style="padding:8px 10px;text-align:left;border:1px solid #0C447C;">可删除</th>
+        <th style="padding:8px 10px;text-align:left;border:1px solid #0C447C;">可重建</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="background:#F7F8FA;">
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;font-weight:600;color:#2C2C2A;">普通用户</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;">自己租户 / 自己拥有</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;">本租户 public + 自己 restricted</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;">仅自己拥有的</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;">否</td>
+      </tr>
+      <tr>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;font-weight:600;color:#2C2C2A;background:#E6F1FB;">租户管理员</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;background:#E6F1FB;">本租户</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;background:#E6F1FB;">整个租户</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;background:#E6F1FB;">租户内任意</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#2C2C2A;background:#E6F1FB;">本租户</td>
+      </tr>
+      <tr style="background:#F7F8FA;">
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;font-weight:600;color:#3C3489;background:#EEEDFE;">super-admin</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#3C3489;background:#EEEDFE;">可指定任意租户</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#3C3489;background:#EEEDFE;">全部</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#3C3489;background:#EEEDFE;">任意</td>
+        <td style="padding:8px 10px;border:1px solid #D9D6CC;color:#3C3489;background:#EEEDFE;">任意</td>
+      </tr>
+    </tbody>
+  </table>
+  <div style="font-size:11px;color:#5F5E5A;margin-top:6px;">注：tenant / owner 全部取自登录态 g.current_user，前端无法伪造；存量数据默认 tenant=default，行为零变化。</div>
+</div>
