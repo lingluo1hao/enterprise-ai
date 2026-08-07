@@ -133,13 +133,16 @@ def _figures_dir(path: str) -> tuple:
 
 
 def _load_pdf(path: str) -> Optional[list]:
-    """使用 PyMuPDF 提取 PDF 文本与表格。
+    """使用 PyMuPDF 提取 PDF 文本与表格，并**按章节聚合为结构化单元**。
 
-    - 优先把页面内表格识别出来并转为 Markdown 表格；
-    - 表格区域同时渲染为图片保存，作为 LLM 可视化兜底；
-    - 表格区域从普通文本中剔除，避免重复；
-    - 按阅读顺序（y 坐标）把段落与表格拼接；
-    - 每页返回一个 RawDoc，便于与 figure_paths 按页对应；
+    核心改造（解决「按页切 → 章节破碎、图/表/文错配」）：
+    - 全文档扫描标题层级（如 2 / 2.13 / 2.13.2），选定切分级别（默认二级 2.13）；
+    - 以「章节」为聚合单元：每个章节 = 其标题 + 下属文字 + 下属表格（[TABLE]+[[FIG:]]）
+      + 该章节范围内的所有图片（通用图抽取 + 表格图）。**大章节天然包含小章节**
+      （小章节标题作为普通文本内嵌，表格/图片/文字都跟随所属章节）；
+    - 每个章节产出一个 RawDoc（section_path 已设置），交由 chunker 做
+      「整章为父、细切为子」的 small-to-big 父子切片；
+    - 表格区域渲染为 PNG 并内嵌 [[FIG:...]]，表格图不挂到页级 figure_paths。
     - 缺失 PyMuPDF 或提取失败时返回 None，由调用方降级到 PyPDFLoader。
     """
     try:
@@ -149,90 +152,195 @@ def _load_pdf(path: str) -> Optional[list]:
     try:
         out_dir, rel_prefix = _figures_dir(path)
         os.makedirs(out_dir, exist_ok=True)
-        # 清理旧版表格图（避免同名文件重建后残留过期图片）
+        # 清理旧版表格图，避免重建后残留过期图片
         for old in glob.glob(os.path.join(out_dir, "table_p*.png")):
             try:
                 os.remove(old)
             except OSError:
                 pass
 
-        pages: List["object"] = []
+        # 通用图抽取（每页列表，与语言/caption/排版无关）
+        gen_figs = _extract_figures(path)  # 失败返回 []
+
+        # 标题识别：编号标题（2 / 2.13 / 2.13.2 ...），过长的行不当标题
+        def _heading_level(t: str):
+            m = re.match(r"^(\d+(?:\.\d+)+)\s+", t)
+            if not m:
+                return None
+            if len(t) > 80:
+                return None
+            return m.group(1).count(".") + 1  # 2→1, 2.13→2, 2.13.2→3
+
+        # 第一遍：按页提取 items（text / table），并统计标题层级分布
+        pages_items = []          # [(page_idx, [(kind, payload), ...], [gen_fig_paths])]
+        level_counts = {}
         with fitz.open(path) as doc:
             for page_idx, page in enumerate(doc, 1):
-                # 1) 找表格
-                table_objs = []
+                # 1) 表格
+                tables = []
                 try:
                     tabs = page.find_tables()
-                    table_objs = tabs.tables if tabs else []
+                    for tidx, tab in enumerate(tabs.tables if tabs else []):
+                        try:
+                            rows = tab.extract()
+                        except Exception:
+                            continue
+                        md = _table_to_markdown(rows)
+                        if not md:
+                            continue
+                        bbox = fitz.Rect(tab.bbox)
+                        fig_name = f"table_p{page_idx:03d}_{tidx+1}.png"
+                        fig_path = f"{rel_prefix}/{fig_name}"
+                        try:
+                            scale = 2.0
+                            pad = 6
+                            clip = fitz.Rect(
+                                max(0, bbox.x0 - pad), max(0, bbox.y0 - pad),
+                                min(page.rect.width, bbox.x1 + pad),
+                                min(page.rect.height, bbox.y1 + pad),
+                            )
+                            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip)
+                            pix.save(os.path.join(out_dir, fig_name))
+                        except Exception as te:
+                            print(f"[ingest] 第 {page_idx} 页表格 {tidx+1} 渲染失败: {te}")
+                            fig_path = ""
+                        tables.append({"y0": bbox.y0, "bbox": bbox, "md": md, "fig_path": fig_path})
                 except Exception as te:
                     print(f"[ingest] 第 {page_idx} 页表格检测失败: {te}")
 
-                table_markdowns = []   # (Rect, markdown_text)
-                table_bboxes = []
-                table_fig_paths: List[str] = []
-                for tidx, tab in enumerate(table_objs):
-                    try:
-                        rows = tab.extract()
-                    except Exception:
-                        continue
-                    md = _table_to_markdown(rows)
-                    if not md:
-                        continue
-                    bbox = fitz.Rect(tab.bbox)
-                    table_bboxes.append(bbox)
-                    # 用 [TABLE] 标签包裹，便于 chunker 识别为保护片段
-                    table_markdowns.append((bbox, f"\n\n[TABLE]\n{md}\n[/TABLE]\n\n"))
-
-                    # 把表格区域渲染成图片，作为 Markdown 表格的可视化兜底
-                    try:
-                        scale = 2.0
-                        pad = 6
-                        clip = fitz.Rect(
-                            max(0, bbox.x0 - pad),
-                            max(0, bbox.y0 - pad),
-                            min(page.rect.width, bbox.x1 + pad),
-                            min(page.rect.height, bbox.y1 + pad),
-                        )
-                        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip)
-                        fname = f"table_p{page_idx:03d}_{tidx+1}.png"
-                        pix.save(os.path.join(out_dir, fname))
-                        table_fig_paths.append(f"{rel_prefix}/{fname}")
-                    except Exception as te:
-                        print(f"[ingest] 第 {page_idx} 页表格 {tidx+1} 渲染失败: {te}")
-
-                # 2) 提取非表格文本块
-                text_blocks = []
+                # 2) 非表格文本块
+                text_items = []
                 for b in page.get_text("blocks"):
                     bbox = fitz.Rect(b[:4])
                     txt = b[4].strip()
                     if not txt:
                         continue
-                    # 若文本块与表格 bbox 显著相交，则视为表格内容，跳过
-                    if any(bbox.intersects(tb) for tb in table_bboxes):
+                    if any(bbox.intersects(t["bbox"]) for t in tables):
                         continue
-                    text_blocks.append((bbox.y0, txt))
+                    text_items.append({"y0": bbox.y0, "text": txt})
 
-                # 3) 表格也作为独立块加入，按 y0 排序实现阅读顺序
-                for bbox, md in table_markdowns:
-                    text_blocks.append((bbox.y0, md))
+                # 3) 按阅读顺序合并，并登记标题层级
+                items = []
+                for t in tables:
+                    items.append((t["y0"], "table", t))
+                for tb in text_items:
+                    items.append((tb["y0"], "text", tb))
+                items.sort(key=lambda x: x[0])
 
-                text_blocks.sort(key=lambda x: x[0])
-                page_text = "\n\n".join(t for _, t in text_blocks if t.strip())
-                if page_text.strip():
-                    page_text = f"[Page {page_idx}]\n{page_text.strip()}"
-                else:
-                    page_text = f"[Page {page_idx}]"
-                pages.append(RawDoc(
-                    text=page_text,
-                    source=path,
-                    file_name=os.path.basename(path),
-                    page=page_idx,
-                    figure_paths=table_fig_paths,
-                ))
+                for _, kind, blk in items:
+                    if kind == "text":
+                        lv = _heading_level(blk["text"])
+                        if lv is not None:
+                            level_counts[lv] = level_counts.get(lv, 0) + 1
 
-        if not pages:
+                gfigs = gen_figs[page_idx - 1] if page_idx - 1 < len(gen_figs) else []
+                pages_items.append((page_idx, items, gfigs))
+
+        # 选定切分级别：优先二级（2.13），否则一级（2），否则整文档一章
+        if level_counts.get(2, 0) >= 1:
+            split_level = 2
+        elif level_counts.get(1, 0) >= 1:
+            split_level = 1
+        else:
+            split_level = None
+
+        # 第二遍：按 split_level 标题切分章节，聚合文字/表格/图片。
+        # 单章节超限（> MAX_SECTION_CHARS）自动「续切」为同名续章，
+        # 既保证「整章为父窗口不超 Milvus 字段上限」，又让大章节仍能完整还原。
+        MAX_SECTION_CHARS = 7800
+        sections = []
+        current = None
+        chapter_prefix = ""   # 最近的上级章节标题（如 "2 WIFI 定位"），用于层级路径
+
+        def _new_section(title="", start_page=None, path=None):
+            return {"items": [], "figures": [], "title": title,
+                    "start_page": start_page, "path": path or [], "length": 0}
+
+        def _has_content(s):
+            for kind, _ in s["items"]:
+                if kind in ("text", "table", "fig"):
+                    return True
+            return False
+
+        def _render(s):
+            parts = []
+            for kind, val in s["items"]:
+                if kind == "text":
+                    parts.append(val)
+                elif kind == "fig":
+                    parts.append(f"[[FIG:{val}]]")
+                elif kind == "table":
+                    fig_line = f"[[FIG:{val['fig_path']}]]\n" if val["fig_path"] else ""
+                    parts.append(f"[TABLE]\n{fig_line}{val['md']}\n[/TABLE]")
+            return "\n\n".join(p for p in parts if p.strip())
+
+        def _flush():
+            nonlocal current
+            if current is not None and _has_content(current):
+                sections.append({
+                    "text": _render(current),
+                    "figures": current["figures"],
+                    "path": current["path"],
+                    "start_page": current["start_page"],
+                })
+
+        def _add_item(kind, val, length):
+            nonlocal current
+            # 续切：当前章节已有内容且加上本项将超限 → 收尾并开同名续章（路径不变）
+            if (current is not None and _has_content(current)
+                    and current["length"] + length > MAX_SECTION_CHARS):
+                _flush()
+                current = _new_section(title=current["title"],
+                                       start_page=current["start_page"],
+                                       path=list(current["path"]))
+            if current is None:
+                current = _new_section(start_page=None)
+            current["items"].append((kind, val))
+            current["length"] += length
+            if kind == "table" and val["fig_path"]:
+                current["figures"].append(val["fig_path"])
+            elif kind == "fig":
+                current["figures"].append(val)
+
+        for page_idx, items, gfigs in pages_items:
+            for _, kind, blk in items:
+                if kind == "table":
+                    _add_item("table", blk, len(blk["md"]) + 40)
+                else:  # text
+                    text = blk["text"]
+                    lv = _heading_level(text)
+                    if split_level is not None and lv == split_level:
+                        # 章节边界：收尾上一章，开新章，并把标题行写入新章
+                        _flush()
+                        current = _new_section(title=text, start_page=page_idx)
+                        current["path"] = ([chapter_prefix] if chapter_prefix else []) + [text]
+                        _add_item("text", text, len(text))
+                    else:
+                        # 非切分级标题：更新上级章节前缀（仅一级），并作为正文行内嵌
+                        if lv == 1 and split_level == 2:
+                            chapter_prefix = text
+                        _add_item("text", text, len(text))
+            # 本页通用图：挂到当前章节，并按出现位置内嵌 [[FIG:]]
+            for fg in gfigs:
+                _add_item("fig", fg, 40)
+        _flush()
+
+        # 章节 → RawDoc（section_path 已设置，标记为「已分章节单元」）
+        out = []
+        for sec in sections:
+            figs = list(dict.fromkeys(sec["figures"]))  # 去重保序
+            out.append(RawDoc(
+                text=sec["text"],
+                source=path,
+                file_name=os.path.basename(path),
+                page=sec["start_page"],
+                figure_paths=figs,
+                section_path=sec["path"] or None,
+            ))
+
+        if not out:
             return None
-        return pages
+        return out
     except Exception as e:
         print(f"[ingest] PyMuPDF 读取 PDF 失败 {os.path.basename(path)}: {e}")
         return None
@@ -249,23 +357,22 @@ def load_file(path: str) -> List["object"]:
         elif ext == ".pdf":
             res = _load_pdf(path)
             if res is not None:
-                out = res
-            else:
-                # 降级：PyPDFLoader（纯文本，表格结构会丢失）
-                from langchain_community.document_loaders import PyPDFLoader
-                docs = PyPDFLoader(path).load()
-                out = []
-                for d in docs:
-                    pg = d.metadata.get("page") if hasattr(d, "metadata") else None
-                    page = (int(pg) + 1) if pg is not None else None
-                    out.append(RawDoc(
-                        text=d.page_content or "",
-                        source=path,
-                        file_name=os.path.basename(path),
-                        page=page,
-                    ))
-            # 通用 PDF 图抽取：每页可能多张图（PyMuPDF + 像素墨迹 + 连通分量）
-            # 按页对齐：out 已按 1-based 页码排序，figs_per_page[i] 对应第 i+1 页
+                # 已按章节聚合：section_path / figure_paths 就绪，直接返回
+                return res
+            # 降级：PyPDFLoader（纯文本，无结构/无表格图）
+            from langchain_community.document_loaders import PyPDFLoader
+            docs = PyPDFLoader(path).load()
+            out = []
+            for d in docs:
+                pg = d.metadata.get("page") if hasattr(d, "metadata") else None
+                page = (int(pg) + 1) if pg is not None else None
+                out.append(RawDoc(
+                    text=d.page_content or "",
+                    source=path,
+                    file_name=os.path.basename(path),
+                    page=page,
+                ))
+            # 降级路径：通用图抽取按页对齐补 figure_paths
             figs_per_page = _extract_figures(path)
             for raw_doc, figs in zip(out, figs_per_page):
                 if figs:

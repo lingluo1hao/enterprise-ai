@@ -19,6 +19,10 @@ class RawDoc:
     # PDF 页面渲染图的文件路径（相对项目根），前端可直接 <img src> 引用。
     # PDF 真图裁剪图的文件路径（相对项目根，PyMuPDF 连通分量抽取），前端可直接 <img src> 引用。
     # 缺失 pymupdf/numpy/scipy 或非 PDF 来源时为 []。
+    # 章节路径（如 ["2 WIFI 定位", "2.13 WIFI 4G 定位包 0xA2"]）：
+    # 由 loader 按章节聚合后设置的「已分章节单元」标记；chunker 据此走
+    # 「整章为父、细切为子」的 small-to-big 父子切片。未分章节的 RawDoc 为 None。
+    section_path: Optional[List[str]] = None
 
 
 @dataclass

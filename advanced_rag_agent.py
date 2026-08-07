@@ -795,6 +795,9 @@ class VectorStoreManager:
         else:
             expr = (f'(tenant_id == "{tenant_id}") and '
                     f'((access_level == "public") or (user_id == "{user_id}"))')
+        # 父子文档：主检索只召回「子片段」，父窗口仅作上下文透传
+        # （避免整章父 chunk 被当 child 召回、撑爆上下文并重复计数）
+        expr = expr + " and (is_parent == false)" if expr else "(is_parent == false)"
         fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
                   "chunk_type", "figure_paths", "page",
                   "parent_id", "parent_content", "is_parent"]
@@ -839,12 +842,15 @@ class VectorStoreManager:
         返回 [(Document, score), ...]，score 越小越相关；与 similarity_search_with_score 同语义。
         """
         # 权限 + chunk_type 双重过滤
+        # 注：新章节化切片不再产出 chunk_type=="page" 的图页，
+        # 图片/表格已内嵌在 section / table chunk 中，因此此处放宽到
+        # page / table / section 三类含图 chunk，保证图查询仍可召回。
         if filter_role == ROLE_SUPER_ADMIN or tenant_id == "__global__":
-            expr = 'chunk_type == "page"'
+            expr = 'chunk_type in ["page", "table", "section"]'
         elif filter_role == ROLE_ADMIN:
-            expr = f'(chunk_type == "page") and (tenant_id == "{tenant_id}")'
+            expr = f'(chunk_type in ["page", "table", "section"]) and (tenant_id == "{tenant_id}")'
         else:
-            expr = (f'(chunk_type == "page") and (tenant_id == "{tenant_id}") and '
+            expr = (f'(chunk_type in ["page", "table", "section"]) and (tenant_id == "{tenant_id}") and '
                     f'((access_level == "public") or (user_id == "{user_id}"))')
         fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
                   "chunk_type", "figure_paths", "page",
@@ -888,14 +894,20 @@ class VectorStoreManager:
         return raw_docs
 
     def _split(self, raw_docs):
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-        return RecursiveCharacterTextSplitter(
-            separators=SEPARATORS,
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            length_function=len,
-            strip_whitespace=True,
-        ).split_documents(raw_docs)
+        # 纯 Python 递归切分（不再依赖 langchain_text_splitters：
+        # 该包在部分 Python 环境下 import 即段错误，且段错误无法被 try/except 捕获）
+        from ingest.chunk import _py_recursive_split
+        from langchain_core.documents import Document
+        out = []
+        for d in raw_docs:
+            text = getattr(d, "page_content", "") or ""
+            for p in _py_recursive_split(text, SEPARATORS, CHUNK_SIZE, CHUNK_OVERLAP):
+                if p.strip():
+                    out.append(Document(
+                        page_content=p,
+                        metadata=dict(getattr(d, "metadata", {}) or {}),
+                    ))
+        return out
 
     def similarity_search_with_score(self, query: str, k: int = 4,
                                      filter_role: str = None,
@@ -1143,7 +1155,9 @@ class DocSearchSkill(BaseSkill):
                 f"[{os.path.basename(source)} 第{page}页]\n{content_truncated}"
             )
             # 如果该片段带了页面渲染图，前端可据此渲染 <img>；用 [[FIG:path]] 占位符
-            fig_paths = doc.metadata.get("figure_paths") or []
+            fig_paths = set(doc.metadata.get("figure_paths") or [])
+            # 同时扫描 chunk 文本中的内嵌 [[FIG:...]] 占位符（表格图路径内嵌在 [TABLE] 块里）
+            fig_paths.update(re.findall(r"\[\[FIG:([^\]]+)\]\]", doc.page_content or ""))
             for fp in fig_paths:
                 if fp:
                     result_parts.append(f"[[FIG:{fp}]]")

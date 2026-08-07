@@ -45,6 +45,67 @@ MAX_ATOMIC = 2000
 
 _CODE_RE = re.compile(r"```.*?```", re.DOTALL)
 
+
+# --------------------------------------------------------------------------- #
+# 纯 Python 递归切分（替代 langchain_text_splitters）
+# 原因：langchain_text_splitters 在部分 Python 环境下 import 即段错误，且段错误
+# 无法被 try/except 捕获，会导致整个切片进程崩溃。以下实现行为对齐
+# RecursiveCharacterTextSplitter（按分隔符递归、末级硬切、相邻块重叠）。
+# --------------------------------------------------------------------------- #
+def _hard_split(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+    """末级硬切（字符级）：按 chunk_size 切，相邻块重叠 chunk_overlap。"""
+    if not text or not text.strip():
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    step = max(1, chunk_size - chunk_overlap)
+    out: List[str] = []
+    for i in range(0, len(text), step):
+        piece = text[i:i + chunk_size]
+        if piece.strip():
+            out.append(piece)
+    return out
+
+
+def _py_recursive_split(text: str, separators: List[str],
+                        chunk_size: int, chunk_overlap: int) -> List[str]:
+    """纯 Python 递归字符切分：超长片段递归下一级分隔符，末级硬切。"""
+    if not text or not text.strip():
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    for idx, sep in enumerate(separators):
+        if sep and sep in text:
+            parts = text.split(sep)
+            pieces = [p + sep if i < len(parts) - 1 else p
+                      for i, p in enumerate(parts)]
+            # 合并相邻小段至接近 chunk_size
+            merged: List[str] = []
+            buf = ""
+            for pc in pieces:
+                if not buf:
+                    buf = pc
+                elif len(buf) + len(pc) <= chunk_size:
+                    buf += pc
+                else:
+                    merged.append(buf)
+                    buf = pc
+            if buf:
+                merged.append(buf)
+            result: List[str] = []
+            for m in merged:
+                if len(m) <= chunk_size:
+                    result.append(m)
+                else:
+                    deeper = separators[idx + 1:]
+                    if deeper:
+                        result.extend(_py_recursive_split(
+                            m, deeper, chunk_size, chunk_overlap))
+                    else:
+                        result.extend(_hard_split(m, chunk_size, chunk_overlap))
+            return result
+    return _hard_split(text, chunk_size, chunk_overlap)
+
 # --------------------------------------------------------------------------- #
 # 图区邻近合并：把「图标题 + 邻近上下文」合并成独立图块，提升图表类内容的召回
 # --------------------------------------------------------------------------- #
@@ -62,6 +123,11 @@ FIGURE_AFTER = 1000
 # 整页文本若短于该值（典型图表页），直接整页作为图块，避免漏掉图内零散文字
 # 提高到 3000：很多 PDF 真图页 1500-3000 字（说明+图注+周围段落）
 FIGURE_PAGE_MAX = 3000
+
+# 内嵌 [[FIG:...]] 占位符提取：loaders.py 把表格图路径直接写进 [TABLE] 块，
+# chunker 扫描每个 chunk 文本，把真实出现的占位符同步到 figure_paths，
+# 避免"一页所有 chunk 都带全页所有图"的错配问题。
+_EMBEDDED_FIG_RE = re.compile(r"\[\[FIG:([^\]]+)\]\]")
 
 
 def _extract_figure_blocks(text: str) -> List[str]:
@@ -100,24 +166,18 @@ def _is_separator_row(s: str) -> bool:
 def chunk_documents(raw_docs: List, chunk_size: int = 600,
                     chunk_overlap: int = 120,
                     separators: List[str] = None) -> List[Chunk]:
-    """把 RawDoc 列表切成 Chunk 列表（朴素固定窗口，无结构感知）。"""
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    """把 RawDoc 列表切成 Chunk 列表（朴素固定窗口，无结构感知）。
 
+    纯 Python 实现（不再依赖 langchain_text_splitters，避免其在部分环境下
+    import 即段错误）。
+    """
     if separators is None:
         separators = DEFAULT_SEPARATORS
-
-    splitter = RecursiveCharacterTextSplitter(
-        separators=separators,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        strip_whitespace=True,
-    )
     out = []
     for doc in raw_docs:
         if not doc.text or not doc.text.strip():
             continue
-        parts = splitter.split_text(doc.text)
+        parts = _py_recursive_split(doc.text, separators, chunk_size, chunk_overlap)
         for i, p in enumerate(parts):
             out.append(Chunk(
                 text=p,
@@ -133,13 +193,29 @@ def chunk_documents(raw_docs: List, chunk_size: int = 600,
 # 结构感知：把文本切成 (kind, text) 片段，保护代码块/表格不被切断
 # --------------------------------------------------------------------------- #
 def _segment_tables(text: str) -> List[tuple]:
-    """在普通文本中识别 Markdown 表格，返回 prose/table 交替片段。"""
+    """在普通文本中识别 Markdown 表格 / [TABLE] 原子块，返回 prose/table 交替片段。"""
     lines = text.split("\n")
     segs: List[tuple] = []
     i, n = 0, len(lines)
     buf_start = 0
     while i < n:
-        if "|" in lines[i] and i + 1 < n and _is_separator_row(lines[i + 1]):
+        # loaders.py 已经把「章节标题 + [[FIG:...]] + Markdown 表格」打包成 [TABLE] 原子块，
+        # 直接整体作为 table 片段，避免标题/图占位符被拆到前面的 prose chunk。
+        if lines[i].strip() == "[TABLE]":
+            pre = "\n".join(lines[buf_start:i])
+            if pre.strip():
+                segs.append(("prose", pre))
+            j = i + 1
+            while j < n and lines[j].strip() != "[/TABLE]":
+                j += 1
+            # 包含 [TABLE] 与 [/TABLE] 标记
+            end = min(j + 1, n)
+            block = "\n".join(lines[i:end])
+            if block.strip():
+                segs.append(("table", block))
+            i = end
+            buf_start = end
+        elif "|" in lines[i] and i + 1 < n and _is_separator_row(lines[i + 1]):
             pre = "\n".join(lines[buf_start:i])
             if pre.strip():
                 segs.append(("prose", pre))
@@ -172,6 +248,62 @@ def _segment(text: str) -> List[tuple]:
 
 
 # --------------------------------------------------------------------------- #
+# 纯 Python Markdown / HTML 标题切分（替代 langchain_text_splitters 的
+# MarkdownHeaderTextSplitter / HTMLHeaderTextSplitter——后者在部分 Python 环境下
+# import 即段错误，且段错误无法被 try/except 捕获）。返回 [(content, path), ...]，
+# path 为标题层级链（如 ["第一章", "安装"]）。
+# --------------------------------------------------------------------------- #
+_MD_HEADER_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_HTML_HEADER_RE = re.compile(r"<h([1-6])[^>]*>(.*?)</h\1>", re.IGNORECASE | re.DOTALL)
+
+
+def _split_md_by_headers(text: str) -> List[tuple]:
+    """按 #~#### 标题把 Markdown 切成 (content, path) 列表。"""
+    lines = text.split("\n")
+    headers = []
+    for i, ln in enumerate(lines):
+        m = _MD_HEADER_RE.match(ln)
+        if m:
+            headers.append((i, len(m.group(1)), m.group(2).strip()))
+    if not headers:
+        return [(text, [])]
+    sections: List[tuple] = []
+    stack: List[tuple] = []
+    for hidx, (line_idx, level, title) in enumerate(headers):
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+        path = [t for _, t in stack]
+        end = headers[hidx + 1][0] if hidx + 1 < len(headers) else len(lines)
+        content = "\n".join(lines[line_idx:end]).strip()
+        if content:
+            sections.append((content, path))
+    return sections
+
+
+def _split_html_by_headers(text: str) -> List[tuple]:
+    """按 <h1>~<h6> 把 HTML 切成 (content, path)，内容做基础标签剥离。"""
+    headers = [(m.start(), int(m.group(1)),
+                re.sub(r"<[^>]+>", "", m.group(2)).strip(), m.end())
+               for m in _HTML_HEADER_RE.finditer(text)]
+    if not headers:
+        return [(text, [])]
+    sections: List[tuple] = []
+    stack: List[tuple] = []
+    for hidx, (_, level, title, end) in enumerate(headers):
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        stack.append((level, title))
+        path = [t for _, t in stack]
+        nxt = headers[hidx + 1][0] if hidx + 1 < len(headers) else len(text)
+        content = re.sub(r"<[^>]+>", " ", text[end:nxt])
+        content = re.sub(r"\s+", " ", content).strip()
+        if content:
+            sections.append((content, path))
+    return sections
+
+
+# --------------------------------------------------------------------------- #
 # 结构感知切分器
 # --------------------------------------------------------------------------- #
 class StructureAwareChunker:
@@ -199,66 +331,40 @@ class StructureAwareChunker:
         self._splitter = None  # 惰性构建（避免无 langchain 时导入失败）
 
     def _rec_split(self, text: str) -> List[str]:
-        if self._splitter is None:
-            from langchain_text_splitters import RecursiveCharacterTextSplitter
-            self._splitter = RecursiveCharacterTextSplitter(
-                separators=self.separators,
-                chunk_size=self.child_size,
-                chunk_overlap=self.child_overlap,
-                length_function=len,
-                strip_whitespace=True,
-            )
-        return self._splitter.split_text(text)
+        # 纯 Python 递归切分（不再依赖 langchain_text_splitters）：
+        # 该包在部分 Python 环境下 import 即段错误，且段错误无法被 try/except 捕获，
+        # 会导致整条切片链路崩溃。改用 _py_recursive_split 行为等价实现。
+        return _py_recursive_split(text, self.separators, self.child_size, self.child_overlap)
 
     # -- 格式分发 --------------------------------------------------------- #
     def split(self, raw: RawDoc) -> List[Chunk]:
+        # 已按章节聚合的 PDF 单元（loader 设置了 section_path）：
+        # 走「整章为父、细切为子」的 small-to-big 父子切片
+        if raw.section_path is not None:
+            return self._split_prebuilt_section(raw)
         ext = os.path.splitext(raw.source)[1].lower()
         if ext in (".md", ".markdown"):
             return self._split_markdown(raw)
         if ext in (".html", ".htm"):
             return self._split_html(raw)
-        # PDF 及其它无显式结构的格式走「图感知」分块：
-        # 先抽图块（图级召回），再按 section 切 child（细节召回）
+        # PDF 降级路径（PyPDFLoader 无结构）及其它无显式结构格式：图感知分块
         return self._split_figure_aware(raw)
 
     # -- Markdown：按标题切章节 ------------------------------------------ #
     def _split_markdown(self, raw: RawDoc) -> List[Chunk]:
-        try:
-            from langchain_text_splitters import MarkdownHeaderTextSplitter
-            splitter = MarkdownHeaderTextSplitter(
-                headers_to_split_on=[("#", "h1"), ("##", "h2"),
-                                     ("###", "h3"), ("####", "h4")])
-            docs = splitter.split_text(raw.text)
-        except Exception:
-            return self._split_section(raw.text, [], raw)
+        # 纯 Python 按 #~#### 标题切分（不再依赖 langchain 的
+        # MarkdownHeaderTextSplitter，避免 import 段错误）
         out: List[Chunk] = []
-        for d in docs:
-            path = [str(d.metadata[k]) for k in ("h1", "h2", "h3", "h4")
-                    if d.metadata.get(k)]
-            content = d.page_content
-            if path:
-                content = " > ".join(path) + "\n\n" + content
+        for content, path in _split_md_by_headers(raw.text):
             out.extend(self._split_section(content, path, raw))
         return out
 
     # -- HTML：按 h1~h6 切章节 ------------------------------------------- #
     def _split_html(self, raw: RawDoc) -> List[Chunk]:
-        try:
-            from langchain_text_splitters import HTMLHeaderTextSplitter
-            splitter = HTMLHeaderTextSplitter(
-                headers_to_split_on=[("h1", "h1"), ("h2", "h2"),
-                                     ("h3", "h3"), ("h4", "h4"),
-                                     ("h5", "h5"), ("h6", "h6")])
-            docs = splitter.split_text(raw.text)
-        except Exception:
-            return self._split_section(raw.text, [], raw)
+        # 纯 Python 按 <h1>~<h6> 标题切分（不再依赖 langchain 的
+        # HTMLHeaderTextSplitter，避免 import 段错误）
         out: List[Chunk] = []
-        for d in docs:
-            path = [str(v) for k, v in sorted(d.metadata.items())
-                    if str(k).lower().startswith("h") and v]
-            content = d.page_content
-            if path:
-                content = " > ".join(path) + "\n\n" + content
+        for content, path in _split_html_by_headers(raw.text):
             out.extend(self._split_section(content, path, raw))
         return out
 
@@ -282,6 +388,12 @@ class StructureAwareChunker:
             for p in pieces:
                 if not p.strip():
                     continue
+                # 该 chunk 文本中内嵌的 FIG 占位符才是真正属于该 chunk 的图
+                embedded_figs = _EMBEDDED_FIG_RE.findall(p)
+                fig_paths = list(raw.figure_paths)
+                for fp in embedded_figs:
+                    if fp not in fig_paths:
+                        fig_paths.append(fp)
                 children.append(Chunk(
                     text=p,
                     source=raw.source,
@@ -294,10 +406,77 @@ class StructureAwareChunker:
                     section_path=path or None,
                     chunk_type=kind,
                     page=raw.page,
-                    figure_paths=list(raw.figure_paths),
+                    figure_paths=fig_paths,
                 ))
                 idx += 1
         return children
+
+    # -- 已分章节单元：整章为父、细切为子（small-to-big 真正落地） -------- #
+    def _split_prebuilt_section(self, raw: RawDoc) -> List[Chunk]:
+        """loader 已把 PDF 按章节聚合为带 section_path 的 RawDoc。
+
+        这里做真正的父子文档：
+        - **父 chunk** = 整章全文（含下属小章节的文字/表格/图片），
+          即「大章节包含小章节」；父 chunk 仅入库不检索（主检索已排除 is_parent）。
+        - **子 chunk** = 整章细切的小片段（检索单元）；每个子 chunk 透传
+          整章 parent_content，且 figure_paths = 整章所有图片，
+          生成答案时可把本章全部相关图片一并还原（解决「只返回一张图」的问题）。
+
+        表格块 [TABLE]...[/TABLE] 经 `_segment` 保护为原子片段，不被切断。
+        每个章节单元长度已在 loader 端约束在 ~8000 字内，确保父窗口不超
+        Milvus 字段上限（content/parent_content 均为 8192）。
+        """
+        CONTENT_CAP = 8192  # Milvus 字段上限保护
+        pcontent = raw.text[:CONTENT_CAP]
+        pid = hashlib.md5(
+            ("§".join(raw.section_path or []) + "\n" + raw.text[:200]).encode("utf-8")
+        ).hexdigest()[:16]
+        # 父 chunk（is_parent=True，仅存不检索）
+        parent = Chunk(
+            text=pcontent,
+            source=raw.source,
+            file_name=raw.file_name,
+            access_level=raw.access_level,
+            chunk_index=0,
+            parent_id="",
+            parent_content="",
+            is_parent=True,
+            section_path=raw.section_path or None,
+            chunk_type="section",
+            page=raw.page,
+            figure_paths=list(raw.figure_paths),
+        )
+        out: List[Chunk] = [parent]
+        # 子 chunk：先保护 [TABLE] 块原子不切，再对 prose 细切
+        segs = _segment(pcontent)
+        idx = 0
+        for kind, seg_text in segs:
+            if kind == "prose":
+                pieces = self._rec_split(seg_text)
+            elif len(seg_text) > self.max_atomic:
+                # 仅超长代码/表格才按空行安全切，仍不切断单行
+                pieces = [p for p in seg_text.split("\n\n") if p.strip()]
+            else:
+                pieces = [seg_text]
+            for p in pieces:
+                if not p.strip():
+                    continue
+                out.append(Chunk(
+                    text=p,
+                    source=raw.source,
+                    file_name=raw.file_name,
+                    access_level=raw.access_level,
+                    chunk_index=idx,
+                    parent_id=pid,
+                    parent_content=pcontent,
+                    is_parent=False,
+                    section_path=raw.section_path or None,
+                    chunk_type=kind,
+                    page=raw.page,
+                    figure_paths=list(raw.figure_paths),
+                ))
+                idx += 1
+        return out
 
     # -- 图感知：先抽图块，再切 child ----------------------------------- #
     def _split_figure_aware(self, raw: RawDoc) -> List[Chunk]:

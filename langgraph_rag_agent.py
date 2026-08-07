@@ -235,6 +235,8 @@ _FIGURE_QUERY_KEYWORDS = (
     "流程图", "架构图", "拓扑", "示意图", "框图", "时序图", "状态图",
     "类图", "原理图", "接线图", "信号流", "数据流", "消息流", "协议栈",
     "配图", "插图",
+    # 中文：表格（loaders.py 把表格也渲染成图片并内嵌 FIG 占位符）
+    "表格", "表",
     # 中文：渲染动作
     "输出", "展示", "画出", "渲染", "看看",
     # 英文
@@ -275,6 +277,16 @@ def _norm_figs(val) -> List[str]:
     if isinstance(val, (list, tuple)):
         return [str(x) for x in val if x]
     return []
+
+
+_FIG_PLACEHOLDER_RE = re.compile(r"\[\[FIG:([^\]]+)\]\]")
+
+
+def _extract_figs_from_text(text: str) -> List[str]:
+    """从 chunk 文本中提取内嵌的 [[FIG:...]] 占位符路径。"""
+    if not text:
+        return []
+    return [m.group(1) for m in _FIG_PLACEHOLDER_RE.finditer(text)]
 
 
 # ============================================================================
@@ -1520,36 +1532,46 @@ class LangGraphRAGApp:
         )
         answer = self.llm.chat(system, user, task="generate", user=self.username)
 
-        # ===== 图渲染：服务端确定性追加，只取「最相关的一张」图，避免占位符刷屏 =====
+        # ===== 图渲染：服务端确定性追加，取「本次检索涉及的所有图」拼到答案末尾 =====
         # 之前把 [[FIG:...]] 放进 context 指望 LLM 原样保留，但 LLM 常把占位符当噪音删掉，
         # 导致前端拿不到图。这里直接把「本次检索到的图页 + 图查询兜底召回到的图页」
-        # 全部收集并按相似度排序，取唯一最相关的一张拼到答案末尾。
+        # 全部收集并按相似度排序，去重后全部拼到答案末尾——章节涉及多少张图就展示多少张。
         figs_with_score = []  # (fp, score)
         for d in docs:
             sc = d[1] if len(d) > 1 else 0.0
-            for fp in _norm_figs(d[0].metadata.get("figure_paths")):
+            doc = d[0]
+            # 元数据 figure_paths + 文本中内嵌 [[FIG:...]] 双重收集
+            fig_sources = set(_norm_figs(doc.metadata.get("figure_paths")))
+            fig_sources.update(_extract_figs_from_text(doc.page_content or ""))
+            for fp in fig_sources:
                 figs_with_score.append((fp, sc))
         # figure 查询再兜底一次：覆盖 grade_docs 把 page chunk 过滤掉、主检索未带图页的情况
         if _is_figure_query(query):
             try:
                 rescued = self.vector_db.search_figure_pages(
-                    query, k=1, filter_role=role,
+                    query, k=10, filter_role=role,
                     user_id=self.user, tenant_id=self.tenant_id
                 )
                 for doc, sc in rescued:
-                    for fp in _norm_figs(doc.metadata.get("figure_paths")):
+                    fps = set(_norm_figs(doc.metadata.get("figure_paths")))
+                    fps.update(_extract_figs_from_text(doc.page_content or ""))
+                    for fp in fps:
                         figs_with_score.append((fp, sc))
             except Exception as e:
                 print(f"  [generate] figure 兜底追加失败(忽略): {e}")
 
         if figs_with_score:
-            # 同一 fp 保留最小 score（最相关）；整体按 score 升序；只取 top-1，避免无关页面刷屏
+            # 同一 fp 保留最小 score（最相关）；整体按 score 升序
             best = {}
             for fp, sc in figs_with_score:
                 if fp not in best or sc < best[fp]:
                     best[fp] = sc
-            figs = [fp for fp, _ in sorted(best.items(), key=lambda kv: kv[1])][:1]
-            answer += "\n\n" + "\n".join(f"[[FIG:{fp}]]" for fp in figs)
+            # 过滤掉 LLM 已经在答案里保留的占位符，避免重复追加
+            existing_figs = set(_extract_figs_from_text(answer))
+            figs = [fp for fp, _ in sorted(best.items(), key=lambda kv: kv[1])
+                    if fp not in existing_figs]
+            if figs:
+                answer += "\n\n" + "\n".join(f"[[FIG:{fp}]]" for fp in figs)
             print(f"  [generate] 确定性追加 {len(figs)} 个图页占位符: {figs}")
 
         return answer

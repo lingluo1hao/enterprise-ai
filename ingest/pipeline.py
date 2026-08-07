@@ -21,7 +21,7 @@ from .fingerprint import compute_fingerprint, ManifestStore, diff_fingerprints
 from .loaders import load_file, get_access_level
 from .chunk import make_chunker
 from .embed import BatchEmbedder
-from .store import StoreBackend
+from .store import StoreBackend, _trunc_bytes
 
 # 支持的文件后缀（与 loaders.load_file 对齐）
 SUPPORTED_EXT = (".txt", ".md", ".pdf", ".html", ".htm",
@@ -177,7 +177,7 @@ class IngestPipeline:
                 tenant = self._derive_tenant(c.source)
                 entities.append({
                     "chunk_id": cid,
-                    "content": c.text[:8192],
+                    "content": _trunc_bytes(c.text),
                     "dense": vec,
                     "file_path": c.source,
                     "file_name": c.file_name,
@@ -186,7 +186,7 @@ class IngestPipeline:
                     "user_id": self.user_id,
                     "tenant_id": tenant,
                     "parent_id": c.parent_id or "",
-                    "parent_content": (c.parent_content or c.text)[:8192],
+                    "parent_content": _trunc_bytes(c.parent_content or c.text),
                     "is_parent": c.is_parent,
                     "page": c.page,
                     "chunk_type": c.chunk_type,
