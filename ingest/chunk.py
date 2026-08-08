@@ -388,12 +388,9 @@ class StructureAwareChunker:
             for p in pieces:
                 if not p.strip():
                     continue
-                # 该 chunk 文本中内嵌的 FIG 占位符才是真正属于该 chunk 的图
-                embedded_figs = _EMBEDDED_FIG_RE.findall(p)
-                fig_paths = list(raw.figure_paths)
-                for fp in embedded_figs:
-                    if fp not in fig_paths:
-                        fig_paths.append(fp)
+                # 只把本 chunk 文本里真实出现的 [[FIG:...]] 占位符作为该 chunk 的图，
+                # 不再整章透传（解决 97% 子 chunk 带无关图、二次关联噪音大的问题）。
+                fig_paths = _EMBEDDED_FIG_RE.findall(p)
                 children.append(Chunk(
                     text=p,
                     source=raw.source,
@@ -444,7 +441,7 @@ class StructureAwareChunker:
             section_path=raw.section_path or None,
             chunk_type="section",
             page=raw.page,
-            figure_paths=list(raw.figure_paths),
+            figure_paths=_EMBEDDED_FIG_RE.findall(pcontent),
         )
         out: List[Chunk] = [parent]
         # 子 chunk：先保护 [TABLE] 块原子不切，再对 prose 细切
@@ -473,7 +470,7 @@ class StructureAwareChunker:
                     section_path=raw.section_path or None,
                     chunk_type=kind,
                     page=raw.page,
-                    figure_paths=list(raw.figure_paths),
+                    figure_paths=_EMBEDDED_FIG_RE.findall(p),
                 ))
                 idx += 1
         return out

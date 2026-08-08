@@ -109,6 +109,15 @@ class ModelConfig:
     temperature: float = 0.0
     max_tokens: int = 0                    # 0 = 不限制
     seed: int = 42                         # 固定随机种子，让 classify/rewrite/grade 可复现
+    # --- Ollama 专属 ---
+    # num_ctx：上下文窗口 token 数。**必须显式设置**——Ollama 默认只有 2048，
+    # 超出部分会从 prompt **开头**静默截断（实测：把关键信息放开头会被整段丢弃，
+    # 模型只能看到末尾的无关内容，答非所问且毫无报错）。RAG 场景 prompt 动辄
+    # 4000+ token，不设这个值等于把最相关的文档喂进黑洞。
+    num_ctx: int = 0                       # 0 = 不传，沿用 Ollama 默认 2048
+    # keep_alive：模型在显存/内存里的常驻时长。默认 5m，过期后下次调用要重新
+    # 冷加载（实测 7B/Q4_0 冷加载 ~6s）。设长一点省掉这笔固定开销。
+    keep_alive: str = ""                   # 空 = 不传，沿用 Ollama 默认 5m
     # 成本：美元 / 每百万 token。本地 Ollama 填 0
     price_in_per_1m: float = 0.0
     price_out_per_1m: float = 0.0
@@ -539,6 +548,9 @@ class OllamaProvider(BaseProvider):
         opts: Dict[str, Any] = {"temperature": self.cfg.temperature, "seed": self.cfg.seed}
         if self.cfg.max_tokens > 0:
             opts["num_predict"] = self.cfg.max_tokens
+        # 上下文窗口：不传则 Ollama 用默认 2048，长 prompt 会从开头静默截断
+        if self.cfg.num_ctx > 0:
+            opts["num_ctx"] = self.cfg.num_ctx
         body = {
             "model": self.cfg.model,
             "messages": [
@@ -548,6 +560,9 @@ class OllamaProvider(BaseProvider):
             "stream": stream,
             "options": opts,
         }
+        # 常驻时长：避免每次调用重新冷加载权重
+        if self.cfg.keep_alive:
+            body["keep_alive"] = self.cfg.keep_alive
         return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     def invoke(self, system_prompt: str, user_prompt: str) -> LLMResponse:

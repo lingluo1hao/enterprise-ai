@@ -134,10 +134,11 @@ REDIS_HOST = os.getenv("REDIS_HOST", "192.168.200.128")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "dev0619")
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
-CACHE_TTL = 7 * 24 * 3600          # 缓存过期时间：7 天
+CACHE_TTL = 30 * 60               # 缓存兜底过期时间：30 分钟（方案乙：真正失效靠 kb_version，TTL 仅兜底）
 CACHE_PREFIX = "rag:cache:"        # Redis 键前缀
-SEMANTIC_THRESHOLD = 0.80          # 语义匹配阈值（余弦相似度 > 0.80 即命中）
-CACHE_MAX_SCAN = 500               # 语义查找时最多扫描的缓存条目数
+SEMANTIC_THRESHOLD = 0.80          # 语义匹配阈值（已停用：方案 A 已删除语义答案缓存，见 lookup）
+CACHE_MAX_SCAN = 500               # 语义查找时最多扫描的缓存条目数（已停用）
+from kb_version import get_kb_version   # 方案乙：缓存键嵌入知识库版本号，文档更新即失效
 
 # ============================================================================
 # 文档访问权限配置
@@ -233,6 +234,7 @@ class CacheManager:
         self._miss_count = 0      # 未命中计数
         self._embed_fn = None     # 延迟加载 embedding 模型
         self.current_role = DEFAULT_ROLE  # 当前用户角色（影响缓存键，防止跨角色泄漏）
+        self.current_tenant = "global"    # 当前租户（方案乙：决定缓存键里的 kb_version 粒度）
 
     # ------------------------------------------------------------------
     # 公开方法
@@ -242,12 +244,13 @@ class CacheManager:
         """
         查找缓存，返回答案字符串；如果没命中返回 None。
 
-        先精确匹配，再语义匹配。
+        仅精确匹配（方案 A：语义答案缓存已删除，避免相似问题回旧答案、截杀自进化读路径）。
+        相似问题的「自进化」由 PlaybookStore（检索策略缓存）在管线顶层处理，不在此处。
         """
         if self.redis is None:
             return None
 
-        # === 第1级：精确匹配 ===
+        # === 精确匹配（唯一一级）===
         exact_key = self._exact_key(query)
         cached = self.redis.get(exact_key)
         if cached:
@@ -258,41 +261,20 @@ class CacheManager:
             print(f"  [CacheManager] 原问题: {data.get('q', '?')}")
             return data["a"]
 
-        # === 第2级：语义匹配 ===
-        result = self._semantic_lookup(query)
-        if result:
-            # 命中了语义匹配，同时补一条精确匹配键，下次直接第一级命中
-            self._hit_count += 1
-            answer, matched_q = result
-            # 为新查询补写精确键（复用已有的 answer 和 embedding）
-            # 需要从原始缓存条目中取 embedding
-            orig_key = self._exact_key(matched_q)
-            orig_data = json.loads(self.redis.get(orig_key) or "{}")
-            emb = orig_data.get("emb", [])
-            self._save_entry(query, answer, emb)
-            print(f"\n  [CacheManager] ✓ 语义匹配命中（相似问题）")
-            print(f"  [CacheManager] 匹配到: \"{matched_q}\"")
-            return answer
-
         self._miss_count += 1
         return None
 
     def save(self, query: str, answer: str):
         """
-        把问题和答案写入缓存。
+        把问题和答案写入缓存（仅精确键）。
 
-        会同时生成：
-          - 精确匹配键（SHA256 哈希）
-          - embedding 向量（用于后续语义匹配）
+        方案 A 已删除语义答案缓存，不再存储 embedding（省一次 Ollama 调用）。
         """
         if self.redis is None:
             return
 
-        # 生成 embedding（用于语义匹配）
-        emb = self._embed(query)
-
-        self._save_entry(query, answer, emb)
-        print(f"  [CacheManager] 已写入缓存（精确+语义）")
+        self._save_entry(query, answer, [])
+        print(f"  [CacheManager] 已写入缓存（精确键，含 kb_version）")
 
     @property
     def stats(self) -> dict:
@@ -332,62 +314,10 @@ class CacheManager:
         # 拼入用户角色，确保不同角色的缓存互不干扰
         hash_input = f"{normalized}|{self.current_role}"
         hash_hex = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:16]
-        return f"{CACHE_PREFIX}{hash_hex}"
-
-    def _semantic_lookup(self, query: str) -> Optional[Tuple[str, str]]:
-        """
-        语义匹配：把当前问题转为 embedding，和 Redis 中所有缓存条目比较。
-
-        返回 (answer, matched_query) 或 None。
-
-        性能说明：
-          - SCAN 操作 O(N)，但每次只扫 CACHE_MAX_SCAN 个键
-          - 余弦相似度计算是向量点积，几百条 <50ms
-          - 如果缓存条目超过 CACHE_MAX_SCAN，只扫最近的
-        """
-        query_emb = self._embed(query)
-
-        # 收集所有缓存条目
-        entries = []
-        cursor = 0
-        while True:
-            cursor, keys = self.redis.scan(cursor, match=f"{CACHE_PREFIX}*", count=100)
-            for key in keys:
-                data = self.redis.get(key)
-                if data:
-                    try:
-                        entry = json.loads(data)
-                        # 角色隔离：只匹配同一角色的缓存条目
-                        # 防止 admin 的答案通过语义匹配泄漏给 user
-                        if entry.get("role") != self.current_role:
-                            continue
-                        if entry.get("emb") and len(entry["emb"]) == len(query_emb):
-                            entries.append(entry)
-                    except json.JSONDecodeError:
-                        pass
-            if cursor == 0 or len(entries) >= CACHE_MAX_SCAN:
-                break
-
-        if not entries:
-            return None
-
-        # 批量计算余弦相似度（用 numpy 向量化加速）
-        import numpy as np
-        q_vec = np.array(query_emb)
-        best_score = -1
-        best_entry = None
-
-        for entry in entries:
-            e_vec = np.array(entry["emb"])
-            # 余弦相似度 = dot(A, B) / (||A|| * ||B||)
-            cos_sim = float(np.dot(q_vec, e_vec) / (np.linalg.norm(q_vec) * np.linalg.norm(e_vec) + 1e-10))
-            if cos_sim > best_score:
-                best_score = cos_sim
-                best_entry = entry
-
-        if best_score >= self.threshold and best_entry:
-            return (best_entry["a"], best_entry["q"])
-        return None
+        # 方案乙：缓存键嵌入知识库版本号，文档 ingest/rebuild 成功后 bump，
+        # 旧版本 key 全体瞬间失效（无需 SCAN/DELETE）。
+        ver = get_kb_version(self.current_tenant)
+        return f"{CACHE_PREFIX}v{ver}:{hash_hex}"
 
     def _save_entry(self, query: str, answer: str, emb: List[float]):
         """写入一条缓存记录（精确键 + embedding + 角色）"""
@@ -750,6 +680,9 @@ class VectorStoreManager:
                 "page": entity.get("page", None),
                 "chunk_type": entity.get("chunk_type", "prose"),
                 "figure_paths": list(entity.get("figure_paths") or []),
+                # 章节路径（动态字段）：生成侧据此做「章节优先」重排，
+                # 避免同文档他章节的高分噪声把正确章节挤出 top-k
+                "section_path": entity.get("section_path", "") or "",
             }
             # small-to-big：优先返回父窗口上下文（更完整），
             # 旧实体无 parent_content 时回退到子片段 content
@@ -798,8 +731,9 @@ class VectorStoreManager:
         # 父子文档：主检索只召回「子片段」，父窗口仅作上下文透传
         # （避免整章父 chunk 被当 child 召回、撑爆上下文并重复计数）
         expr = expr + " and (is_parent == false)" if expr else "(is_parent == false)"
+        # section_path 是动态字段（schema 未显式声明），必须列在 output_fields 里才会回传
         fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
-                  "chunk_type", "figure_paths", "page",
+                  "chunk_type", "figure_paths", "page", "section_path",
                   "parent_id", "parent_content", "is_parent"]
         top = max(k * 2, 8)  # 召回更多候选供 RRF 融合
 
@@ -853,7 +787,7 @@ class VectorStoreManager:
             expr = (f'(chunk_type in ["page", "table", "section"]) and (tenant_id == "{tenant_id}") and '
                     f'((access_level == "public") or (user_id == "{user_id}"))')
         fields = ["content", "file_name", "file_path", "access_level", "chunk_index",
-                  "chunk_type", "figure_paths", "page",
+                  "chunk_type", "figure_paths", "page", "section_path",
                   "parent_id", "parent_content", "is_parent"]
         try:
             hits = self.client.search(

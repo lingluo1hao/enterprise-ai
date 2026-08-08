@@ -175,6 +175,11 @@ class AgentState(TypedDict, total=False):
     # 每个搜索词都会分别去向量库（Milvus）检索，结果合并去重。
     rewritten_queries: List[str]
 
+    # 自进化层（方案 A）预填的"已知好改写"列表。
+    # 由 node_classify 查相似 playbook 命中后注入；
+    # node_query_rewrite 第 1 轮优先直接复用，跳过 LLM 改写（省 token、越用越快）。
+    prefill_rewrites: List[str]
+
     # 累积检索到的文档列表，格式为 [(langchain Document, 距离分数), ...]。
     # 多轮检索的结果会不断追加（不会覆盖），所以叫"累积"。
     # 距离分数越小表示越相似。
@@ -363,6 +368,19 @@ class LangGraphRAGApp:
         # 首次运行：将默认提示词导入 MySQL
         if self.pm.available:
             self.pm.import_defaults()
+
+        # 4.5 自进化层（方案 A：嫁接 Hermes 式自进化 —— 越用越快）
+        # 复用 self.vector_db（Milvus 客户端 + Ollama embedding），独立集合 skill_playbooks。
+        # 任何失败都降级跳过，绝不影响主问答链路。
+        self.playbook_store = None
+        self._Extractor = None
+        try:
+            from evolution import PlaybookStore, Extractor
+            self.playbook_store = PlaybookStore(self.vector_db)
+            self._Extractor = Extractor
+            print("  [4.5] 自进化层 PlaybookStore 已挂载（skill_playbooks）")
+        except Exception as e:
+            print(f"  [4.5] ⚠ 自进化层挂载失败(降级,不影响主流程): {e}")
 
         # 5. 构建 StateGraph
         print("\n[5/5] 构建 LangGraph 状态图...")
@@ -669,13 +687,25 @@ class LangGraphRAGApp:
         query = state["query"]
         messages = state.get("messages", [])
 
+        # —— 自进化（方案 A）：查相似 playbook，命中则预填已知好 rewrite ——
+        prefill: List[str] = []
+        try:
+            store = getattr(self, "playbook_store", None)
+            if store is not None:
+                hit = store.query_similar(query, self.tenant_id, top_k=1)
+                if hit and hit.get("rewrite_text"):
+                    prefill = json.loads(hit["rewrite_text"])
+                    print(f"  [classify] ♻ 命中经验 playbook(相似度={hit['score']:.2f})，预填 rewrite: {prefill}")
+        except Exception as e:
+            print(f"  [classify] 经验查询异常(忽略): {e}")
+
         # —— 确定性修复：多问句问题强制走 complex 且跳过历史消解 ——
         # 同一问题在「有/无历史」两种状态下会被 LLM 消解出不同 query，
         # 导致两次检索结果不一致。多问号问题几乎都是自包含复杂问题，
         # 直接判定 complex 并用原始 query，消除历史依赖带来的随机性。
         if query.count("？") >= 2 or query.count("?") >= 2:
             print(f"  [classify] 类型=complex（多问句强制，跳过 LLM 消解）")
-            return {"query_type": "complex", "resolved_query": query}
+            return {"query_type": "complex", "resolved_query": query, "prefill_rewrites": prefill}
 
         # 构建最近 4 轮对话历史的文本摘要
         history_text = self._format_history(messages, max_turns=4)
@@ -684,7 +714,7 @@ class LangGraphRAGApp:
             # 快速模式或无历史：跳过 LLM，用规则快速分类
             qtype = self._quick_classify(query)
             print(f"  [classify] 类型={qtype}（快速分类）")
-            return {"query_type": qtype, "resolved_query": query}
+            return {"query_type": qtype, "resolved_query": query, "prefill_rewrites": prefill}
 
         # 从提示词管理器获取 classify 模板
         prompt = self.pm.get_prompt("classify")
@@ -698,7 +728,7 @@ class LangGraphRAGApp:
         # 解析 LLM 输出的 JSON（含容错兜底）
         qtype, resolved = self._parse_classify(result, query)
         print(f"  [classify] 类型={qtype}, 消解问题={resolved[:40]}")
-        return {"query_type": qtype, "resolved_query": resolved}
+        return {"query_type": qtype, "resolved_query": resolved, "prefill_rewrites": prefill}
 
     # ========================================================================
     # 条件边路由函数
@@ -853,6 +883,18 @@ class LangGraphRAGApp:
         # 统一走 _append_history：本轮问答写 L1 + L2，超窗压缩并落库摘要
         messages = self._append_history(session_id, query, answer, user_id=self.user)
         print(f"  [save_history] 已保存到 MySQL + 内存，历史 {len(messages)} 条消息")
+
+        # —— 自进化（方案 A）：沉淀本次成功经验为 playbook ——
+        try:
+            store = getattr(self, "playbook_store", None)
+            ext = getattr(self, "_Extractor", None)
+            if store is not None and ext is not None:
+                pb = ext.extract(state, self.tenant_id, self.username)
+                if pb is not None:
+                    store.save(pb)
+        except Exception as e:
+            print(f"  [evolution] 沉淀异常(忽略): {e}")
+
         return {"messages": messages}
 
     # ========================================================================
@@ -906,7 +948,11 @@ class LangGraphRAGApp:
         query = state.get("resolved_query", state["query"])
         iteration = state.get("retrieval_iterations", 0)
 
-        if iteration == 0:
+        if iteration == 0 and state.get("prefill_rewrites"):
+            # 第 1 轮：复用经验 playbook 已知好的首轮改写，跳过 LLM 改写（省 token）
+            queries = state["prefill_rewrites"]
+            print(f"  [query_rewrite] ♻ 复用经验 playbook 首轮改写，跳过 LLM: {queries}")
+        elif iteration == 0:
             # 第 1 轮：正常改写
             queries = self._do_rewrite(query, None)
         else:
@@ -1419,6 +1465,11 @@ class LangGraphRAGApp:
                     seen2.add(key)
                     merged.append((doc, score))
             all_results = merged
+        else:
+            # 非图查询：跨多 query 合并后按相关性升序（score 越小越相关，
+            # 与 _rrf_fuse 返回的 -fused 语义一致），确保最相关章节一定进入
+            # _do_generate 的 docs[:5]，不被后续 query 召回的命令表等噪声挤掉。
+            all_results.sort(key=lambda x: x[1])
         return all_results
 
     def _do_grade(self, query: str, docs: List) -> List[bool]:
@@ -1505,19 +1556,49 @@ class LangGraphRAGApp:
         # 构建上下文：最多 5 个文档，每个截断到 DOC_TRUNCATE 字符。
         # 带 figure_paths 的文档放宽到 2000 字符，避免 PyPDF 抽取的 caption
         # （如「I 通信流程图」）落在截断点之后被吃掉，导致 LLM 看不到图上下文。
-        # 同时为每条带图文档追加 [[FIG:assets/figures/...]] 占位符，
-        # 由前端 renderAssistantContent 拆段渲染为 <img>（需 prompt_manager.generate_answer
-        # 规则「原样保留」配合）。
+        # 同时剥离 chunk 文本里内嵌的 [[FIG:assets/...]] 占位符——
+        # 图由本方法末尾「服务端确定性追加」逻辑统一处理（1581 行起），
+        # 不应出现在喂给 LLM 的正文里，否则 LLM 会把它当噪音或原样吐回答案。
+        import re as _re
+        _FIG_RE = _re.compile(r"\[\[FIG:[^\]]*\]\]")
+
+        def _clean_body(text: str) -> str:
+            return _FIG_RE.sub("", text).strip()
+
+        # 章节优先（B3）：把「与问题同属一个章节」的文档排到最前，
+        # 避免被同文档其他章节（如命令集表格）的噪声带偏。
+        # 匹配规则：doc 的 section_path（"§" 连接）中包含 query 里的连续中文字片段越多，
+        # 优先级越高；query 不含章节名时（如"MCC 是什么"）全部为 0，退化为按原 score 序。
+        _q_segs = [s for s in re.findall(r"[\u4e00-\u9fff]{2,}", query)]
+
+        def _section_priority(doc) -> int:
+            sp = doc.metadata.get("section_path", "") or ""
+            if not sp:
+                return 0
+            return sum(1 for seg in sp.split("§") if any(seg in qseg for qseg in _q_segs))
+
+        docs = sorted(docs, key=lambda d: _section_priority(d[0]), reverse=True)
+
+        # ---- 分级上下文预算（按上面 B3 排序后的名次分配字数）----------------
+        # 旧逻辑是「带图就放宽到 2000 字」，本意只覆盖极少数图页；但 chunker 会把
+        # 整章图片清单透传给该章每一个子 chunk（实测 97% 的 chunk 都带图），
+        # 这条规则等于对全体生效。再叠加 _parse_hits 优先返回整章 parent_content
+        # （中位数 5468 字，子 chunk 自身只有 269 字），上下文直接涨到 8348 字符
+        # / 4000+ token。
+        # 致命后果：Ollama 默认 num_ctx=2048，超出部分**从 prompt 开头静默截断**，
+        # 而 B3 恰好把最相关的章节排在第一位 —— 正确答案第一个被丢掉，模型只剩
+        # 末尾的无关章节可看，于是答成「心跳/补传/GPRS 数传」。
+        # 现在按名次给预算：命中章节给足，旁证给少量，兜底给最少。
+        RANK_BUDGET = (1200, 500, 500, 350, 350)  # 合计 ≈ 2900 字，约 1700 token
         parts = []
-        for d in docs[:5]:
+        top_docs = docs[:5]
+        for i, d in enumerate(top_docs):
             doc = d[0]
             src = os.path.basename(doc.metadata.get("source", "未知"))
             page = doc.metadata.get("page")
             label = f"[{src} 第{page}页]" if page else f"[{src}]"
-            # 带图文档放宽截断，避免 caption 落在截断点之后
-            fig_paths = _norm_figs(doc.metadata.get("figure_paths"))
-            trunc = 2000 if fig_paths else DOC_TRUNCATE
-            body = doc.page_content[:trunc]
+            trunc = RANK_BUDGET[i] if i < len(RANK_BUDGET) else DOC_TRUNCATE
+            body = _clean_body(doc.page_content[:trunc])
             parts.append(f"{label} {body}")
         context = "\n\n".join(parts)
         # 过滤后上下文仍为空（理论上不会，但做兜底）
@@ -1532,12 +1613,21 @@ class LangGraphRAGApp:
         )
         answer = self.llm.chat(system, user, task="generate", user=self.username)
 
-        # ===== 图渲染：服务端确定性追加，取「本次检索涉及的所有图」拼到答案末尾 =====
+        # ===== 图渲染：服务端确定性追加，取「本次检索涉及的最相关图」拼到答案末尾 =====
         # 之前把 [[FIG:...]] 放进 context 指望 LLM 原样保留，但 LLM 常把占位符当噪音删掉，
         # 导致前端拿不到图。这里直接把「本次检索到的图页 + 图查询兜底召回到的图页」
-        # 全部收集并按相似度排序，去重后全部拼到答案末尾——章节涉及多少张图就展示多少张。
+        # 收集并按相似度排序，去重后取前 MAX_FIGS 张（当前 2）拼到答案末尾，避免图片泛滥成噪音。
+        # LLM 走到降级分支（全链失败）时，答案是网关的固定文案，与文档无关，
+        # 此时再追加图片只会制造「一句道歉 + 一堆无关截图」的观感，直接返回。
+        if answer and answer.startswith("抱歉，当前模型服务繁忙"):
+            print("  [generate] LLM 降级，跳过图页追加")
+            return answer
+
         figs_with_score = []  # (fp, score)
-        for d in docs:
+        # 只从**真正进入 context 的 top_docs** 收集，不再扫全量 docs：
+        # chunker 把整章图透传给每个子 chunk，5 个文档去重后能收出 16 张图，
+        # 全糊到答案末尾就是「一问基站格式、末尾挂满报警/心跳表格截图」。
+        for d in top_docs:
             sc = d[1] if len(d) > 1 else 0.0
             doc = d[0]
             # 元数据 figure_paths + 文本中内嵌 [[FIG:...]] 双重收集
@@ -1549,7 +1639,7 @@ class LangGraphRAGApp:
         if _is_figure_query(query):
             try:
                 rescued = self.vector_db.search_figure_pages(
-                    query, k=10, filter_role=role,
+                    query, k=4, filter_role=role,
                     user_id=self.user, tenant_id=self.tenant_id
                 )
                 for doc, sc in rescued:
@@ -1568,8 +1658,12 @@ class LangGraphRAGApp:
                     best[fp] = sc
             # 过滤掉 LLM 已经在答案里保留的占位符，避免重复追加
             existing_figs = set(_extract_figs_from_text(answer))
+            # 上限 2 张：图按相关性升序排，越靠前越贴题；收紧上限避免「图片太多/噪音大」
+            # （用户反馈二次关联图片太多、再去推理耗时太长）。且 chunker 已改为只透传本
+            # chunk 真实出现的图，候选池已大幅缩小，2 张足够覆盖最相关图。
+            MAX_FIGS = 2
             figs = [fp for fp, _ in sorted(best.items(), key=lambda kv: kv[1])
-                    if fp not in existing_figs]
+                    if fp not in existing_figs][:MAX_FIGS]
             if figs:
                 answer += "\n\n" + "\n".join(f"[[FIG:{fp}]]" for fp in figs)
             print(f"  [generate] 确定性追加 {len(figs)} 个图页占位符: {figs}")
@@ -2083,8 +2177,9 @@ class LangGraphRAGApp:
         print("=" * 70)
 
         # ---- 第一步：缓存检查（Layer 3: Redis）----
-        # CacheManager 内部会做标准化 → SHA256 精确匹配 → BGE 语义匹配
+        # 方案 A：CacheManager 仅精确匹配（语义答案缓存已删除）。
         self.cache.current_role = role
+        self.cache.current_tenant = self.tenant_id   # 方案乙：决定缓存键里的 kb_version 粒度
         cached = self.cache.lookup(question)
         if cached:
             print(f"\n[Cache] 命中缓存，直接返回（耗时 {time.time() - total_start:.1f}s）")
@@ -2093,6 +2188,25 @@ class LangGraphRAGApp:
             # 否则命中缓存的这一轮永不入库，对话历史出现空洞（模型看不到刚问过的内容）。
             self._append_history(session_id, question, cached, user_id=self.user, cached=True)
             return cached
+
+        # ---- 第一步·5（方案 A 自进化读路径，提到缓存短路之前）----
+        # 精确缓存未命中后、跑管线前，先查 PlaybookStore：
+        # 命中相似问题 → 带「经验改写词」跑完整管线，答案仍实时生成（永远新鲜）。
+        # 注意：这里复用的是「检索策略」，不是「答案」，所以绝不回旧答案。
+        prefill_rewrites: List[str] = []
+        try:
+            store = getattr(self, "playbook_store", None)
+            if store is not None:
+                hit = store.query_similar(question, self.tenant_id, top_k=1)
+                if hit:
+                    try:
+                        prefill_rewrites = json.loads(hit["rewrite_text"])
+                    except Exception:
+                        prefill_rewrites = []
+                    print(f"[evolution] ♻ 顶层命中 playbook (score={hit.get('score')}, "
+                          f"success_count={hit.get('success_count')})")
+        except Exception as e:
+            print(f"[evolution] ⚠ 顶层 playbook 查询失败(忽略): {e}")
 
         # ---- 第二步：创建任务记录（Layer 2: MySQL task_queue）----
         # 在 MySQL 中创建一条 status=running 的任务记录。
@@ -2116,6 +2230,8 @@ class LangGraphRAGApp:
             "retrieval_iterations": 0,
             "research_results": [],
             "review_rounds": 0,
+            # 方案 A：若顶层命中 Playbook，则带上经验改写词；node_query_rewrite 首轮优先复用。
+            "prefill_rewrites": prefill_rewrites,
         }
 
         try:

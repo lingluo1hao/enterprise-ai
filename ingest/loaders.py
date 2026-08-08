@@ -17,6 +17,8 @@ import os
 import re
 from typing import List, Optional, Any
 
+import statistics
+
 from .types import RawDoc
 from .chunk import FIGURE_ANCHOR_RE
 
@@ -132,6 +134,76 @@ def _figures_dir(path: str) -> tuple:
     return out_dir, rel_prefix
 
 
+def _probe_font_levels(pages_items):
+    """字体大小兜底探测（方案丙）。
+
+    当文档没有数字编号标题（split_level 为 None）时，用每文本块的最大字号
+    识别两级标题：比正文基字号大一个明显台阶的当作标题，最大档为 lvl2（章节）、
+    次大档为 lvl1（小节）。返回 (font_mode: bool, levels: dict)。
+    失败或缺数据均降级为 (False, {})，不影响主流程。
+    """
+    sizes = [tb.get("max_font", 0.0) for _, items, _ in pages_items
+             for _, kind, tb in items
+             if kind == "text" and tb.get("max_font", 0.0) > 0]
+    if not sizes:
+        return False, {}
+    try:
+        body = statistics.median(sizes)
+    except statistics.StatisticsError:
+        return False, {}
+    THRESH = 1.15   # 字号大于正文 15% 才算候选标题
+    cand = []
+    for page_idx, items, _ in pages_items:
+        for y0, kind, tb in items:
+            if kind != "text":
+                continue
+            ms = tb.get("max_font", 0.0)
+            txt = tb.get("text", "")
+            if ms > body * THRESH and 0 < len(txt) <= 80:
+                cand.append((page_idx, y0, txt, ms))
+    if not cand:
+        return False, {}
+    cand_sizes = sorted({ms for *_, ms in cand})
+    top2 = cand_sizes[-2:]
+    levels = {}
+    for page_idx, y0, txt, ms in cand:
+        lvl = 2 if (len(top2) >= 2 and ms >= top2[-1]) else 1
+        levels[(page_idx, y0, txt)] = lvl
+    return True, levels
+
+
+def _is_valid_table(rows, bbox, page_rect) -> bool:
+    """结构性校验：拒绝 PyMuPDF 把文字段误检成的伪表格。
+
+    阈值（实测学生证 PDF 校准，见修复报告）：
+      ① rows >= 2           —— 单行"表"= 文字段被误框（p8/p14/p45 等误检）
+      ② cols >= 2           —— 单列"表"= 列表被误框
+      ③ max_cell_len <= 150 —— 整段叙述被当 1 个 cell，合并误检主因（用户截图 p2=185）
+      ⑤ bbox 占比 <= 0.72   —— 整页文字被当一张表（实测最大 0.67）
+    命中任一拒绝条件即判为伪表格。数据不丢：调用方对伪表格仍保留 [TABLE] 文本块，
+    仅跳过 PNG 渲染与 figure_paths 关联。
+    """
+    if not rows:
+        return False
+    ncols = max((len(r) for r in rows), default=0)
+    if len(rows) < 2 or ncols < 2:
+        return False
+    cells = [c for r in rows for c in r if c is not None]
+    if not cells:
+        return False
+    lens = [len(str(c).strip()) for c in cells]
+    if max(lens) > 150:
+        return False
+    try:
+        ratio = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                 / (page_rect.width * page_rect.height))
+    except Exception:
+        ratio = 0.0
+    if ratio > 0.72:
+        return False
+    return True
+
+
 def _load_pdf(path: str) -> Optional[list]:
     """使用 PyMuPDF 提取 PDF 文本与表格，并**按章节聚合为结构化单元**。
 
@@ -164,12 +236,39 @@ def _load_pdf(path: str) -> Optional[list]:
 
         # 标题识别：编号标题（2 / 2.13 / 2.13.2 ...），过长的行不当标题
         def _heading_level(t: str):
-            m = re.match(r"^(\d+(?:\.\d+)+)\s+", t)
-            if not m:
-                return None
+            t = t.strip()
             if len(t) > 80:
                 return None
-            return m.group(1).count(".") + 1  # 2→1, 2.13→2, 2.13.2→3
+            # 数字编号标题：2 / 2.13 / 2.13.2
+            m = re.match(r"^(\d+(?:\.\d+)+)\s+", t)
+            if m:
+                return m.group(1).count(".") + 1  # 2→1, 2.13→2, 2.13.2→3
+            # 罗马数字编号章节：VI 基站信息格式 / IV 技术要求 ...
+            ROMANS = ['X', 'IX', 'VIII', 'VII', 'VI', 'V', 'IV', 'III', 'II', 'I']
+            for r in ROMANS:
+                if re.match(rf"^{r}\s+[\u4e00-\u9fff]", t):
+                    return 2
+            # 中文编号小节：一、 二、 三．  （学生证协议等常用）
+            if re.match(r'^[一二三四五六七八九十百]+\s*[、.．]', t):
+                return 2
+            # 数字加顿号/点小节：1、一般信息 / 1. 概述（ASCII 小数点 1.0 不算标题）
+            if re.match(r'^\d+\s*[、．]', t) or re.match(r'^\d+\.(?!\d)\s', t):
+                # 排除「1、2、3 号键拨出的号码…」这类含多个顿号/句号的列表句
+                if t.count("、") <= 1 and "。" not in t:
+                    return 1
+            # 裸中文短标题（无编号前缀）：协议类文档常见如「基站信息格式」「关于白名单」。
+            # 约束：3~14 个纯汉字、不含句末标点，且以标题后缀（格式/结构/信息/协议/命令/
+            # 流程/集/说明/规则/要求/规范/表/图）结尾，或以「关于/附录/附件」开头。
+            # 这样既能把纯中文标题切成独立章节，又不会把正文短句（设备登陆/其中：…）
+            # 或表格脚注（裸「格式」/「说明」）误判成标题。
+            TITLE_SUFFIX = ('格式', '结构', '信息', '协议', '命令', '流程', '集',
+                            '说明', '规则', '要求', '规范', '表', '图')
+            if (3 <= len(t) <= 14
+                    and re.match(r'^[\u4e00-\u9fff]+$', t)
+                    and (t.endswith(TITLE_SUFFIX)
+                         or t.startswith(('关于', '附录', '附件')))):
+                return 2
+            return None
 
         # 第一遍：按页提取 items（text / table），并统计标题层级分布
         pages_items = []          # [(page_idx, [(kind, payload), ...], [gen_fig_paths])]
@@ -189,6 +288,11 @@ def _load_pdf(path: str) -> Optional[list]:
                         if not md:
                             continue
                         bbox = fitz.Rect(tab.bbox)
+                        # 结构性校验：拒绝伪表格（整段文字被误框成表）。
+                        # 保留 [TABLE] 文本块（不丢数据），仅跳过 PNG 渲染与 figure_paths。
+                        if not _is_valid_table(rows, bbox, page.rect):
+                            tables.append({"y0": bbox.y0, "bbox": bbox, "md": md, "fig_path": ""})
+                            continue
                         fig_name = f"table_p{page_idx:03d}_{tidx+1}.png"
                         fig_path = f"{rel_prefix}/{fig_name}"
                         try:
@@ -208,16 +312,24 @@ def _load_pdf(path: str) -> Optional[list]:
                 except Exception as te:
                     print(f"[ingest] 第 {page_idx} 页表格检测失败: {te}")
 
-                # 2) 非表格文本块
+                # 2) 非表格文本块（顺带取块内最大字号，供字体标题兜底探测）
+                text_blocks = page.get_text("blocks")
+                raw_dict = page.get_text("dict")
+                dict_blocks = raw_dict.get("blocks", [])  # 保留全量，与 text_blocks 按序对齐
                 text_items = []
-                for b in page.get_text("blocks"):
+                for bi, b in enumerate(text_blocks):
                     bbox = fitz.Rect(b[:4])
                     txt = b[4].strip()
                     if not txt:
                         continue
                     if any(bbox.intersects(t["bbox"]) for t in tables):
                         continue
-                    text_items.append({"y0": bbox.y0, "text": txt})
+                    max_font = 0.0
+                    if bi < len(dict_blocks):
+                        for ln in dict_blocks[bi].get("lines", []):
+                            for sp in ln.get("spans", []):
+                                max_font = max(max_font, float(sp.get("size", 0.0)))
+                    text_items.append({"y0": bbox.y0, "text": txt, "max_font": max_font})
 
                 # 3) 按阅读顺序合并，并登记标题层级
                 items = []
@@ -243,6 +355,15 @@ def _load_pdf(path: str) -> Optional[list]:
             split_level = 1
         else:
             split_level = None
+
+        # 双轨兜底（方案丙）：数字编号标题为零时，用字号大小识别两级标题
+        font_levels: dict = {}     # (page_idx, y0, text) -> lvl(1|2)
+        font_mode = False
+        if split_level is None:
+            font_mode, font_levels = _probe_font_levels(pages_items)
+            if font_mode:
+                lv2 = sum(1 for v in font_levels.values() if v == 2)
+                split_level = 2 if lv2 >= 1 else 1
 
         # 第二遍：按 split_level 标题切分章节，聚合文字/表格/图片。
         # 单章节超限（> MAX_SECTION_CHARS）自动「续切」为同名续章，
@@ -309,6 +430,8 @@ def _load_pdf(path: str) -> Optional[list]:
                 else:  # text
                     text = blk["text"]
                     lv = _heading_level(text)
+                    if font_mode and lv is None:
+                        lv = font_levels.get((page_idx, blk["y0"], text))
                     if split_level is not None and lv == split_level:
                         # 章节边界：收尾上一章，开新章，并把标题行写入新章
                         _flush()

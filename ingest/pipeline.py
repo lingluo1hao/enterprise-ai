@@ -170,16 +170,20 @@ class IngestPipeline:
             texts = [c.text for c in all_chunks]
             vectors = self._embedder.embed(texts)
             for c, vec in zip(all_chunks, vectors):
+                # 路径分隔符归一化：Windows 上 / 与 \ 混用会让同一文档算出不同 chunk_id，
+                # 导致 upsert 不幂等（残留叠加）、delete 按一种形式删不净、父子 id 跨分隔符失配。
+                # 统一为 / 后：chunk_id 稳定、删除可精确匹配、tenant 推断一致。
+                norm_source = c.source.replace("\\", "/")
                 # chunk_id = md5(content + source)：内容相同 → 同一 id → 幂等 upsert
-                cid = hashlib.md5((c.text + c.source).encode("utf-8")).hexdigest()
+                cid = hashlib.md5((c.text + norm_source).encode("utf-8")).hexdigest()
                 # 租户从文件相对 folder 的路径推断：首层子目录即租户名（knowledge/{tenant}/x.pdf），
                 # 平铺文件（knowledge/x.pdf）归 default。拥有者一律取 pipeline 构造时传入的 user_id。
-                tenant = self._derive_tenant(c.source)
+                tenant = self._derive_tenant(norm_source)
                 entities.append({
                     "chunk_id": cid,
                     "content": _trunc_bytes(c.text),
                     "dense": vec,
-                    "file_path": c.source,
+                    "file_path": norm_source,
                     "file_name": c.file_name,
                     "access_level": c.access_level,
                     "chunk_index": c.chunk_index,
@@ -190,6 +194,7 @@ class IngestPipeline:
                     "is_parent": c.is_parent,
                     "page": c.page,
                     "chunk_type": c.chunk_type,
+                    "section_path": "§".join(c.section_path) if c.section_path else "",
                     "figure_paths": list(c.figure_paths),  # 动态字段，存为 list
                 })
         rep.entities_upserted = len(entities)
@@ -213,6 +218,15 @@ class IngestPipeline:
         for fp in diff["to_process"]:
             self._manifest.upsert(fp, diff["current"][fp],
                                   file_chunk_counts.get(fp, 0))
+
+        # 方案乙：文档真正变更后，bump 知识库版本号 → 所有旧精确缓存 key 瞬间失效。
+        # 覆盖 web 全量重建(_kb_build_pipeline().run) 与 CLI ingest(vector_store.ingest_documents) 两条路径。
+        if rep.entities_upserted + rep.entities_deleted > 0:
+            try:
+                from kb_version import bump_kb_version
+                bump_kb_version()
+            except Exception as e:
+                print(f"[pipeline] ⚠ kb_version bump 失败(忽略): {e}")
 
         rep.duration_sec = time.time() - t0
         return rep

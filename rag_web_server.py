@@ -18,6 +18,10 @@
 ================================================================================
 """
 
+# ====== 全局日志加时间戳（必须在所有 import 之前） ======
+# 包一层 builtins.print，使后续所有 print 自动带 [YYYY-MM-DD HH:MM:SS] 前缀
+import logutil  # noqa: F401  仅副作用：替换 builtins.print
+
 import io
 import os
 import sys

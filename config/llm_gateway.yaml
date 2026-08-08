@@ -26,9 +26,14 @@ models:
     model: qwen2:7b
     base_url: http://192.168.200.128:11434
     tier: large
-    timeout: 120.0
+    timeout: 600.0      # CPU 推理约 8.5 tok/s，长上下文单次可达数分钟，不能按云端标准设
     temperature: 0.0
     seed: 42            # 固定随机种子，分类/生成可复现（根治两次结果不一致）
+    # num_ctx 必须显式设置！Ollama 默认仅 2048，超出部分从 prompt **开头**静默截断。
+    # 实测：8348 字符上下文只报 prompt_eval_count=2050，放在开头的正确章节被整段
+    # 丢弃，模型拿末尾的无关章节作答（这就是"答成心跳/补传"的直接原因）。
+    num_ctx: 8192
+    keep_alive: 30m     # 常驻 30 分钟，省掉每次约 6s 的权重冷加载
     rpm: 60             # 每分钟最多 60 次调用
     tpm: 150000         # 每分钟最多 15 万 token
     fail_threshold: 3   # 连续失败 3 次触发熔断
@@ -46,9 +51,11 @@ models:
     model: qwen2:7b
     base_url: http://192.168.200.128:11434
     tier: large
-    timeout: 120.0
+    timeout: 600.0      # 生成节点上下文最长，CPU 上耗时也最久，超时给足
     temperature: 0.3    # 生成放开温度，答案更自然（仍带 seed=42 保证可复现）
     seed: 42
+    num_ctx: 8192       # 同 local-qwen：不设会被 Ollama 默认 2048 从开头截断
+    keep_alive: 30m
     rpm: 60
     tpm: 150000
     fail_threshold: 3
@@ -65,9 +72,11 @@ models:
     model: qwen2.5:1.5b
     base_url: http://192.168.200.128:11434
     tier: small
-    timeout: 60.0
+    timeout: 180.0      # 小模型快，但 grade 节点也会喂进多篇文档，留足余量
     temperature: 0.0    # 分类打分要确定性，温度拉到 0
     seed: 42            # 固定种子，确保可复现
+    num_ctx: 8192       # grade/rewrite 会一次喂入多篇文档，同样不能吃默认 2048
+    keep_alive: 30m
     rpm: 200            # 小模型便宜，配额给大一些
     tpm: 300000
     fail_threshold: 3

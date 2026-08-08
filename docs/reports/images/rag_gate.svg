@@ -1,0 +1,29 @@
+<svg width="680" height="250" viewBox="0 0 680 250" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="680" height="250" fill="#ffffff"/>
+  <!-- 起点 -->
+  <rect x="20" y="100" width="110" height="48" rx="8" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>
+  <text x="75" y="129" font-size="14" fill="#0c4a6e" text-anchor="middle" font-family="sans-serif">用户问题</text>
+  <!-- 闸门1 -->
+  <rect x="170" y="100" width="140" height="48" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="240" y="121" font-size="13" fill="#14532d" text-anchor="middle" font-family="sans-serif">①精确缓存</text>
+  <text x="240" y="138" font-size="11" fill="#14532d" text-anchor="middle" font-family="sans-serif">(kb_version失效·TTL 30分兜底)</text>
+  <!-- 闸门2 -->
+  <rect x="350" y="100" width="140" height="48" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="420" y="121" font-size="13" fill="#1e3a8a" text-anchor="middle" font-family="sans-serif">②Playbook命中</text>
+  <text x="420" y="138" font-size="11" fill="#1e3a8a" text-anchor="middle" font-family="sans-serif">(自进化·出新鲜答案)</text>
+  <!-- 闸门3 -->
+  <rect x="530" y="100" width="130" height="48" rx="8" fill="#fef9c3" stroke="#ca8a04" stroke-width="2"/>
+  <text x="595" y="121" font-size="13" fill="#713f12" text-anchor="middle" font-family="sans-serif">③正常管线</text>
+  <text x="595" y="138" font-size="11" fill="#713f12" text-anchor="middle" font-family="sans-serif">(LLM改写→检索→生成)</text>
+  <!-- 连线 -->
+  <line x1="130" y1="124" x2="168" y2="124" stroke="#64748b" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="310" y1="124" x2="348" y2="124" stroke="#64748b" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="490" y1="124" x2="528" y2="124" stroke="#64748b" stroke-width="2" marker-end="url(#a)"/>
+  <!-- 回写 -->
+  <path d="M595,148 C595,200 420,210 420,150" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="5,4" marker-end="url(#b)"/>
+  <text x="500" y="205" font-size="11" fill="#16a34a" font-family="sans-serif">③跑通→沉淀新Playbook</text>
+  <defs>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/></marker>
+    <marker id="b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#16a34a"/></marker>
+  </defs>
+</svg>
