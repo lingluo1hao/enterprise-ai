@@ -781,7 +781,7 @@ waitress-serve --threads=8 --port=8080 rag_web_server:app
 | [docs/reports/RAG数据面改造方案.md](docs/reports/RAG数据面改造方案.md) | 数据面改造方案：背景 / 目标 / 设计 / 前后对比 |
 | [docs/reports/UPGRADE_PLAN_MEMORY_KB.md](docs/reports/UPGRADE_PLAN_MEMORY_KB.md) | 记忆系统升级：分阶段方案 / P0 落地 / 验证 |
 | [docs/reports/P0_FIX_PLAN.md](docs/reports/P0_FIX_PLAN.md) | P0 修复计划：隔离 / 角色矩阵 / 上传流程 |
-| [docs/reports/RAG自进化与修复方案.md](docs/reports/RAG自进化与修复方案.md) | RAG 自进化方案 A + 回答不准根因修复：num_ctx 截断 / PyMuPDF 伪表格 / 整章图透传 / 上下文暴涨 |
+| [docs/reports/RAG自进化与修复方案.md](docs/reports/RAG自进化与修复方案.md) | RAG 自进化方案 + 回答不准根因修复：num_ctx 截断 / PyMuPDF 伪表格 / 整章图透传 / 上下文暴涨 |
 | [docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md](docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md) | RAG 检索召回链路优化：reranker 两阶段精排 .env 化 + RRF 候选池放大 + 多租户 tenant 透传修复 + 图查询真图意图优先；含 CURRENT/FIXED-A/RRF 三列量化验证（配图见同目录 `images/`） |
 
 ---
