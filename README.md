@@ -151,7 +151,7 @@ MySQL（192.168.200.128:3306 / rag_agent）
 
 | 文件 | 作用 |
 |------|------|
-| `langgraph_rag_agent.py` | **核心引擎**，含 `LangGraphRAGApp` 类、`AgentState` 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。 |
+| `langgraph_rag_agent.py` | **核心引擎**，含 `LangGraphRAGApp` 类、`AgentState` 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。**本次改造点**：reranker 两阶段精排改为 `.env` 驱动（`RERANK_ENABLED` / `RERANK_URL` / `RERANK_TIMEOUT` 去除硬编码）；RRF 融合候选池放大到 `RETRIEVE_CANDIDATE_K=20` 避免 gold 在精排前被 top-k 截断；`_rerank` 增加超长文本防御性截断规避 cross-encoder 长 chunk 500；多租户修复——CLI 新增 `--tenant` 且 `query()` 调用点透传 `tenant_id`（原被 `or "default"` 覆盖）；图查询意图识别拆分为 `figure/table/any`，`generate` 阶段真图（`fig_p*`）优先于表格图（`table_p*`）。 |
 | `advanced_rag_agent.py` | 基础组件库，提供 `OllamaLLM`、`VectorStoreManager`、`CacheManager`、`AccessControlFilter`、`DocSearchSkill` 等可复用类。**`AccessControlFilter` / `search()` / `search_figure_pages()` 的权限下推已扩展为 `tenant_id` + `user_id` + `access_level` 三级标量过滤**（`super_admin` 无 expr、`admin` 仅 `tenant_id`、`user` 加 `access_level/user_id` 约束），所有 LLM 调用统一带 `user=self.username` 以支撑 Token 用量归因。同时保留原 LangChain 版 `RAGOrchestrator` 实现（兼容旧模式）。 |
 | `memory_store.py` | **MySQL 持久化记忆模块**，含 `MySQLMemoryStore` 类，管理 4 张表：`chat_messages`（对话历史，按 `user_id` 外键→`admin_users.id` + `session_id` 隔离，列 `speaker_role`=消息说话方 user/assistant/system）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）、`chat_summaries`（对话摘要落库，进程重启不丢）。`save_message` / `save_checkpoint` 使用单条 SQL 原子取号（修复并发撞号）。支持连接池、线程安全、自动降级。 |
 | `prompt_manager.py` | **提示词工程管理模块**，含 `PromptManager`（11 个提示词模板的 CRUD + 动态加载）和 `AuthManager`（管理员 `salt:sha256` 密码认证 + `create_user()` 按租户创建用户）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务；启动时自动比对 `DEFAULT_PROMPTS` 与 DB 版本，代码更高则同步 MySQL。`generate_answer` / `writer_compose` 系统提示词已加入「保持 Markdown 表格输出 / 原样保留 `[[FIG:...]]` 占位符」要求，配合摄取层的表格与图片抽取。 |
@@ -161,6 +161,7 @@ MySQL（192.168.200.128:3306 / rag_agent）
 | `llm_gateway.py` | **企业级 LLM 网关**，统一所有 LLM 调用的出口。内含多模型路由、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载。纯标准库实现，零第三方依赖。 |
 | `ingest/` | **百万级 RAG 数据面引擎**（改造点落地）。`pipeline.IngestPipeline` 编排「扫 `knowledge/`（递归 `os.walk`，含子目录）→ 指纹增量(`mtime+size+md5`) → 多格式 loader(`txt/md/pdf/html/docx/xlsx/pptx`) → 结构切分 → 批量 embedding(并发池+重试) → 幂等 upsert」；`store.MilvusStoreBackend` 复用现有 Milvus 客户端；`cli` 提供 `ingest/status/delete/rebuild` 子命令。支持增量（仅处理变更文件）、`--force` 全量、`--dry-run` 预检。**单文件上传不再误删其他文件**（显式传入 `files` 时 `removed=[]`）。`loaders._load_pdf` 用 PyMuPDF 抽取表格→Markdown `[TABLE]...[/TABLE]`、抽取插图并在 `chunk.py` 插入 `[[FIG:...]]` 占位符；缺 PyMuPDF 时优雅降级为纯文本。测试见 `tests/test_ingest.py`（零外部依赖，`python tests/test_ingest.py` 直接跑）。 |
 | `config/llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
+| `scripts/eval_retrieval_bury.py` | **检索召回量化验证脚本**（可复跑）：对比 CURRENT（原 top-k 截断）/ FIXED-A（放大候选池）/ RRF（融合）三列召回排名，定位 gold 被精排前截断的根因，输出结果可直接对照 `docs/reports/rag_retrieval_upgrade/images/` 可视化。 |
 | `config/init_db.sql` | MySQL 建库建表脚本。`admin_users` 表含 `role`（`admin/user/super_admin`）与 `tenant_id`（多租户隔离）字段；已预置 `admin`(default)、`reader`/`viewer`(user,default)、`jm_admin`(admin,jm)、`yh_admin`(admin,yh)、`superadmin`(super_admin,default) 五类演示账号。 |
 | `knowledge/` | 存放企业知识库 PDF 文档（ingestion 数据源），首次运行 / `ingest` 时自动构建向量索引（写入 Milvus）。 |
 | `docs/` | 文档中心：`guides/`（MCP / LLM 网关使用说明）+ `reports/`（RAG 数据面改造、P0 修复、记忆系统升级等方案与分析报告）。 |
@@ -406,6 +407,11 @@ cp .env.example .env
 # 编辑 .env：填入真实的 MySQL / Redis / Milvus 密码与地址等
 ```
 
+# RAG 检索增强（默认已开启，reranker 两阶段精排）
+RERANK_ENABLED=true
+RERANK_URL=http://<RERANK_HOST>:11436/v1/rerank
+RERANK_TIMEOUT=180     # 精排超时（秒）：CPU 上 20 候选 × 3000 字偏重，给足余量
+
 ### 5.9 启动 Web 服务
 
 ```bash
@@ -513,6 +519,10 @@ RAG 数据面是项目的"地基改造"，围绕**百万级文档**的可观测�
 - **混合检索**：Milvus 原生 `Function` + `FunctionType.BM25`，无需 `rank_bm25` / `jieba`。可用 `HYBRID_SEARCH=false` 关闭。
 - **权限下推**：标量 `expr` 在距离计算前过滤；普通用户不会泄露受限文档片段。
 - **缓存按角色隔离**：Redis 缓存键含角色，避免 admin 答案通过缓存泄漏给 user。
+
+#### 两阶段精排与图查询意图
+- **两阶段精排**：混合检索（Dense + BM25）→ RRF 融合（候选池 `RETRIEVE_CANDIDATE_K=20`）→ cross-encoder rerank（`bge-reranker-v2-m3`，由 `RERANK_URL` / `RERANK_TIMEOUT` 经 `.env` 驱动，超时或失败自动回退 RRF）。候选池放大避免 gold 在精排前被 top-k 截断。
+- **图查询意图识别**：`figure / table / any` 三态拆分，`generate` 阶段真图（`fig_p*`）优先于表格图（`table_p*`），避免协议表格图淹没真正的示意图。
 
 #### PDF 通用图抽取（与语言/caption 无关）
 
@@ -772,6 +782,7 @@ waitress-serve --threads=8 --port=8080 rag_web_server:app
 | [docs/reports/UPGRADE_PLAN_MEMORY_KB.md](docs/reports/UPGRADE_PLAN_MEMORY_KB.md) | 记忆系统升级：分阶段方案 / P0 落地 / 验证 |
 | [docs/reports/P0_FIX_PLAN.md](docs/reports/P0_FIX_PLAN.md) | P0 修复计划：隔离 / 角色矩阵 / 上传流程 |
 | [docs/reports/RAG自进化与修复方案.md](docs/reports/RAG自进化与修复方案.md) | RAG 自进化方案 A + 回答不准根因修复：num_ctx 截断 / PyMuPDF 伪表格 / 整章图透传 / 上下文暴涨 |
+| [docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md](docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md) | RAG 检索召回链路优化：reranker 两阶段精排 .env 化 + RRF 候选池放大 + 多租户 tenant 透传修复 + 图查询真图意图优先；含 CURRENT/FIXED-A/RRF 三列量化验证（配图见同目录 `images/`） |
 
 ---
 
