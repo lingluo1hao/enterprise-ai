@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="540" viewBox="0 0 860 540" font-family="Microsoft YaHei">
+  <rect width="860" height="540" fill="#0E1726"/>
+  <text x="40" y="44" fill="#E8F0FF" font-size="24" font-weight="bold">为什么现状会错：跨 query 分数不可比</text>
+  <text x="40" y="72" fill="#8FA6C4" font-size="14">CURRENT 用 sort by distance 把不同 query 的结果混排 —— 但各自的距离分布根本不是一回事</text>
+
+  <!-- left panel: Query A -->
+  <rect x="40" y="110" width="380" height="320" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="230" y="136" fill="#5AA9FF" font-size="15" font-weight="bold" text-anchor="middle">Query A：基站信息格式</text>
+  <text x="230" y="158" fill="#7E93B0" font-size="12" text-anchor="middle">距离范围 0.30 ~ 0.50（整体偏远）</text>
+  <rect x="70"  y="180" width="50" height="220" fill="#7FD98A"/>
+  <rect x="140" y="210" width="50" height="190" fill="#5AA9FF"/>
+  <rect x="210" y="250" width="50" height="150" fill="#5AA9FF"/>
+  <rect x="280" y="290" width="50" height="110" fill="#5AA9FF"/>
+  <rect x="350" y="340" width="50" height="60"  fill="#5AA9FF"/>
+  <text x="95"  y="176" fill="#7FD98A" font-size="12" text-anchor="middle" font-weight="bold">0.30</text>
+  <text x="165" y="206" fill="#D6E2F2" font-size="12" text-anchor="middle">0.33</text>
+  <text x="235" y="246" fill="#D6E2F2" font-size="12" text-anchor="middle">0.37</text>
+  <text x="305" y="286" fill="#D6E2F2" font-size="12" text-anchor="middle">0.41</text>
+  <text x="375" y="336" fill="#D6E2F2" font-size="12" text-anchor="middle">0.50</text>
+  <text x="95"  y="420" fill="#7FD98A" font-size="12" text-anchor="middle" font-weight="bold">#1 gold</text>
+  <text x="165" y="420" fill="#D6E2F2" font-size="12" text-anchor="middle">#2</text>
+  <text x="235" y="420" fill="#D6E2F2" font-size="12" text-anchor="middle">#3</text>
+  <text x="305" y="420" fill="#D6E2F2" font-size="12" text-anchor="middle">#4</text>
+  <text x="375" y="420" fill="#D6E2F2" font-size="12" text-anchor="middle">#5</text>
+
+  <!-- right panel: Query B -->
+  <rect x="440" y="110" width="380" height="320" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="630" y="136" fill="#5AA9FF" font-size="15" font-weight="bold" text-anchor="middle">Query B：VI 基站信息格式</text>
+  <text x="630" y="158" fill="#7E93B0" font-size="12" text-anchor="middle">距离范围 0.12 ~ 0.25（整体比 A 近得多）</text>
+  <rect x="470" y="180" width="50" height="220" fill="#FF5C7A"/>
+  <rect x="540" y="210" width="50" height="190" fill="#FF5C7A"/>
+  <rect x="610" y="240" width="50" height="160" fill="#FF9F45"/>
+  <rect x="680" y="260" width="50" height="140" fill="#FF9F45"/>
+  <rect x="750" y="300" width="50" height="100" fill="#FF9F45"/>
+  <text x="495" y="176" fill="#FFD0D8" font-size="12" text-anchor="middle" font-weight="bold">0.12</text>
+  <text x="565" y="206" fill="#FFD0D8" font-size="12" text-anchor="middle" font-weight="bold">0.15</text>
+  <text x="635" y="236" fill="#0E1726" font-size="12" text-anchor="middle" font-weight="bold">0.18</text>
+  <text x="705" y="256" fill="#0E1726" font-size="12" text-anchor="middle" font-weight="bold">0.20</text>
+  <text x="775" y="296" fill="#0E1726" font-size="12" text-anchor="middle" font-weight="bold">0.25</text>
+  <text x="495" y="420" fill="#FF8FA3" font-size="12" text-anchor="middle">#1</text>
+  <text x="565" y="420" fill="#FF8FA3" font-size="12" text-anchor="middle">#2</text>
+  <text x="635" y="420" fill="#FFD0A0" font-size="12" text-anchor="middle">#3</text>
+  <text x="705" y="420" fill="#FFD0A0" font-size="12" text-anchor="middle">#4</text>
+  <text x="775" y="420" fill="#FFD0A0" font-size="12" text-anchor="middle">#5</text>
+
+  <!-- merged note -->
+  <rect x="40" y="450" width="780" height="68" rx="10" fill="#3A1622" stroke="#FF5C7A" stroke-width="2"/>
+  <text x="60" y="478" fill="#FFD0D8" font-size="14" font-weight="bold">全局按 distance 升序后：Query B 的 5 个文档（0.12~0.25）全排在 Query A 的 gold（0.30）之前</text>
+  <text x="60" y="502" fill="#FF8FA3" font-size="13">→ A 的精准文档被挤到 <tspan font-weight="bold">rank 6+</tspan>（实测 rank 9）。这就是「分数不可比」直接导致的被埋。</text>
+</svg>

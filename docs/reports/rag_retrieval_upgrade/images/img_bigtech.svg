@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="500" viewBox="0 0 800 500" font-family="Microsoft YaHei">
+  <defs>
+    <marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#6E8DBF"/>
+    </marker>
+  </defs>
+  <rect width="800" height="500" fill="#0E1726"/>
+  <text x="40" y="44" fill="#E8F0FF" font-size="24" font-weight="bold">大厂检索范式：Hybrid + RRF + 两阶段 rerank</text>
+  <text x="40" y="72" fill="#8FA6C4" font-size="14">三件套解决单路 dense 召回的语义 gap、分数不可比、精确原句被埋</text>
+
+  <!-- stage 1 -->
+  <rect x="60" y="100" width="680" height="92" rx="12" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="84" y="128" fill="#5AA9FF" font-size="16" font-weight="bold">阶段一 · 多 Query 改写（扩召回）</text>
+  <text x="84" y="156" fill="#D6E2F2" font-size="14">LLM 把长问句拆成 2-3 个短关键词扩召回；</text>
+  <text x="84" y="180" fill="#36D399" font-size="14">原句必须 insert(0) 置顶 —— 改写是「扩召回」，原句是「保精准」，角色不同。</text>
+
+  <!-- stage 2 -->
+  <rect x="60" y="212" width="680" height="110" rx="12" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="84" y="240" fill="#5AA9FF" font-size="16" font-weight="bold">阶段二 · Hybrid 召回 + RRF 跨 query 融合</text>
+  <text x="84" y="268" fill="#D6E2F2" font-size="14">dense(语义向量) + sparse BM25(字面) 双路召回，互补长短板；</text>
+  <text x="84" y="290" fill="#D6E2F2" font-size="14">多个 query 的排名用 RRF 融合：score += 1 / (60 + rank + 1)</text>
+  <text x="84" y="312" fill="#FF9F45" font-size="14">用「排名倒数」而非「原始分数」——彻底规避不同 query 距离分布不可比。</text>
+
+  <!-- stage 3 -->
+  <rect x="60" y="342" width="680" height="100" rx="12" fill="#1A2C45" stroke="#36D299" stroke-width="1.5"/>
+  <text x="84" y="370" fill="#36D299" font-size="16" font-weight="bold">阶段三 · 两阶段 cross-encoder rerank（精排）</text>
+  <text x="84" y="398" fill="#D6E2F2" font-size="14">第一阶段 RRF 粗召回 top-20 候选；</text>
+  <text x="84" y="420" fill="#D6E2F2" font-size="14">第二阶段 bge-reranker-v2-m3 对 (query + doc) 联合打分，精度远 &gt; bi-encoder。</text>
+  <text x="84" y="438" fill="#7E93B0" font-size="12">RRF: Cormack et al. 2009 · cross-encoder rerank 是大厂标配（如 Cohere Rerank / BGE）</text>
+
+  <!-- vertical connectors -->
+  <line x1="400" y1="192" x2="400" y2="210" stroke="#6E8DBF" stroke-width="2" marker-end="url(#arw)"/>
+  <line x1="400" y1="322" x2="400" y2="340" stroke="#6E8DBF" stroke-width="2" marker-end="url(#arw)"/>
+</svg>

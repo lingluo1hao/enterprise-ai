@@ -41,6 +41,28 @@ LangGraph 版高级 RAG Agent
 import os
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
+# ---- 加载 .env 文件（轻量实现，零依赖；与 advanced_rag_agent / prompt_manager / memory_store 一致） ----
+def _load_dotenv(dotenv_path: str | None = None):
+    """解析 .env 文件并将「未设置」的变量注入 os.environ（不覆盖已 export 的环境变量）。"""
+    if dotenv_path is None:
+        dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(dotenv_path):
+        return
+    with open(dotenv_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 import sys
 import time
 import json
@@ -107,6 +129,24 @@ HISTORY_COMPRESS_TURNS = 6
 # 向量库（Milvus）的 similarity_search_with_score 的 k 参数。
 # 5 是一个平衡值：太少可能遗漏关键信息，太多会塞满 LLM 上下文窗口。
 RETRIEVE_TOP_K = 5
+
+# RRF 跨 query 融合后的候选池宽度（两阶段精排前不截断）。
+# 关键：裸原句单独检索时 gold 可能已 rank1，但 RRF 融合会被噪声改写 query 稀释到 rank>5；
+# 若直接截断到 RETRIEVE_TOP_K=5 再送 reranker，gold 会在精排前被丢弃（图错 bug 根因）。
+# 故先融合到较宽候选池，让 cross-encoder 在宽池中把 gold 拉回顶部，再收窄到 top5。
+RETRIEVE_CANDIDATE_K = 20
+
+# ===== 两阶段 cross-encoder 精排（reranker via llama.cpp server）=====
+# 见改造方案文档 §4.2。Ollama 0.32.x 不提供 /api/rerank 路由，故 reranker 由
+# llama.cpp 独立托管（已在 192.168.200.128:11436 起好并通过 /v1/rerank 验证：
+# 相关 +3.07 / 无关 -6.77）。启动命令（VM 上一次性）：
+#   nohup /data/llama/build/bin/llama-server \
+#     -m /data/models/bge-reranker-v2-m3.Q4_K_M.gguf \
+#     --reranking --port 11436 -c 2048 -b 2048 -ub 2048 &
+# Reranker（两阶段精排）配置 —— 从 .env 读取，缺失时回退到以下生产默认值
+RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() == "true"
+RERANK_URL = os.getenv("RERANK_URL", "http://192.168.200.128:11436/v1/rerank")
+RERANK_TIMEOUT = int(os.getenv("RERANK_TIMEOUT", "20"))
 
 # 文档片段截断长度。
 # 给 LLM 生成答案时，每个文档片段只取前 N 个字符。
@@ -235,18 +275,23 @@ class AgentState(TypedDict, total=False):
 # --------------------------------------------------------------------------- #
 # 含图类名词 / 渲染动作的 query 走 figure-aware 召回路径——专门捞图页（chunk_type="page"），
 # 避免 caption 文本极短被正文页挤掉导致 [[FIG:...]] 缺失。
-_FIGURE_QUERY_KEYWORDS = (
-    # 中文：图类名词
+# 真图类名词（意图=figure）：优先返回 fig_p* 真图（流程图/架构图/示意图等）
+_FIGURE_INTENT_FIGURE_KW = (
     "流程图", "架构图", "拓扑", "示意图", "框图", "时序图", "状态图",
     "类图", "原理图", "接线图", "信号流", "数据流", "消息流", "协议栈",
     "配图", "插图",
-    # 中文：表格（loaders.py 把表格也渲染成图片并内嵌 FIG 占位符）
-    "表格", "表",
-    # 中文：渲染动作
-    "输出", "展示", "画出", "渲染", "看看",
-    # 英文
     "diagram", "chart", "graph", "architecture", "topology",
-    "flowchart", "sequence", "render", "display",
+    "flowchart", "sequence",
+)
+# 表格类名词（意图=table）：优先返回 table_p* 表格图
+_FIGURE_INTENT_TABLE_KW = (
+    "表格", "表",
+)
+# 通用「要图」触发词（含渲染动作）：仅决定是否走 figure 召回路径，不区分意图
+_FIGURE_QUERY_KEYWORDS = (
+    _FIGURE_INTENT_FIGURE_KW
+    + _FIGURE_INTENT_TABLE_KW
+    + ("输出", "展示", "画出", "渲染", "看看", "render", "display")
 )
 
 
@@ -256,6 +301,51 @@ def _is_figure_query(query: str) -> bool:
         return False
     ql = query.lower()
     return any(kw in ql for kw in _FIGURE_QUERY_KEYWORDS)
+
+
+def _figure_intent(query: str) -> str:
+    """判断图查询意图：'figure'(真图) / 'table'(表格图) / 'any'(未明确)。
+
+    用于图选择阶段区分 fig_p*(真图) 与 table_p*(表格图)，避免「通信流程图」
+    这类真图查询被协议细节表格 chunk 的文本相关度挤掉，返回错图。
+    """
+    if not query:
+        return "any"
+    ql = query.lower()
+    if any(kw in ql for kw in _FIGURE_INTENT_FIGURE_KW):
+        return "figure"
+    if any(kw in ql for kw in _FIGURE_INTENT_TABLE_KW):
+        return "table"
+    return "any"
+
+
+def _fig_is_table(fp: str) -> bool:
+    """路径是否指向表格图（table_p*）。真图/整页图返回 False。"""
+    return "table_p" in (fp or "").lower()
+
+
+def _fig_sort_key(fp: str, intent: str):
+    """图选择排序键：(意图优先级, score) 中的意图优先级部分，越小越优先。
+    - figure 意图：fig_p* 真图(0) > 其他真图/整页图(1) > table_p* 表格图(2)
+    - table  意图：table_p*(0) > 其他真图(1) > fig_p*(2)
+    - any    意图：不区分(1)
+    """
+    low = (fp or "").lower()
+    is_fig = "fig_p" in low
+    is_tab = "table_p" in low
+    if intent == "figure":
+        if is_fig:
+            return 0
+        if is_tab:
+            return 2
+        return 1
+    if intent == "table":
+        if is_tab:
+            return 0
+        if is_fig:
+            return 2
+        return 1
+    return 1
 
 
 def _norm_figs(val) -> List[str]:
@@ -1392,55 +1482,53 @@ class LangGraphRAGApp:
             result = self.llm.chat(system, user, task="rewrite", user=self.username)
 
         # 解析 LLM 输出：按行拆分，取前 3 个非空行
-        queries = [q.strip() for q in result.strip().split("\n") if q.strip()][:3]
-        # 兜底：始终保留原始问题作为搜索词
-        queries.append(query)
+        # 去「1. 2. 3.」或「1、2、3、」编号噪声（LLM 常给有序列表，编号会干扰检索）
+        queries = [re.sub(r"^\d+[.、]\s*", "", q.strip())
+                   for q in result.strip().split("\n") if q.strip()][:3]
+        # 兜底：始终保留原始问题，且置于列表首位（原句是最高精度信号，
+        # 放末尾会被改写 query 抢注分数而沉底；见改造方案 §4.1）
+        queries.insert(0, query.strip())
         return queries
 
     def _do_retrieve(self, queries: List[str], role: str) -> List:
         """
-        【辅助：向量检索 + 去重 + 权限过滤】
+        【辅助：向量检索 + RRF 跨 query 融合 + 权限过滤 + 两阶段精排】
 
-        作用：对多个查询词分别做向量库（Milvus）向量检索，合并结果后去重。
+        作用：对多个查询词分别做向量检索，用 RRF（Reciprocal Rank Fusion）
+        跨 query 融合排名，再做可选 cross-encoder 精排，最后权限过滤、去重。
 
         原理：
         1. 每个查询词独立调用 similarity_search_with_score() 取 top-k 个文档
-        2. 对每个查询词的结果做权限过滤（AccessControlFilter）
-        3. 用 page_content 前 80 个字符做去重 key，避免同一文档在多个查询词的结果中出现
-
-        去重的重要性：
-        如果不去重，同一段文档可能被 3 个查询词分别返回，在最终上下文里出现 3 次。
-        这浪费 LLM 的上下文窗口，且会导致答案偏向这段重复内容。
+        2. 不同 query 的距离分数分布不同、不可直接比较（改造方案 §5.2），
+           改用 RRF：每个 query 内部按返回顺序给 1/(k+rank+1) 的分，跨 query 累加
+        3. 原句已在 _do_rewrite 中置顶（insert(0)），其召回的 gold 文档在首个
+           query 即 rank 1，RRF 累加后稳居顶部 —— 根治「精准文档被改写 query 挤沉」
+        4. （可选）cross-encoder reranker 对 RRF 候选池用原句精排，进一步提升精度
 
         参数：
-            queries: 搜索词列表
+            queries: 搜索词列表（第 0 项始终为原句）
             role: 用户角色（"admin" 或 "user"，决定可见文档范围）
         返回：
-            [(Document, score), ...] — 去重后的文档列表
+            [(Document, score), ...] — 融合 + 精排后的文档列表（score 越小越相关）
         """
-        all_results = []
-        seen = set()  # 去重集合：记录已经见过的文档内容摘要
+        # ① 收集每个 query 的排名（带权限过滤）
+        per_query_results = []
         for q in queries:
-            # 向量库相似度检索（Milvus 接口）：返回 (Document, 距离分数) 的列表
-            # filter_role 透传给 Milvus 后端做 access_level 权限下推
             results = self.vector_db.similarity_search_with_score(
                 q, k=RETRIEVE_TOP_K, filter_role=role,
                 user_id=self.user, tenant_id=self.tenant_id)
-            # 根据用户角色过滤无权限文档
             results = AccessControlFilter.filter_results(results, role)
-            for doc, score in results:
-                # 用前 80 字符作为文档唯一标识
-                content_key = doc.page_content[:80]
-                if content_key not in seen:
-                    seen.add(content_key)
-                    all_results.append((doc, score))
+            per_query_results.append(results)
 
-        # ===== figure-aware 二次召回 =====
-        # 原始 query（rewrites 列表的最后一项 = 原句）含「图/流程图/架构图」等关键词时，
-        # 专门在 chunk_type=="page" 的图页里做 BM25 稀疏召回并顶到结果前面。
-        # 原因：figure caption 文本极短（PyPDF 仅抽到几字），常规 dense+BM25 混合检索
-        # 容易被同文档的正文页挤掉，导致 _do_generate 拿不到 figure_paths。
-        original_q = queries[-1] if queries else ""
+        # ② RRF 跨 query 融合（原生句置顶 → gold 文档浮顶）
+        #    融合到较宽候选池 RETRIEVE_CANDIDATE_K，避免 gold 在进 reranker 前被 top5 截断丢弃
+        rrf_results = self._rrf_fuse_queries(per_query_results, RETRIEVE_CANDIDATE_K)
+
+        # ③④ 两阶段精排（可选，失败优雅回退到 RRF 顺序）
+        candidate = self._rerank(queries[0] if queries else "", rrf_results, RETRIEVE_TOP_K)
+
+        # ⑤ figure-aware 二次召回：原句（queries[0]）含图关键词时，图页顶到最前
+        original_q = queries[0] if queries else ""
         figure_results = []
         if _is_figure_query(original_q):
             try:
@@ -1459,18 +1547,84 @@ class LangGraphRAGApp:
                 if key not in seen2:
                     seen2.add(key)
                     merged.append((doc, score))
-            for doc, score in all_results:
+            for doc, score in candidate:
                 key = doc.page_content[:80]
                 if key not in seen2:
                     seen2.add(key)
                     merged.append((doc, score))
-            all_results = merged
-        else:
-            # 非图查询：跨多 query 合并后按相关性升序（score 越小越相关，
-            # 与 _rrf_fuse 返回的 -fused 语义一致），确保最相关章节一定进入
-            # _do_generate 的 docs[:5]，不被后续 query 召回的命令表等噪声挤掉。
-            all_results.sort(key=lambda x: x[1])
-        return all_results
+            return merged
+        return candidate
+
+    def _rrf_fuse_queries(self, per_query_results, top_k, rrf_k=60):
+        """
+        RRF（Reciprocal Rank Fusion）跨 query 融合。
+
+        不同 query 的距离分布不同、不可直接比较（改造方案 §5.2），故用排名倒数而非
+        原始距离。原句置顶后，其召回的 gold 文档在第一个 query 即 rank 1，累加分最高，
+        浮到顶部（改造方案 §5.3 的小算例）。
+
+        返回 [(Document, score), ...]，score = -fused（越小越相关），与下游约定一致。
+        """
+        fused = {}
+        docs = {}
+        for qres in per_query_results:
+            for rank, (doc, _) in enumerate(qres):
+                key = doc.page_content[:80]
+                docs[key] = doc
+                fused[key] = fused.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+        ranked = sorted(fused, key=lambda h: fused[h], reverse=True)
+        return [(docs[h], -fused[h]) for h in ranked[:top_k]]
+
+    def _rerank(self, query: str, docs: List, top_n: int) -> List:
+        """
+        两阶段 cross-encoder 精排（改造方案 §4.2）。
+
+        用 bge-reranker-v2-m3（经 llama.cpp server 的 OpenAI 兼容 /v1/rerank 接口）
+        对 RRF 候选池做精排。原句 query 直接作为 reranker 的 query（最高精度信号）。
+
+        reranker 服务不可用时优雅回退到 RRF 顺序，不影响主链路。
+
+        参数：
+            query: 原始问题
+            docs: RRF 融合后的候选 [(Document, score), ...]
+            top_n: 返回条数
+        返回：
+            精排后的 [(Document, score), ...]
+        """
+        if not RERANK_ENABLED or not docs:
+            return docs[:top_n]
+        try:
+            import requests
+            # 防御性清洗：过滤空串/None，截断超长文档，避免 reranker 报 500。
+            # 截断只影响"发给 reranker 打分的内容"，返回时经 idx_map 取回完整原始
+            # Document，不丢上下文。
+            RERANK_MAX_CHARS = 3000
+            cleaned, idx_map = [], []
+            for i, (d, _s) in enumerate(docs):
+                text = (getattr(d, "page_content", None) or "").strip()
+                if not text:
+                    continue
+                if len(text) > RERANK_MAX_CHARS:
+                    text = text[:RERANK_MAX_CHARS]
+                cleaned.append(text)
+                idx_map.append(i)
+            if not cleaned:
+                return docs[:top_n]
+            payload = {
+                "model": "bge-reranker-v2-m3",
+                "query": (query or "").strip()[:512],
+                "documents": cleaned,
+            }
+            resp = requests.post(RERANK_URL, json=payload, timeout=RERANK_TIMEOUT)
+            resp.raise_for_status()
+            order = sorted(resp.json().get("results", []),
+                           key=lambda x: x["relevance_score"], reverse=True)
+            reranked = [docs[idx_map[it["index"]]] for it in order[:top_n]]
+            print(f"  [rerank] {len(docs)} 候选 → 精排 {len(reranked)} 条 (query={query[:30]!r})")
+            return reranked
+        except Exception as e:
+            print(f"  [rerank] 失败，回退 RRF 顺序: {e}")
+            return docs[:top_n]
 
     def _do_grade(self, query: str, docs: List) -> List[bool]:
         """
@@ -1651,22 +1805,26 @@ class LangGraphRAGApp:
                 print(f"  [generate] figure 兜底追加失败(忽略): {e}")
 
         if figs_with_score:
-            # 同一 fp 保留最小 score（最相关）；整体按 score 升序
+            # 同一 fp 保留最小 score（最相关）
             best = {}
             for fp, sc in figs_with_score:
                 if fp not in best or sc < best[fp]:
                     best[fp] = sc
             # 过滤掉 LLM 已经在答案里保留的占位符，避免重复追加
             existing_figs = set(_extract_figs_from_text(answer))
-            # 上限 2 张：图按相关性升序排，越靠前越贴题；收紧上限避免「图片太多/噪音大」
-            # （用户反馈二次关联图片太多、再去推理耗时太长）。且 chunker 已改为只透传本
-            # chunk 真实出现的图，候选池已大幅缩小，2 张足够覆盖最相关图。
+            remaining = [(fp, sc) for fp, sc in best.items() if fp not in existing_figs]
+
+            intent = _figure_intent(query)
             MAX_FIGS = 2
-            figs = [fp for fp, _ in sorted(best.items(), key=lambda kv: kv[1])
-                    if fp not in existing_figs][:MAX_FIGS]
+            # 按「意图优先级 + score」排序：figure 意图优先 fig_p* 真图、最后才回退
+            # table_p* 表格图；table 意图反之。any 意图保持原 score 排序。
+            # 这样「通信流程图」即使真图 chunk 的 BM25 分数低于协议表格 chunk，
+            # 也会因为意图=figure 而被顶上来，返回正确配图。
+            ordered = sorted(remaining, key=lambda kv: (_fig_sort_key(kv[0], intent), kv[1]))
+            figs = [fp for fp, _ in ordered][:MAX_FIGS]
             if figs:
                 answer += "\n\n" + "\n".join(f"[[FIG:{fp}]]" for fp in figs)
-            print(f"  [generate] 确定性追加 {len(figs)} 个图页占位符: {figs}")
+            print(f"  [generate] 确定性追加 {len(figs)} 个图页占位符: {figs} (intent={intent})")
 
         return answer
 
@@ -2394,7 +2552,7 @@ class LangGraphRAGApp:
 # ============================================================================
 # CLI 入口 — 命令行交互模式
 # ============================================================================
-def run_interactive(app: LangGraphRAGApp, role: str):
+def run_interactive(app: LangGraphRAGApp, role: str, tenant: str = "default"):
     """
     【CLI：命令行交互模式】
 
@@ -2475,7 +2633,7 @@ def run_interactive(app: LangGraphRAGApp, role: str):
 
         # ---- 提问 ----
         try:
-            app.query(question, role=current_role, session_id=session_id)
+            app.query(question, role=current_role, session_id=session_id, tenant_id=tenant)
         except Exception as e:
             print(f"\n  处理出错: {e}")
             traceback.print_exc()
@@ -2503,6 +2661,17 @@ def main():
     admin_mode = "--admin" in args
     role = ROLE_ADMIN if admin_mode else DEFAULT_ROLE
 
+    # 提取 --tenant 参数（支持 "--tenant yh" 与 "--tenant=yh" 两种写法），
+    # 用于多租户环境下把 CLI 验证指向真实租户（默认 default 无文档）。
+    tenant = "default"
+    for i, a in enumerate(args):
+        if a == "--tenant" and i + 1 < len(args):
+            tenant = args[i + 1]
+            break
+        if a.startswith("--tenant="):
+            tenant = a.split("=", 1)[1]
+            break
+
     # 提取直接提问（第一个不以 "--" 开头的参数）
     direct_question = None
     for arg in args:
@@ -2520,13 +2689,14 @@ def main():
 
     # 初始化应用（连接 LLM、加载向量库、编译状态图）
     app = LangGraphRAGApp(fast_mode=fast_mode)
+    app.tenant_id = tenant   # CLI 显式指定租户，便于多租户环境验证（默认 default 无文档）
 
     if direct_question:
         # 直接提问模式：回答后退出
-        app.query(direct_question, role=role)
+        app.query(direct_question, role=role, tenant_id=tenant)
     else:
         # 交互模式：进入命令行循环
-        run_interactive(app, role)
+        run_interactive(app, role, tenant)
 
 
 if __name__ == "__main__":

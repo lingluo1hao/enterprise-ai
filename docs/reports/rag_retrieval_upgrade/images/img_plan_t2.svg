@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="460" viewBox="0 0 800 460" font-family="Microsoft YaHei">
+  <defs>
+    <marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#6E8DBF"/>
+    </marker>
+  </defs>
+  <rect width="800" height="460" fill="#0E1726"/>
+  <text x="40" y="44" fill="#E8F0FF" font-size="24" font-weight="bold">cross-encoder 两阶段精排（llama.cpp server）</text>
+  <text x="40" y="72" fill="#8FA6C4" font-size="14">Ollama 0.32.6 无 /api/rerank，改用本地 GGUF 起的独立 reranker 服务</text>
+
+  <!-- candidate -->
+  <rect x="40" y="120" width="200" height="80" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="140" y="152" fill="#D6E2F2" font-size="14" text-anchor="middle">RRF 粗召回</text>
+  <text x="140" y="176" fill="#5AA9FF" font-size="15" text-anchor="middle" font-weight="bold">top-20 候选</text>
+
+  <!-- server -->
+  <rect x="300" y="110" width="240" height="100" rx="10" fill="#1A2C45" stroke="#36D299" stroke-width="2"/>
+  <text x="420" y="140" fill="#36D299" font-size="15" text-anchor="middle" font-weight="bold">llama-server :11436</text>
+  <text x="420" y="164" fill="#D6E2F2" font-size="13" text-anchor="middle">/v1/rerank</text>
+  <text x="420" y="186" fill="#9FE6B0" font-size="12" text-anchor="middle">bge-reranker-v2-m3</text>
+
+  <!-- reranked -->
+  <rect x="600" y="120" width="160" height="80" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="680" y="152" fill="#D6E2F2" font-size="14" text-anchor="middle">按 relevance</text>
+  <text x="680" y="176" fill="#36D299" font-size="15" text-anchor="middle" font-weight="bold">降序 top-k</text>
+
+  <!-- fallback -->
+  <rect x="300" y="250" width="240" height="70" rx="10" fill="#2A2113" stroke="#FF9F45" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="420" y="278" fill="#FF9F45" font-size="13" text-anchor="middle">失败优雅回退</text>
+  <text x="420" y="300" fill="#D6E2F2" font-size="13" text-anchor="middle">保留 RRF 顺序（不影响可用）</text>
+
+  <!-- arrows -->
+  <line x1="240" y1="160" x2="296" y2="160" stroke="#6E8DBF" stroke-width="2" marker-end="url(#arw)"/>
+  <line x1="540" y1="160" x2="596" y2="160" stroke="#6E8DBF" stroke-width="2" marker-end="url(#arw)"/>
+  <line x1="420" y1="210" x2="420" y2="248" stroke="#6E8DBF" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arw)"/>
+
+  <!-- bottom notes -->
+  <rect x="40" y="350" width="720" height="80" rx="10" fill="#13233A" stroke="#2E4A6E" stroke-width="1"/>
+  <text x="60" y="378" fill="#D6E2F2" font-size="14">模型文件：/data/models/bge-reranker-v2-m3.Q4_K_M.gguf（limcheekin 量化版，离线导入）</text>
+  <text x="60" y="404" fill="#36D299" font-size="14" font-weight="bold">实测 /v1/rerank：相关文档 relevance +3.07  vs  无关文档 -6.77，cross-encoder 工作正常</text>
+  <text x="60" y="424" fill="#7E93B0" font-size="12">_rerank 失败(超时/服务挂)自动回退 RRF，零风险上线</text>
+</svg>

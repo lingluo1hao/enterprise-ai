@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="500" viewBox="0 0 800 500" font-family="Microsoft YaHei">
+  <rect width="800" height="500" fill="#0E1726"/>
+  <text x="40" y="44" fill="#E8F0FF" font-size="24" font-weight="bold">原句置顶 + 去编号 + RRF 跨 query 融合</text>
+  <text x="40" y="72" fill="#8FA6C4" font-size="14">零新依赖，eval 实测把『基站信息格式』从 rank 9 拉回 rank 1</text>
+
+  <!-- left: _do_rewrite -->
+  <rect x="40" y="100" width="360" height="180" rx="12" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="60" y="128" fill="#5AA9FF" font-size="16" font-weight="bold">改 _do_rewrite（line 1394-1397）</text>
+  <rect x="60" y="142" width="320" height="124" rx="6" fill="#0C1626" stroke="#2E4A6E"/>
+  <text x="72" y="168" fill="#9FE6B0" font-size="13" xml:space="preserve">queries = [re.sub(</text>
+  <text x="72" y="188" fill="#D6E2F2" font-size="13" xml:space="preserve">  r"^\d+[.、]\s*", "", q)</text>
+  <text x="72" y="208" fill="#D6E2F2" font-size="13" xml:space="preserve">  for q in lines][:3]</text>
+  <text x="72" y="232" fill="#FF9F45" font-size="13" xml:space="preserve">queries.insert(0, query)  # 原句置顶</text>
+  <text x="72" y="256" fill="#7E93B0" font-size="12" xml:space="preserve"># 去「1. 2. 3.」编号噪声</text>
+
+  <!-- right: _do_retrieve -->
+  <rect x="420" y="100" width="340" height="180" rx="12" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="440" y="128" fill="#5AA9FF" font-size="16" font-weight="bold">改 _do_retrieve（line 1400-1473）</text>
+  <rect x="440" y="142" width="300" height="124" rx="6" fill="#0C1626" stroke="#2E4A6E"/>
+  <text x="452" y="168" fill="#D6E2F2" font-size="13" xml:space="preserve">per_query = []</text>
+  <text x="452" y="188" fill="#D6E2F2" font-size="13" xml:space="preserve">for q in queries:</text>
+  <text x="452" y="208" fill="#D6E2F2" font-size="13" xml:space="preserve">    per_query.append(检索top-k)</text>
+  <text x="452" y="232" fill="#FF9F45" font-size="13" xml:space="preserve">all = _rrf_fuse_queries(</text>
+  <text x="452" y="252" fill="#FF9F45" font-size="13" xml:space="preserve">    per_query, k)  # 去 sort</text>
+
+  <!-- bottom: formula + result -->
+  <rect x="40" y="300" width="720" height="150" rx="12" fill="#13233A" stroke="#2E4A6E" stroke-width="1"/>
+  <text x="60" y="330" fill="#36D399" font-size="15" font-weight="bold">RRF 融合公式（rrf_k = 60）</text>
+  <text x="60" y="358" fill="#D6E2F2" font-size="14" xml:space="preserve">score[doc] += 1 / (60 + rank + 1)   每 query 独立排名后倒数加权融合</text>
+  <text x="60" y="386" fill="#D6E2F2" font-size="14" xml:space="preserve">original_q = queries[0]   （原 -1 末位 改为 0 首位，figure-aware 才不会误判）</text>
+  <text x="60" y="420" fill="#FF9F45" font-size="15" font-weight="bold">eval 实测：基站信息格式  CURRENT rank 9  →  FIXED-A rank 1  /  RRF rank 2</text>
+
+  <!-- connector -->
+  <line x1="220" y1="280" x2="220" y2="298" stroke="#6E8DBF" stroke-width="2"/>
+  <line x1="590" y1="280" x2="590" y2="298" stroke="#6E8DBF" stroke-width="2"/>
+</svg>

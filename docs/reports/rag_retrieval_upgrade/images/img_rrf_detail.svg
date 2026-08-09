@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="550" viewBox="0 0 860 550" font-family="Microsoft YaHei">
+  <rect width="860" height="550" fill="#0E1726"/>
+  <text x="40" y="44" fill="#E8F0FF" font-size="24" font-weight="bold">RRF 融合机制：用「排名」而非「分数」投票</text>
+  <text x="40" y="72" fill="#8FA6C4" font-size="14">Reciprocal Rank Fusion：每个 query 独立排名，再按 1/(60+rank) 累加 —— 绕开分数不可比</text>
+
+  <!-- three query panels -->
+  <!-- panel 原句 -->
+  <rect x="40" y="100" width="250" height="150" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="165" y="126" fill="#7FD98A" font-size="14" font-weight="bold" text-anchor="middle">原句（置顶）</text>
+  <text x="70"  y="156" fill="#D6E2F2" font-size="13">#1  Doc-X <tspan fill="#7FD98A">★gold</tspan></text>
+  <text x="70"  y="184" fill="#D6E2F2" font-size="13">#2  Doc-P</text>
+  <text x="70"  y="212" fill="#D6E2F2" font-size="13">#3  Doc-Q</text>
+
+  <!-- panel 改写1 -->
+  <rect x="305" y="100" width="250" height="150" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="430" y="126" fill="#5AA9FF" font-size="14" font-weight="bold" text-anchor="middle">改写 query 1</text>
+  <text x="335" y="156" fill="#D6E2F2" font-size="13">#1  Doc-P</text>
+  <text x="335" y="184" fill="#D6E2F2" font-size="13">#2  Doc-X <tspan fill="#7FD98A">★</tspan></text>
+  <text x="335" y="212" fill="#D6E2F2" font-size="13">#3  Doc-R</text>
+
+  <!-- panel 改写2 -->
+  <rect x="570" y="100" width="250" height="150" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <text x="695" y="126" fill="#5AA9FF" font-size="14" font-weight="bold" text-anchor="middle">改写 query 2</text>
+  <text x="600" y="156" fill="#D6E2F2" font-size="13">#1  Doc-Q</text>
+  <text x="600" y="184" fill="#D6E2F2" font-size="13">#2  Doc-X <tspan fill="#7FD98A">★</tspan></text>
+  <text x="600" y="212" fill="#D6E2F2" font-size="13">#3  Doc-S</text>
+
+  <!-- formula -->
+  <rect x="40" y="270" width="780" height="56" rx="10" fill="#13233A" stroke="#2E4A6E" stroke-width="1"/>
+  <text x="60" y="298" fill="#D6E2F2" font-size="15" font-weight="bold">RRF 分(doc) = Σ  1 / (60 + rankᵢ)   ，k=60 是平滑常数</text>
+  <text x="60" y="318" fill="#8FA6C4" font-size="12">越靠前的排名，1/(60+rank) 越大；多个 query 都靠前 → 累加后分数最高 → 排最前。分数不参与比较，只看名次。</text>
+
+  <!-- score table -->
+  <text x="40" y="362" fill="#E8F0FF" font-size="15" font-weight="bold">逐文档累加（小算例）：</text>
+  <rect x="40" y="376" width="780" height="110" rx="10" fill="#16263D" stroke="#3E6FB0" stroke-width="1.5"/>
+  <!-- header -->
+  <text x="70"  y="402" fill="#8FA6C4" font-size="12">文档</text>
+  <text x="190" y="402" fill="#8FA6C4" font-size="12" text-anchor="middle">原句rank</text>
+  <text x="300" y="402" fill="#8FA6C4" font-size="12" text-anchor="middle">改写1rank</text>
+  <text x="410" y="402" fill="#8FA6C4" font-size="12" text-anchor="middle">改写2rank</text>
+  <text x="540" y="402" fill="#8FA6C4" font-size="12" text-anchor="middle">RRF 分</text>
+  <text x="690" y="402" fill="#8FA6C4" font-size="12" text-anchor="middle">最终排名</text>
+  <line x1="50" y1="412" x2="810" y2="412" stroke="#2E4A6E" stroke-width="1"/>
+  <!-- rows -->
+  <text x="70"  y="436" fill="#7FD98A" font-size="13" font-weight="bold">Doc-X ★</text>
+  <text x="190" y="436" fill="#D6E2F2" font-size="13" text-anchor="middle">1</text>
+  <text x="300" y="436" fill="#D6E2F2" font-size="13" text-anchor="middle">2</text>
+  <text x="410" y="436" fill="#D6E2F2" font-size="13" text-anchor="middle">2</text>
+  <text x="540" y="436" fill="#7FD98A" font-size="13" text-anchor="middle">0.0486</text>
+  <text x="690" y="436" fill="#7FD98A" font-size="13" font-weight="bold" text-anchor="middle">1</text>
+
+  <text x="70"  y="462" fill="#D6E2F2" font-size="13">Doc-P</text>
+  <text x="190" y="462" fill="#D6E2F2" font-size="13" text-anchor="middle">2</text>
+  <text x="300" y="462" fill="#D6E2F2" font-size="13" text-anchor="middle">1</text>
+  <text x="410" y="462" fill="#D6E2F2" font-size="13" text-anchor="middle">-</text>
+  <text x="540" y="462" fill="#D6E2F2" font-size="13" text-anchor="middle">0.0325</text>
+  <text x="690" y="462" fill="#D6E2F2" font-size="13" text-anchor="middle">2</text>
+
+  <text x="70"  y="478" fill="#D6E2F2" font-size="13">Doc-Q</text>
+  <text x="190" y="478" fill="#D6E2F2" font-size="13" text-anchor="middle">3</text>
+  <text x="300" y="478" fill="#D6E2F2" font-size="13" text-anchor="middle">-</text>
+  <text x="410" y="478" fill="#D6E2F2" font-size="13" text-anchor="middle">1</text>
+  <text x="540" y="478" fill="#D6E2F2" font-size="13" text-anchor="middle">0.0323</text>
+  <text x="690" y="478" fill="#D6E2F2" font-size="13" text-anchor="middle">3</text>
+
+  <rect x="40" y="496" width="780" height="0" fill="none"/>
+  <text x="40" y="522" fill="#8FA6C4" font-size="12">gold（Doc-X）虽在改写 query 中只排 #2，但因在三个 query 都靠前，RRF 累加后稳居 #1 —— 这正是「置顶原句 + 跨 query 融合」能救回精准文档的原因。</text>
+</svg>

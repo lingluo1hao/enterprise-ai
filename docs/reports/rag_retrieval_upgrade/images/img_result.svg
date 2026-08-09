@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="460" viewBox="0 0 800 460" font-family="Microsoft YaHei">
+  <defs>
+    <marker id="arw" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#6E8DBF"/>
+    </marker>
+  </defs>
+  <rect width="800" height="460" fill="#0E1726"/>
+  <text x="40" y="44" fill="#E8F0FF" font-size="24" font-weight="bold">测试结果：精确文档排名对比（越小越靠前）</text>
+  <text x="40" y="72" fill="#8FA6C4" font-size="14">eval_retrieval_bury.py 连真实 Milvus + Ollama(bge-m3)，gold = 原句单独检索 top1</text>
+
+  <!-- axes -->
+  <line x1="120" y1="400" x2="740" y2="400" stroke="#5A708F" stroke-width="2"/>
+  <line x1="120" y1="400" x2="120" y2="80" stroke="#5A708F" stroke-width="2"/>
+  <text x="60" y="86" fill="#7E93B0" font-size="12">rank</text>
+
+  <!-- y ticks -->
+  <text x="100" y="404" fill="#7E93B0" font-size="11" text-anchor="end">0</text>
+  <text x="100" y="336" fill="#7E93B0" font-size="11" text-anchor="end">2</text>
+  <text x="100" y="272" fill="#7E93B0" font-size="11" text-anchor="end">4</text>
+  <text x="100" y="208" fill="#7E93B0" font-size="11" text-anchor="end">6</text>
+  <text x="100" y="144" fill="#7E93B0" font-size="11" text-anchor="end">8</text>
+  <text x="100" y="84" fill="#7E93B0" font-size="11" text-anchor="end">10</text>
+
+  <!-- bars for 基站信息格式: CURRENT=9, FIXED-A=1, RRF=2  (scale 32px/unit, baseline y=400) -->
+  <!-- CURRENT=9 -> h=288, y=112 -->
+  <rect x="160" y="112" width="80" height="288" rx="4" fill="#FF5C7A"/>
+  <text x="200" y="102" fill="#FF8FA3" font-size="15" text-anchor="middle" font-weight="bold">9</text>
+  <text x="200" y="420" fill="#D6E2F2" font-size="13" text-anchor="middle">CURRENT</text>
+
+  <!-- FIXED-A=1 -> h=32, y=368 -->
+  <rect x="320" y="368" width="80" height="32" rx="4" fill="#36D299"/>
+  <text x="360" y="358" fill="#9FE6B0" font-size="15" text-anchor="middle" font-weight="bold">1</text>
+  <text x="360" y="420" fill="#D6E2F2" font-size="13" text-anchor="middle">FIXED-A</text>
+
+  <!-- RRF=2 -> h=64, y=336 -->
+  <rect x="480" y="336" width="80" height="64" rx="4" fill="#5AA9FF"/>
+  <text x="520" y="326" fill="#9FD0FF" font-size="15" text-anchor="middle" font-weight="bold">2</text>
+  <text x="520" y="420" fill="#D6E2F2" font-size="13" text-anchor="middle">RRF</text>
+
+  <!-- threshold line at rank5 -> y=400-5*32=240 -->
+  <line x1="120" y1="240" x2="740" y2="240" stroke="#FF9F45" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="736" y="234" fill="#FF9F45" font-size="12" text-anchor="end">top5 门槛</text>
+
+  <!-- note -->
+  <rect x="600" y="300" width="140" height="96" rx="10" fill="#13233A" stroke="#2E4A6E" stroke-width="1"/>
+  <text x="612" y="324" fill="#D6E2F2" font-size="12">另两个 query</text>
+  <text x="612" y="344" fill="#D6E2F2" font-size="12">（基站信息格式</text>
+  <text x="612" y="364" fill="#D6E2F2" font-size="12">是什么 / VI …）</text>
+  <text x="612" y="386" fill="#36D299" font-size="12" font-weight="bold">当前已 rank1</text>
+  <text x="40" y="444" fill="#7E93B0" font-size="12">结论：当前代码把最高频精确 query 埋到 rank 9；修复后 100% 救回 top5。</text>
+</svg>

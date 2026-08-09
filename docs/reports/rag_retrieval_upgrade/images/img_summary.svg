@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="460" viewBox="0 0 800 460" font-family="Microsoft YaHei">
+  <rect width="800" height="460" fill="#0E1726"/>
+  <text x="40" y="44" fill="#E8F0FF" font-size="24" font-weight="bold">小结：改造前 vs 改造后</text>
+  <text x="40" y="72" fill="#8FA6C4" font-size="14">全盘对齐大厂检索范式，高频精确 query 不再被埋</text>
+
+  <!-- table header -->
+  <rect x="40" y="100" width="220" height="44" rx="6" fill="#1A2C45" stroke="#3E6FB0"/>
+  <text x="150" y="128" fill="#E8F0FF" font-size="15" text-anchor="middle" font-weight="bold">维度</text>
+  <rect x="264" y="100" width="250" height="44" rx="6" fill="#3A1622" stroke="#FF5C7A"/>
+  <text x="389" y="128" fill="#FF8FA3" font-size="15" text-anchor="middle" font-weight="bold">改造前</text>
+  <rect x="518" y="100" width="242" height="44" rx="6" fill="#13301F" stroke="#36D299"/>
+  <text x="639" y="128" fill="#9FE6B0" font-size="15" text-anchor="middle" font-weight="bold">改造后</text>
+
+  <!-- rows -->
+  <g font-size="13" fill="#D6E2F2">
+    <!-- row1 -->
+    <rect x="40" y="148" width="220" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="150" y="175" text-anchor="middle">原句位置</text>
+    <rect x="264" y="148" width="250" height="44" rx="6" fill="#241820" stroke="#5A3340"/>
+    <text x="389" y="175" text-anchor="middle">列表末尾(兜底)</text>
+    <rect x="518" y="148" width="242" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="639" y="175" text-anchor="middle" fill="#36D299">首位(保精准)</text>
+
+    <!-- row2 -->
+    <rect x="40" y="196" width="220" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="150" y="223" text-anchor="middle">跨 query 合并</text>
+    <rect x="264" y="196" width="250" height="44" rx="6" fill="#241820" stroke="#5A3340"/>
+    <text x="389" y="223" text-anchor="middle">sort by score(不可比)</text>
+    <rect x="518" y="196" width="242" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="639" y="223" text-anchor="middle" fill="#36D299">RRF 排名融合</text>
+
+    <!-- row3 -->
+    <rect x="40" y="244" width="220" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="150" y="271" text-anchor="middle">精排</text>
+    <rect x="264" y="244" width="250" height="44" rx="6" fill="#241820" stroke="#5A3340"/>
+    <text x="389" y="271" text-anchor="middle">无</text>
+    <rect x="518" y="244" width="242" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="639" y="271" text-anchor="middle" fill="#36D299">cross-encoder rerank</text>
+
+    <!-- row4 -->
+    <rect x="40" y="292" width="220" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="150" y="319" text-anchor="middle">高频精确 query</text>
+    <rect x="264" y="292" width="250" height="44" rx="6" fill="#241820" stroke="#5A3340"/>
+    <text x="389" y="319" text-anchor="middle" fill="#FF5C7A">沉到 rank 9</text>
+    <rect x="518" y="292" width="242" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="639" y="319" text-anchor="middle" fill="#36D299">置顶 rank 1</text>
+
+    <!-- row5 -->
+    <rect x="40" y="340" width="220" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="150" y="367" text-anchor="middle">reranker 故障</text>
+    <rect x="264" y="340" width="250" height="44" rx="6" fill="#241820" stroke="#5A3340"/>
+    <text x="389" y="367" text-anchor="middle">-</text>
+    <rect x="518" y="340" width="242" height="44" rx="6" fill="#16263D" stroke="#2E4A6E"/>
+    <text x="639" y="367" text-anchor="middle" fill="#FF9F45">自动回退 RRF</text>
+  </g>
+
+  <text x="40" y="420" fill="#7E93B0" font-size="12">后续：per-query 混合召回（dense + BM25）、eval 回归「全量改造后」策略确认不退化。</text>
+</svg>
