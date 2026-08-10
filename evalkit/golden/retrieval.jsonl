@@ -1,0 +1,44 @@
+# 检索层黄金集 —— 每行一条 case，# 开头为注释行会被跳过
+#
+# 【字段说明】
+#   case_id    唯一标识，建议 <租户>-<序号>
+#   query      用户问题（尽量用真实用户的问法，不要写成检索关键词）
+#   relevant   哪些文档算"对"。file 子串匹配 + pages 页码 + keywords 内容兜底
+#              gain: 3=直接写着答案 / 2=需推理 / 1=背景相关（用于 nDCG 加权）
+#   tenant_id  检索租户（jm / yh），必须与实际 ingest 时一致
+#   role       检索角色（admin 看全部；user 只看 public）
+#   tags       分组标签，用于回答"我们在哪类问题上弱"
+#
+# 【为什么标 pages 又标 keywords】
+#   pages 精确但依赖 PDF 排版不变；keywords 抗变化但可能误判。
+#   两者是"或"关系，任一命中即算召回，这样重新 ingest 后黄金集依然有效。
+#   本文档物理页 = 目录标注页 + 5（前有 2 页封面 + 3 页目录）。
+#
+# ---------------------------------------------------------------------------
+# 租户 jm：几米物联《个人定位终端通讯协议 V1.2》（101 页）
+# ---------------------------------------------------------------------------
+{"case_id": "jm-001", "query": "登录包的协议号是多少", "tenant_id": "jm", "role": "admin", "tags": ["fact-lookup", "protocol-id"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [7, 8], "keywords": ["登录包0x01", "0x01"], "gain": 3, "note": "登录包章节，协议号 0x01"}]}
+{"case_id": "jm-002", "query": "心跳包用的是哪个协议号，终端多久发一次", "tenant_id": "jm", "role": "admin", "tags": ["fact-lookup", "protocol-id"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [10, 11, 12], "keywords": ["0x36", "心跳包"], "gain": 3, "note": "心跳包 0x36 章节"}]}
+{"case_id": "jm-003", "query": "通用协议包的格式是什么样的，包含哪些字段", "tenant_id": "jm", "role": "admin", "tags": ["format", "overview"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [6], "keywords": ["起始位", "包长度", "校验"], "gain": 3, "note": "第 1 章 通用协议包格式"}]}
+{"case_id": "jm-004", "query": "校时包怎么用，终端如何向服务器请求时间同步", "tenant_id": "jm", "role": "admin", "tags": ["fact-lookup", "flow"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [13, 14], "keywords": ["0x1F", "校时"], "gain": 3, "note": "校时包 0x1F 章节"}]}
+{"case_id": "jm-005", "query": "4G 设备的 GPS 定位包和 2G 的有什么不同", "tenant_id": "jm", "role": "admin", "tags": ["multi-hop", "compare"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [46, 47, 48, 49], "keywords": ["0xA0", "GPS 4G"], "gain": 3, "note": "GPS 4G 定位包 0xA0"}, {"file": "个人定位终端通讯协议", "pages": [15, 16, 17, 18], "keywords": ["0x22", "GPS 2G"], "gain": 3, "note": "GPS 2G 定位包 0x22，对比需要两段都召回"}]}
+{"case_id": "jm-006", "query": "LBS 多基站扩展信息包怎么解析", "tenant_id": "jm", "role": "admin", "tags": ["fact-lookup", "parse"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [32, 33, 34], "keywords": ["0x28", "多基站"], "gain": 3, "note": "2G 版 0x28"}, {"file": "个人定位终端通讯协议", "pages": [50, 51, 52], "keywords": ["0xA1"], "gain": 2, "note": "4G 版 0xA1，也算相关但优先级次之"}]}
+{"case_id": "jm-007", "query": "服务器要给终端下发在线设置指令，用哪个包", "tenant_id": "jm", "role": "admin", "tags": ["fact-lookup", "protocol-id"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [36, 37, 38], "keywords": ["0x80", "在线设置"], "gain": 3, "note": "在线设置指令 0x80"}]}
+{"case_id": "jm-008", "query": "WiFi 定位包里 MAC 地址是怎么组织的", "tenant_id": "jm", "role": "admin", "tags": ["fact-lookup", "parse"], "relevant": [{"file": "个人定位终端通讯协议", "pages": [20, 21, 22], "keywords": ["0x2C", "WiFi"], "gain": 3, "note": "WiFi 2G 定位包 0x2C"}, {"file": "个人定位终端通讯协议", "pages": [53, 54, 55], "keywords": ["0xA2"], "gain": 2, "note": "WIFI 4G 定位包 0xA2"}]}
+#
+# ---------------------------------------------------------------------------
+# 租户 yh：《学生证设备通讯协议 V5.0》（58 页）
+# ---------------------------------------------------------------------------
+{"case_id": "yh-001", "query": "V2、KA、WIFIMAC 这三种数据分别是什么", "tenant_id": "yh", "role": "admin", "tags": ["fact-lookup", "overview"], "relevant": [{"file": "学生证设备通讯协议", "pages": [1], "keywords": ["V2 是GPS", "WIFIMAC 是WIFI", "KA 是基站"], "gain": 3, "note": "首页数据说明段落"}]}
+{"case_id": "yh-002", "query": "设备上报定位数据的优先级顺序是怎样的", "tenant_id": "yh", "role": "admin", "tags": ["fact-lookup", "rule"], "relevant": [{"file": "学生证设备通讯协议", "pages": [1], "keywords": ["GPS > WIFI > LBS", "优先级"], "gain": 3, "note": "定位数据优先级：GPS > WIFI > LBS"}]}
+{"case_id": "yh-003", "query": "设备是怎么登录到服务器的，登录流程是什么", "tenant_id": "yh", "role": "admin", "tags": ["flow"], "relevant": [{"file": "学生证设备通讯协议", "pages": [1, 2], "keywords": ["设备登录", "序列号", "TCP"], "gain": 3, "note": "设备登录与下线段落"}]}
+{"case_id": "yh-004", "query": "白名单号码拨打的逻辑是什么，打不通会怎样", "tenant_id": "yh", "role": "admin", "tags": ["fact-lookup", "rule"], "relevant": [{"file": "学生证设备通讯协议", "pages": [1, 2], "keywords": ["白名单", "3 个循环", "接听"], "gain": 3, "note": "语音流程：顺序拨打 1-3 个号码，3 个循环后停止"}]}
+{"case_id": "yh-005", "query": "SOS 报警是怎么触发和上报的", "tenant_id": "yh", "role": "admin", "tags": ["fact-lookup", "flow"], "relevant": [{"file": "学生证设备通讯协议", "pages": [12, 13, 36, 43], "keywords": ["SOS"], "gain": 3, "note": "SOS 相关章节分散在多页"}]}
+#
+# ---------------------------------------------------------------------------
+# 跨租户隔离 case：在 yh 租户下问 jm 独有的内容，正确行为是「检索不到」。
+# 这类 case 的 relevant 为空，评测时不计入常规指标，
+# 由 triage 单独校验「是否发生跨租户泄漏」（根因 R5 的反向验证）。
+# ---------------------------------------------------------------------------
+{"case_id": "iso-001", "query": "心跳包 0x36 的字段定义", "tenant_id": "yh", "role": "user", "tags": ["isolation", "negative"], "relevant": [], "forbidden": [{"file": "Jimi", "note": "几米协议文档不应出现在 yh 租户检索结果中"}], "note": "0x36 只存在于 jm 租户文档；在 yh 租户下若召回到几米协议内容即为跨租户泄漏"}
+{"case_id": "iso-002", "query": "V2 KA WIFIMAC 数据格式说明", "tenant_id": "jm", "role": "user", "tags": ["isolation", "negative"], "relevant": [], "forbidden": [{"file": "学生证", "note": "学生证协议文档不应出现在 jm 租户检索结果中"}], "note": "反向隔离验证：V2/KA/WIFIMAC 只存在于 yh 租户文档，在 jm 租户下不得召回"}

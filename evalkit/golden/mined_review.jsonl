@@ -1,0 +1,1 @@
+{"case_id": "mined-008", "query": "输出一下通信流程图", "tenant_id": "yh", "role": "admin", "tags": ["mined", "yh"], "relevant": [{"file": "27 【技术对接】学生证设备通讯协议V5.0.pdf", "gain": 3, "pages": [2, 3, 25], "keywords": ["设备信息结构", "白名单主动获取"]}], "source": "mined", "note": "挖自 trace 97f4b928（2026-08-05 01:26:57），LLM 判定相关文档 1 篇 | ⚠ 自校验未命中：标注可信度存疑，需人工确认"}
