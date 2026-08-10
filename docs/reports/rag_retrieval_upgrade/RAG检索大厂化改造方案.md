@@ -37,7 +37,7 @@
 
 1. **原句置顶与跨 query 融合（零依赖，零新服务）**：原句置顶 + 去「1./2./3.」编号噪声 + RRF 跨 query 融合 → 解决「原句被埋 + 分数不可比」
 2. **两阶段 cross-encoder 精排**：接 reranker（bge-reranker-v2-m3 via llama-server）做两阶段精排 → 解决「bi-encoder 召回精度有限」
-3. **混合召回升级（可选）**：per-query 召回从纯 dense 升级为 hybrid（dense + sparse BM25） → 解决「字面匹配漏召回」
+3. **混合召回增强（可选）**：项目基线已是 Hybrid（dense + sparse BM25，详见 4.0）；在其之上调权重 / 对齐 rerank 候选池，进一步降漏召回
 
 **目标态**（量化目标 = 原句单独检索的 top1 文档能稳定排在最终 top1）：
 
@@ -74,6 +74,42 @@
 ---
 
 ## 4. 技术方案与实施细节
+
+### 4.0 基础前提：Hybrid 召回（dense + sparse BM25）—— 项目基线已具备
+
+> 本节先把「单 query 召回」这件事说清楚：企业级 RAG 的**地基**已经是 Hybrid（dense 语义向量 + sparse BM25 字面），本改造是在这块地基之上再叠「RRF 跨 query 融合（4.1）」与「cross-encoder 精排（4.2）」，而不是从零搭召回。即便这套 Hybrid 是项目早期就有的，也值得在这里交代明白——因为它决定了后续两节的输入从何而来。
+
+![大厂检索范式：Hybrid + RRF + 两阶段 rerank](images/img_bigtech.png)
+
+> **图说**：最左一段就是 Hybrid 召回（dense + sparse BM25）。本节聚焦它；中段 RRF 跨 query 融合见 4.1，右段 cross-encoder 精排见 4.2。
+
+#### 为什么必须 Hybrid：dense 与 BM25 互补
+
+单路 dense 向量召回有两个「天然短板」，恰好是 BM25 的强项：
+
+- **dense（bge-m3 语义向量）**：擅长语义 / 同义 / 改写泛化（"怎么查基站的配置" 能命中「基站信息格式」章节）。但**字面精确匹配弱**——用户敲「基站信息格式」「VI 基站」「table_p037」这类专有名词、缩写、编号、表名时，dense 很容易把它和语义相近但非目标的文档混在一起；罕见词 / 新术语向量稀疏，召回不稳。
+- **sparse BM25（Milvus 原生 BM25 函数）**：擅长**精确词面匹配**——上面的专有名词、编号、表名，BM25 直接命中，不受语义漂移影响。但对同义改写、长问句泛化无能为力（"怎么查基站的配置" 用 BM25 搜不到「基站信息格式」）。
+
+两路 RRF 融合后，既保住「词面精准」，又不漏「语义泛化」——这正是 Hybrid 的价值，也是大厂范式的第一件套。
+
+#### 本项目如何落地（代码落点，已上线）
+
+`langgraph_rag_agent.py` 的每次召回都走 `self.vector_db.similarity_search_with_score(...)`（`advanced_rag_agent.py:846`），它**直接转发**到 `_milvus_search`（`:715`），后者就是 Hybrid 实现：
+
+1. **dense 召回**：`client.search(anns_field="dense", metric=COSINE)`，bge-m3 向量，召回 top-`2k` 候选。
+2. **sparse BM25 召回**：`client.search(anns_field="sparse", metric=BM25)`，Milvus 原生 BM25 函数基于 `content` 字段（已开 `enable_analyzer=True, analyzer_params={type: "chinese"}` 中文分词）自动生成 sparse 向量，召回 top-`2k` 候选；**失败自动回退纯 dense**（`:762`）。
+3. **RRF 融合**：`_rrf_fuse`（`:698`，`rrf_k=60`）把两路按「排名倒数」累加融合，返回 `(doc, -fused_score)` 前 k。
+
+关键开关与 schema：
+
+- `HYBRID_SEARCH`（默认 `"true"`）控制是否启用 sparse —— `advanced_rag_agent.py:526`；设 `false` 仅做 dense。
+- schema：`content`（开中文 analyzer）、`dense`(FLOAT_VECTOR)、`sparse`(SPARSE_FLOAT_VECTOR，**BM25 函数输出字段**)，见 `:586–619`。
+
+#### 与本次改造的关系
+
+4.1 的「RRF 跨 query 融合」和 4.2 的「cross-encoder 精排」，它们输入的**每一个 query 的 top-k 都来自上面这条 Hybrid 召回**。换句话说：改造是在「已经 Hybrid 化的每路召回」之上，做「跨 query 融合 + 精排」，召回底座本身不是本次新增——这也是为什么 4.3 把它列为「可选增强」而非「从零启用」。
+
+> **量化线索**：基线 Hybrid 召回已具备，所以本改造的量化基线（5.4「量化评估结果」）是在「Hybrid 已开」的前提下对比「合并策略」的——证明被埋问题不在 Hybrid 召回，而在「多 query 分数的合并方式」与「缺精排」。
 
 ### 4.1 原句置顶与跨 query 融合
 
@@ -152,11 +188,17 @@ def _rerank(self, query, docs, top_n=RETRIEVE_TOP_K):
 
 > **量化线索**：reranker 已实测——相关文档 +3.07、无关文档 -6.77，分差近 10 个单位，精排方向正确（见 5.5「reranker 实证」）。两阶段精排的代码接线后，即用同一接口对 RRF 候选池精排。
 
-### 4.3 混合召回升级（可选）
+### 4.3 混合召回增强（可选）
 
-把 per-query `similarity_search_with_score` 换成 `advanced_rag_agent.py:715 _milvus_search`（hybrid dense+sparse+RRF）—— 让**单 query 召回**也变 hybrid。低风险，可后续。
+单 query 的 Hybrid 召回（dense + sparse BM25）**已是项目基线**（实现见 4.0，开关 `HYBRID_SEARCH=true`），并非本次新增。本节列为「可选」的是在它之上的**进一步增强**：
 
-> **量化线索**：混合召回这一步预计进一步降漏召回（补足字面匹配），目前尚未量化，列入后续回归计划。
+- 调 BM25 / dense 两路的融合权重或各自召回量，针对本项目中文术语 / 编号密集的特点做定向调优；
+- 将 Hybrid 召回的候选池（`top = 2k`）与 4.2 reranker 的候选池对齐，避免「召回够、喂给 rerank 时被截断」；
+- 必要时用 `HYBRID_SEARCH=false` 做消融实验，量化 Hybrid 对「字面精确 query」的独立贡献。
+
+低风险、可独立开关，不影响 4.1 / 4.2 主链路。
+
+> **量化线索**：混合召回增强预计在基线 Hybrid 之上进一步降漏召回（扩大字面 / 语义互补的覆盖），目前尚未量化，列入后续回归计划。
 
 ---
 
@@ -232,7 +274,7 @@ results:  [{"index":0,"relevance_score":3.07}, {"index":1,"relevance_score":-6.7
 
 **后续**：
 
-- per-query 混合召回（dense + BM25），并补量化
+- per-query 混合召回增强（基线已是 Hybrid，见 4.0）：调 BM25/dense 权重、对齐 rerank 候选池，并补量化
 - eval 增加「全量改造后」策略回归确认不退化（覆盖原句置顶 + RRF + 两阶段精排）
 - 监控 reranker P99 延迟与 fallback 触发率
 

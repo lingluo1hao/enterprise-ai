@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340">
+  <rect width="760" height="340" fill="#f8fafc"/>
+  <text x="380" y="24" font-size="16" font-weight="700" text-anchor="middle" fill="#0f172a">关键能力 3：测试判分硬化（消除误判）</text>
+
+  <rect x="20" y="40" width="720" height="34" rx="6" fill="#f1f5f9" stroke="#64748b"/>
+  <text x="380" y="62" font-size="11" text-anchor="middle" fill="#334155">完整评测首跑 答案层通过率 <tspan font-weight="700" fill="#dc2626">11.1%</tspan> = 4 真问题 + <tspan font-weight="700" fill="#dc2626">4 测试误判</tspan>（false positive）</text>
+
+  <!-- 左：4 误判 -->
+  <rect x="20" y="86" width="360" height="26" rx="6" fill="#fef2f2" stroke="#ef4444"/>
+  <text x="200" y="104" font-size="11" font-weight="700" text-anchor="middle" fill="#dc2626">4 条误判（测试框架 false positive）</text>
+
+  <rect x="20" y="120" width="360" height="46" rx="6" fill="#ffffff" stroke="#fca5a5"/>
+  <text x="32" y="140" font-size="10" font-weight="700" fill="#334155">ans-jm-002</text>
+  <text x="32" y="156" font-size="10" fill="#475569">must_not_include:["0x01"] 误杀合法信号码</text>
+
+  <rect x="20" y="172" width="360" height="46" rx="6" fill="#ffffff" stroke="#fca5a5"/>
+  <text x="32" y="192" font-size="10" font-weight="700" fill="#334155">ans-yh-003</text>
+  <text x="32" y="208" font-size="10" fill="#475569">"并不会发送短信" 否定句被子串命中</text>
+
+  <rect x="20" y="224" width="360" height="46" rx="6" fill="#ffffff" stroke="#fca5a5"/>
+  <text x="32" y="244" font-size="10" font-weight="700" fill="#334155">ans-refuse-001 / 002</text>
+  <text x="32" y="260" font-size="10" fill="#475569">正确拒答但关键词表漏"未提及/未提供"</text>
+
+  <!-- 右：3 修复 -->
+  <rect x="400" y="86" width="340" height="26" rx="6" fill="#ecfdf5" stroke="#059669"/>
+  <text x="570" y="104" font-size="11" font-weight="700" text-anchor="middle" fill="#059669">3 项修复手段</text>
+
+  <rect x="400" y="120" width="340" height="46" rx="6" fill="#ffffff" stroke="#6ee7b7"/>
+  <text x="412" y="140" font-size="10" font-weight="700" fill="#334155">grade_refusal</text>
+  <text x="412" y="156" font-size="10" fill="#475569">窄词 + 语义正则双路兜底</text>
+
+  <rect x="400" y="172" width="340" height="46" rx="6" fill="#ffffff" stroke="#6ee7b7"/>
+  <text x="412" y="192" font-size="10" font-weight="700" fill="#334155">_forbidden_hits</text>
+  <text x="412" y="208" font-size="10" fill="#475569">否定感知分句 + regex: 精确断言</text>
+
+  <rect x="400" y="224" width="340" height="46" rx="6" fill="#ffffff" stroke="#6ee7b7"/>
+  <text x="412" y="244" font-size="10" font-weight="700" fill="#334155">golden 收紧</text>
+  <text x="412" y="260" font-size="10" fill="#475569">ans-jm-002 → regex 精确断言</text>
+
+  <rect x="20" y="300" width="720" height="28" rx="6" fill="#ecfdf5" stroke="#059669"/>
+  <text x="380" y="319" font-size="11" text-anchor="middle" fill="#065f46">4 条历史误判在冻结答案上确认消失 ✅（详见第六部分验证）</text>
+</svg>

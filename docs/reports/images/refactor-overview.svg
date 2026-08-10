@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 390">
+  <rect width="680" height="390" fill="#f8fafc"/>
+  <text x="340" y="28" font-size="17" font-weight="700" text-anchor="middle" fill="#0f172a">体系全景：harness → bad case → 自进化 三级闭环</text>
+
+  <!-- 三个主节点 -->
+  <rect x="30" y="70" width="180" height="125" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="120" y="98" font-size="14" font-weight="700" text-anchor="middle" fill="#2563eb">① Harness 工程</text>
+  <text x="120" y="122" font-size="11" text-anchor="middle" fill="#334155">黄金集 · 检索/答案 harness</text>
+  <text x="120" y="140" font-size="11" text-anchor="middle" fill="#334155">DeepSeek 强 Judge</text>
+  <text x="120" y="158" font-size="11" text-anchor="middle" fill="#334155">生成难度路由</text>
+  <text x="120" y="176" font-size="11" text-anchor="middle" fill="#334155">评测判分硬化</text>
+
+  <rect x="250" y="70" width="180" height="125" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text x="340" y="98" font-size="14" font-weight="700" text-anchor="middle" fill="#d97706">② Bad Case 库</text>
+  <text x="340" y="122" font-size="11" text-anchor="middle" fill="#334155">失败样本沉淀</text>
+  <text x="340" y="140" font-size="11" text-anchor="middle" fill="#334155">R1~R8 根因分类</text>
+  <text x="340" y="158" font-size="11" text-anchor="middle" fill="#334155">管理后台 triage</text>
+  <text x="340" y="176" font-size="11" text-anchor="middle" fill="#334155">点踩自动入</text>
+
+  <rect x="470" y="70" width="180" height="125" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+  <text x="560" y="98" font-size="14" font-weight="700" text-anchor="middle" fill="#059669">③ 自进化闭环</text>
+  <text x="560" y="122" font-size="11" text-anchor="middle" fill="#334155">patch_success 计数</text>
+  <text x="560" y="140" font-size="11" text-anchor="middle" fill="#334155">去重合并</text>
+  <text x="560" y="158" font-size="11" text-anchor="middle" fill="#334155">playbook 强化</text>
+  <text x="560" y="176" font-size="11" text-anchor="middle" fill="#334155">文本相似度兜底</text>
+
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#475569"/>
+    </marker>
+  </defs>
+  <path d="M210,100 C232,100 232,100 250,100" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <text x="230" y="93" font-size="9" text-anchor="middle" fill="#475569">评测失败</text>
+  <path d="M430,100 C452,100 452,100 470,100" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <text x="450" y="93" font-size="9" text-anchor="middle" fill="#475569">triage</text>
+  <path d="M560,195 C560,255 120,255 120,195" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <text x="340" y="270" font-size="9" text-anchor="middle" fill="#475569">强化 playbook → 提升 harness / 生成质量</text>
+
+  <!-- 底部支撑 -->
+  <rect x="30" y="305" width="620" height="48" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1"/>
+  <text x="40" y="324" font-size="11" font-weight="700" fill="#64748b">支撑加固（不属主线，但保障主线可靠运行）</text>
+  <text x="40" y="343" font-size="10" fill="#475569">reranker 三层防御 · 测试判分硬化 · evalkit 框架修复 · Milvus 距离兜底</text>
+
+  <!-- 图例 -->
+  <rect x="30" y="368" width="12" height="12" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="48" y="378" font-size="10" fill="#334155">Harness</text>
+  <rect x="140" y="368" width="12" height="12" fill="#fffbeb" stroke="#d97706"/>
+  <text x="158" y="378" font-size="10" fill="#334155">Bad Case</text>
+  <rect x="280" y="368" width="12" height="12" fill="#ecfdf5" stroke="#059669"/>
+  <text x="298" y="378" font-size="10" fill="#334155">自进化</text>
+  <rect x="420" y="368" width="12" height="12" fill="#f1f5f9" stroke="#64748b"/>
+  <text x="438" y="378" font-size="10" fill="#334155">支撑</text>
+</svg>

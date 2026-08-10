@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 465">
+  <rect width="760" height="465" fill="#f8fafc"/>
+  <text x="380" y="26" font-size="17" font-weight="700" text-anchor="middle" fill="#0f172a">运行时数据流：提问 → 评测 → 失败沉淀 → 自进化强化</text>
+  <defs>
+    <marker id="ar2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <!-- 顶部主流程 -->
+  <rect x="30" y="55" width="140" height="48" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="100" y="84" font-size="12" text-anchor="middle" fill="#1e3a8a">用户提问</text>
+  <rect x="210" y="55" width="160" height="48" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="290" y="76" font-size="11" text-anchor="middle" fill="#1e3a8a">检索 + rerank</text>
+  <text x="290" y="93" font-size="9" text-anchor="middle" fill="#475569">两阶段精排</text>
+  <rect x="410" y="55" width="160" height="48" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="490" y="76" font-size="11" text-anchor="middle" fill="#1e3a8a">生成路由</text>
+  <text x="490" y="93" font-size="9" text-anchor="middle" fill="#475569">简单→qwen/难题→ds</text>
+  <rect x="610" y="55" width="130" height="48" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="675" y="76" font-size="11" text-anchor="middle" fill="#1e3a8a">DeepSeek</text>
+  <text x="675" y="93" font-size="9" text-anchor="middle" fill="#475569">强 Judge</text>
+
+  <path d="M170,79 L210,79" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+  <path d="M370,79 L410,79" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+  <path d="M570,79 L610,79" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+  <text x="290" y="48" font-size="9" fill="#64748b">harness 评测复用同一链路</text>
+
+  <!-- 失败分支：Judge 往下 -->
+  <path d="M675,103 L675,140 L500,140 L500,175" stroke="#dc2626" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+  <text x="700" y="130" font-size="10" fill="#dc2626">判失败</text>
+
+  <rect x="400" y="175" width="200" height="46" rx="8" fill="#fffbeb" stroke="#d97706"/>
+  <text x="500" y="196" font-size="11" text-anchor="middle" fill="#92400e">点踩 / 评测失败</text>
+  <text x="500" y="213" font-size="9" text-anchor="middle" fill="#475569">沉淀 Bad Case(open)</text>
+
+  <path d="M500,221 L500,255" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+
+  <rect x="400" y="255" width="200" height="46" rx="8" fill="#fffbeb" stroke="#d97706"/>
+  <text x="500" y="276" font-size="11" text-anchor="middle" fill="#92400e">triage 根因</text>
+  <text x="500" y="293" font-size="9" text-anchor="middle" fill="#475569">R1~R8 + 诊断</text>
+
+  <path d="M500,301 L500,330 L300,330 L300,355" stroke="#059669" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+  <text x="410" y="345" font-size="10" fill="#059669">喂样本</text>
+
+  <!-- 底部自进化 -->
+  <rect x="100" y="355" width="200" height="48" rx="8" fill="#ecfdf5" stroke="#059669"/>
+  <text x="200" y="376" font-size="11" text-anchor="middle" fill="#065f46">自进化</text>
+  <text x="200" y="393" font-size="9" text-anchor="middle" fill="#475569">patch_success + 去重</text>
+
+  <path d="M100,379 L60,379 L60,300 L300,300 L300,275" stroke="#059669" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+  <text x="150" y="290" font-size="10" fill="#059669">回灌</text>
+
+  <rect x="300" y="255" width="200" height="46" rx="8" fill="#ecfdf5" stroke="#059669"/>
+  <text x="400" y="276" font-size="11" text-anchor="middle" fill="#065f46">playbook 库</text>
+  <text x="400" y="293" font-size="9" text-anchor="middle" fill="#475569">强化后回灌生成</text>
+
+  <path d="M300,278 L245,278 L245,103 L410,103" stroke="#059669" stroke-width="1.5" fill="none" marker-end="url(#ar2)"/>
+  <text x="295" y="95" font-size="10" fill="#059669">强化 playbook</text>
+
+  <!-- 图例 -->
+  <rect x="30" y="435" width="12" height="12" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="48" y="445" font-size="10" fill="#334155">Harness/评测</text>
+  <rect x="200" y="435" width="12" height="12" fill="#fffbeb" stroke="#d97706"/>
+  <text x="218" y="445" font-size="10" fill="#334155">Bad Case</text>
+  <rect x="370" y="435" width="12" height="12" fill="#ecfdf5" stroke="#059669"/>
+  <text x="388" y="445" font-size="10" fill="#334155">自进化</text>
+</svg>

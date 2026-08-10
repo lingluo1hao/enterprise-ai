@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 310">
+  <rect width="760" height="310" fill="#f8fafc"/>
+  <text x="380" y="26" font-size="16" font-weight="700" text-anchor="middle" fill="#0f172a">三件事：改造前 → 改造后</text>
+  <defs>
+    <marker id="ard" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#475569"/></marker>
+  </defs>
+
+  <rect x="20" y="48" width="230" height="248" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+  <rect x="20" y="48" width="230" height="32" rx="10" fill="#eff6ff"/>
+  <text x="135" y="69" font-size="13" font-weight="700" text-anchor="middle" fill="#1e3a8a">① Harness 工程</text>
+  <text x="135" y="108" font-size="10" font-weight="700" text-anchor="middle" fill="#dc2626">改造前</text>
+  <text x="135" y="126" font-size="10" text-anchor="middle" fill="#475569">只有零散脚本</text>
+  <text x="135" y="142" font-size="10" text-anchor="middle" fill="#475569">无统一黄金集</text>
+  <text x="135" y="158" font-size="10" text-anchor="middle" fill="#475569">无 harness / Judge</text>
+  <path d="M135,176 L135,196" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ard)"/>
+  <text x="135" y="222" font-size="10" font-weight="700" text-anchor="middle" fill="#059669">改造后</text>
+  <text x="135" y="240" font-size="10" text-anchor="middle" fill="#475569">补齐 4 模块</text>
+  <text x="135" y="256" font-size="10" text-anchor="middle" fill="#475569">强 Judge + 难度路由</text>
+  <text x="135" y="272" font-size="10" text-anchor="middle" fill="#475569">判分硬化</text>
+
+  <rect x="265" y="48" width="230" height="248" rx="10" fill="#ffffff" stroke="#d97706" stroke-width="1.5"/>
+  <rect x="265" y="48" width="230" height="32" rx="10" fill="#fffbeb"/>
+  <text x="380" y="69" font-size="13" font-weight="700" text-anchor="middle" fill="#92400e">② Bad Case 库</text>
+  <text x="380" y="108" font-size="10" font-weight="700" text-anchor="middle" fill="#dc2626">改造前</text>
+  <text x="380" y="126" font-size="10" text-anchor="middle" fill="#475569">没有库 / 页面</text>
+  <text x="380" y="142" font-size="10" text-anchor="middle" fill="#475569">没有 API</text>
+  <text x="380" y="158" font-size="10" text-anchor="middle" fill="#475569">失败样本散落</text>
+  <path d="M380,176 L380,196" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ard)"/>
+  <text x="380" y="222" font-size="10" font-weight="700" text-anchor="middle" fill="#059669">改造后</text>
+  <text x="380" y="240" font-size="10" text-anchor="middle" fill="#475569">bad_cases 表</text>
+  <text x="380" y="256" font-size="10" text-anchor="middle" fill="#475569">管理后台 master-detail</text>
+  <text x="380" y="272" font-size="10" text-anchor="middle" fill="#475569">点踩自动沉淀</text>
+
+  <rect x="510" y="48" width="230" height="248" rx="10" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+  <rect x="510" y="48" width="230" height="32" rx="10" fill="#ecfdf5"/>
+  <text x="625" y="69" font-size="13" font-weight="700" text-anchor="middle" fill="#065f46">③ 自进化闭环</text>
+  <text x="625" y="108" font-size="10" font-weight="700" text-anchor="middle" fill="#dc2626">改造前</text>
+  <text x="625" y="126" font-size="10" text-anchor="middle" fill="#475569">有 playbook</text>
+  <text x="625" y="142" font-size="10" text-anchor="middle" fill="#475569">但无失败反向</text>
+  <text x="625" y="158" font-size="10" text-anchor="middle" fill="#475569">强化机制</text>
+  <path d="M625,176 L625,196" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#ard)"/>
+  <text x="625" y="222" font-size="10" font-weight="700" text-anchor="middle" fill="#059669">改造后</text>
+  <text x="625" y="240" font-size="10" text-anchor="middle" fill="#475569">三级成功信号</text>
+  <text x="625" y="256" font-size="10" text-anchor="middle" fill="#475569">→ patch_success</text>
+  <text x="625" y="272" font-size="10" text-anchor="middle" fill="#475569">去重 + 负样本回流</text>
+</svg>

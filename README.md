@@ -468,6 +468,7 @@ routing:
   rewrite:    [local-small, local-qwen]          # 查询改写（temp=0）
   compress:   [local-small, local-qwen]          # 历史压缩（temp=0）
   generate:   [local-qwen-gen, deepseek-chat, qwen-plus]  # 答案生成（temp=0.3）
+  generate-hard: [deepseek-chat, local-qwen-gen, qwen-plus]  # 难题/硬 tenant(jm,yh)/技术关键词 → DeepSeek 生成（难度路由，详见 RAG质量加固方案文档）
   plan:       [local-qwen, deepseek-chat]
   review:     [local-qwen, deepseek-chat]
   react:      [local-qwen, deepseek-chat]
@@ -521,7 +522,7 @@ RAG 数据面是项目的"地基改造"，围绕**百万级文档**的可观测�
 - **缓存按角色隔离**：Redis 缓存键含角色，避免 admin 答案通过缓存泄漏给 user。
 
 #### 两阶段精排与图查询意图
-- **两阶段精排**：混合检索（Dense + BM25）→ RRF 融合（候选池 `RETRIEVE_CANDIDATE_K=20`）→ cross-encoder rerank（`bge-reranker-v2-m3`，由 `RERANK_URL` / `RERANK_TIMEOUT` 经 `.env` 驱动，超时或失败自动回退 RRF）。候选池放大避免 gold 在精排前被 top-k 截断。
+- **两阶段精排**：混合检索（Dense + BM25）→ RRF 融合（候选池 `RETRIEVE_CANDIDATE_K=20`）→ cross-encoder rerank（`bge-reranker-v2-m3`，由 `RERANK_URL` / `RERANK_TIMEOUT` 经 `.env` 驱动，超时或失败自动回退 RRF）。候选池放大避免 gold 在精排前被 top-k 截断。**reranker 稳定性做三层防御**：L3 应用端遇 5xx 重试 2 次再回退 RRF（`langgraph_rag_agent.py` `_rerank`）；L1 VM 端 systemd 守护（`-b 4096 -ub 4096` + `Restart=always` + `MemoryMax=2G`）；L2 cron 看门狗兜底「假死」。详见 [Harness_BadCase_自进化体系改造方案.md](docs/reports/Harness_BadCase_自进化体系改造方案.md)。
 - **图查询意图识别**：`figure / table / any` 三态拆分，`generate` 阶段真图（`fig_p*`）优先于表格图（`table_p*`），避免协议表格图淹没真正的示意图。
 
 #### PDF 通用图抽取（与语言/caption 无关）
@@ -783,6 +784,7 @@ waitress-serve --threads=8 --port=8080 rag_web_server:app
 | [docs/reports/P0_FIX_PLAN.md](docs/reports/P0_FIX_PLAN.md) | P0 修复计划：隔离 / 角色矩阵 / 上传流程 |
 | [docs/reports/RAG自进化与修复方案.md](docs/reports/RAG自进化与修复方案.md) | RAG 自进化方案 + 回答不准根因修复：num_ctx 截断 / PyMuPDF 伪表格 / 整章图透传 / 上下文暴涨 |
 | [docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md](docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md) | RAG 检索召回链路优化：reranker 两阶段精排 .env 化 + RRF 候选池放大 + 多租户 tenant 透传修复 + 图查询真图意图优先；含 CURRENT/FIXED-A/RRF 三列量化验证（配图见同目录 `images/`） |
+| [docs/reports/Harness_BadCase_自进化体系改造方案.md](docs/reports/Harness_BadCase_自进化体系改造方案.md) | Harness / Bad Case / 自进化 体系改造方案：以「评测 Harness 工程 + Bad Case 失败样本库 + 模型自进化闭环」三件事为主线，含 DeepSeek 强 Judge、生成难度路由、测试判分硬化、reranker 三层防御、evalkit 框架修复，及第七部分环境/部署/外部依赖坑记录 |
 
 ---
 

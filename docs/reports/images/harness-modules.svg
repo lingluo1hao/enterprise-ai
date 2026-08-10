@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 360">
+  <rect width="680" height="360" fill="#f8fafc"/>
+  <text x="340" y="26" font-size="16" font-weight="700" text-anchor="middle" fill="#0f172a">Harness 工程组成与数据流</text>
+  <text x="340" y="46" font-size="10" text-anchor="middle" fill="#64748b">evalkit/ 包 · runner.py 为 CLI 入口</text>
+  <defs>
+    <marker id="arm" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#475569"/></marker>
+  </defs>
+
+  <!-- Row 1 -->
+  <rect x="20" y="62" width="120" height="54" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="80" y="84" font-size="11" font-weight="700" text-anchor="middle" fill="#1e3a8a">黄金集</text>
+  <text x="80" y="100" font-size="9" text-anchor="middle" fill="#475569">retrieval/answer</text>
+
+  <rect x="170" y="62" width="110" height="54" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="225" y="84" font-size="11" font-weight="700" text-anchor="middle" fill="#1e3a8a">runner</text>
+  <text x="225" y="100" font-size="9" text-anchor="middle" fill="#475569">CLI 入口</text>
+
+  <rect x="305" y="62" width="160" height="54" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="385" y="82" font-size="11" font-weight="700" text-anchor="middle" fill="#1e3a8a">harness_answer</text>
+  <text x="385" y="98" font-size="9" text-anchor="middle" fill="#475569">跑真实 LangGraph 链路</text>
+
+  <rect x="495" y="62" width="160" height="54" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="575" y="82" font-size="11" font-weight="700" text-anchor="middle" fill="#1e3a8a">judge</text>
+  <text x="575" y="98" font-size="9" text-anchor="middle" fill="#475569">DeepSeek 打 faith/relev</text>
+
+  <path d="M140,89 L170,89" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arm)"/>
+  <path d="M280,89 L305,89" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arm)"/>
+  <path d="M465,89 L495,89" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arm)"/>
+
+  <!-- Row 2 -->
+  <rect x="20" y="222" width="150" height="54" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="95" y="244" font-size="11" font-weight="700" text-anchor="middle" fill="#1e3a8a">schema</text>
+  <text x="95" y="260" font-size="9" text-anchor="middle" fill="#475569">聚合 pass_rate 等</text>
+
+  <rect x="200" y="222" width="160" height="54" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="280" y="244" font-size="11" font-weight="700" text-anchor="middle" fill="#1e3a8a">triage</text>
+  <text x="280" y="260" font-size="9" text-anchor="middle" fill="#475569">R1~R8 根因分类</text>
+
+  <rect x="390" y="222" width="160" height="54" rx="8" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="470" y="244" font-size="11" font-weight="700" text-anchor="middle" fill="#1e3a8a">report</text>
+  <text x="470" y="260" font-size="9" text-anchor="middle" fill="#475569">HTML + JSON + 门禁</text>
+
+  <path d="M170,249 L200,249" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arm)"/>
+  <path d="M360,249 L390,249" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arm)"/>
+
+  <!-- Connector judge -> schema -->
+  <path d="M575,116 L575,180 L95,180 L95,222" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arm)"/>
+  <text x="350" y="172" font-size="9" fill="#64748b">judge 结果 → 聚合</text>
+</svg>

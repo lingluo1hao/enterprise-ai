@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 210">
+  <rect width="680" height="210" fill="#f8fafc"/>
+  <text x="340" y="24" font-size="16" font-weight="700" text-anchor="middle" fill="#0f172a">关键能力 1：DeepSeek 强 Judge</text>
+  <defs>
+    <marker id="arj" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#475569"/></marker>
+  </defs>
+
+  <rect x="30" y="42" width="290" height="28" rx="6" fill="#fef2f2" stroke="#ef4444"/>
+  <text x="175" y="61" font-size="12" font-weight="700" text-anchor="middle" fill="#dc2626">改造前：本地 1.5B judge</text>
+  <rect x="70" y="84" width="210" height="40" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="175" y="109" font-size="11" text-anchor="middle" fill="#334155">evalgrade: local-small</text>
+  <path d="M175,124 L175,142" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arj)"/>
+  <rect x="70" y="146" width="210" height="44" rx="8" fill="#fef2f2" stroke="#ef4444"/>
+  <text x="175" y="166" font-size="11" text-anchor="middle" fill="#334155">faith=0.9</text>
+  <text x="175" y="182" font-size="11" text-anchor="middle" fill="#dc2626">幻觉判"相关"</text>
+
+  <rect x="360" y="42" width="290" height="28" rx="6" fill="#ecfdf5" stroke="#059669"/>
+  <text x="505" y="61" font-size="12" font-weight="700" text-anchor="middle" fill="#059669">改造后：DeepSeek 强 judge</text>
+  <rect x="400" y="84" width="210" height="40" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="505" y="109" font-size="11" text-anchor="middle" fill="#334155">evalgrade: deepseek-chat</text>
+  <path d="M505,124 L505,142" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arj)"/>
+  <rect x="400" y="146" width="210" height="44" rx="8" fill="#ecfdf5" stroke="#059669"/>
+  <text x="505" y="166" font-size="11" text-anchor="middle" fill="#334155">faith=0.4</text>
+  <text x="505" y="182" font-size="11" text-anchor="middle" fill="#059669">指出 context 无出处</text>
+</svg>
