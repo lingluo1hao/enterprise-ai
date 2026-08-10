@@ -89,6 +89,16 @@ class LangGraphEngine:
                               session_id=_derive_session_id(username, role),
                               user=username, user_id=user_id, tenant_id=tenant_id)
 
+    @property
+    def last_task_id(self):
+        """
+        透传底层 App 最近一次问答的任务 ID（请求级 ContextVar）。
+
+        必须在**执行 query 的那个线程内**读取，跨线程读会拿到 None。
+        前端用它把用户反馈（点赞/点踩/纠错）挂到对应的全链路 trace 上。
+        """
+        return getattr(self.app, "last_task_id", None)
+
     def check_unfinished_tasks(self, session_id="web_session", user_id=0):
         """查询指定会话的未完成任务（断点检测）"""
         return self.app.check_unfinished_tasks(session_id, user_id=user_id)
@@ -115,22 +125,64 @@ use_langgraph = os.getenv("RAG_LANGGRAPH", "true").lower() not in ("0", "false",
 # 进度捕获器 — 拦截 print 输出并转发到队列，供 SSE 实时推送
 # ======================================================================
 
-class ProgressWriter(io.StringIO):
-    """替换 sys.stdout，把每次 write 写入到队列中，同时保留到原始 stdout"""
+class ThreadRoutedStdout(io.StringIO):
+    """
+    按「线程」路由的 stdout 多路复用器。
 
-    def __init__(self, _queue: queue.Queue, original_stdout):
+    【为什么要有它 —— 原实现的并发缺陷】
+    旧写法是每个 SSE 请求各建一个 ProgressWriter 并 `sys.stdout = writer`，
+    结束时再 `sys.stdout = original`。但 sys.stdout 是**进程级全局**的：
+
+        请求A: sys.stdout = WriterA
+        请求B: sys.stdout = WriterB          # 覆盖了 A
+        A 的管线 print(...)  → 全部流进 B 的 SSE 通道（A 页面卡住不动，B 看到别人的日志）
+        请求A 结束: sys.stdout = original    # B 还在跑，却被提前恢复，B 后半段日志全丢
+
+    也就是说：日志串台 + 日志丢失 + 潜在的隐私泄漏（A 的问题内容出现在 B 的屏幕上）。
+
+    【怎么修】
+    全局只安装一次，永不恢复。内部维护 {线程ID: 队列} 路由表：
+      - 工作线程开始前调用 register(q) 把自己登记进去
+      - write() 时按 threading.get_ident() 找到本线程的队列，只投递给它
+      - 没登记的线程（如 Flask 主线程、后台定时任务）照常写原始 stdout，不进任何队列
+    注册与写入都发生在同一个工作线程内，所以路由天然正确。
+    """
+
+    def __init__(self, original_stdout):
         super().__init__()
-        self._queue = _queue
         self._original = original_stdout
+        self._routes: dict[int, queue.Queue] = {}
+        self._lock = threading.Lock()
+
+    def register(self, q: queue.Queue):
+        """在当前线程内登记接收队列（必须由工作线程自己调用）。"""
+        with self._lock:
+            self._routes[threading.get_ident()] = q
+
+    def unregister(self):
+        """注销当前线程的接收队列（放在 finally 里，确保线程退出前清理）。"""
+        with self._lock:
+            self._routes.pop(threading.get_ident(), None)
 
     def write(self, s):
         if s.strip():
-            self._queue.put({"type": "log", "text": s.strip()})
+            # 不加锁读：dict.get 在 CPython 下是原子的，
+            # 且此处只读自己线程的 key，避免每行日志都抢锁拖慢管线。
+            q = self._routes.get(threading.get_ident())
+            if q is not None:
+                q.put({"type": "log", "text": s.strip()})
         self._original.write(s)
         self._original.flush()
 
     def flush(self):
         self._original.flush()
+
+
+# 全局唯一实例：进程启动时安装一次，此后 sys.stdout 不再被任何请求替换。
+# 注意要在 logutil 替换 builtins.print 之后取 sys.stdout，
+# 这样原始输出链路（控制台/日志文件）保持不变。
+_stdout_mux = ThreadRoutedStdout(sys.stdout)
+sys.stdout = _stdout_mux
 
 
 # ======================================================================
@@ -322,8 +374,10 @@ def api_query():
 
     result = orchestrator.query(question, user_role=user_role, user=user,
                                 user_id=user_id, tenant_id=tenant_id)
+    # 非流式接口在 Flask 请求线程内同步执行，可直接读到本上下文的 task_id
+    task_id = getattr(orchestrator, "last_task_id", None)
     _audit_log("query", target=question[:80], username=user)
-    return jsonify({"answer": result, "role": user_role})
+    return jsonify({"answer": result, "role": user_role, "task_id": task_id})
 
 
 @app.route("/api/query/stream", methods=["POST"])
@@ -369,19 +423,23 @@ def api_query_stream():
             }, ensure_ascii=False)
             yield f"data: {evt}\n\n"
 
-            # 在后台线程执行查询，stdout 重定向到进度队列
+            # 在后台线程执行查询。该线程的 print 输出由 stdout 多路复用器
+            # 按线程 ID 精确路由到本请求的队列 —— 不再全局替换 sys.stdout，
+            # 因此多个用户并发提问时日志不会串台、也不会被提前恢复而丢失。
             output_queue = queue.Queue()
-            original_stdout = sys.stdout
-            sys.stdout = ProgressWriter(output_queue, original_stdout)
 
-            result_holder = {"answer": None, "error": None}
+            result_holder = {"answer": None, "error": None, "task_id": None}
 
             def run_query():
+                _stdout_mux.register(output_queue)
                 try:
                     result_holder["answer"] = orchestrator.query(
                         question, user_role=user_role, user=user,
                         user_id=user_id, tenant_id=tenant_id
                     )
+                    # task_id 必须在**工作线程内**读取：它存放在 ContextVar 中，
+                    # 而 SSE 生成器跑在 Flask 请求线程，读不到本线程的上下文。
+                    result_holder["task_id"] = getattr(orchestrator, "last_task_id", None)
                 except Exception as e:
                     import traceback
                     result_holder["error"] = str(e)
@@ -389,6 +447,8 @@ def api_query_stream():
                         "type": "log",
                         "text": f"[ERROR] {traceback.format_exc()}"
                     })
+                finally:
+                    _stdout_mux.unregister()
 
             thread = threading.Thread(target=run_query, daemon=True)
             thread.start()
@@ -404,8 +464,8 @@ def api_query_stream():
                     if not thread.is_alive():
                         finished = True
 
-            # 恢复 stdout
-            sys.stdout = original_stdout
+            # 无需恢复 stdout：多路复用器是全局常驻的，
+            # 工作线程退出前已在 finally 中 unregister 自己的路由。
 
             # 审计日志（生成器内无 request 上下文，使用提前捕获的 client_ip）
             if result_holder["error"]:
@@ -424,7 +484,16 @@ def api_query_stream():
             if result_holder["error"]:
                 yield f"data: {json.dumps({'type': 'error', 'text': result_holder['error']}, ensure_ascii=False)}\n\n"
             else:
-                yield f"data: {json.dumps({'type': 'done', 'answer': result_holder['answer'], 'role': orchestrator.user_role}, ensure_ascii=False)}\n\n"
+                # role 用请求局部变量，不读全局 orchestrator.user_role（并发下会是别人的角色）。
+                # task_id 透出给前端：点赞/点踩/纠错时带回来，即可关联到
+                # task_checkpoints 里那一整条 13 节点全链路 trace。
+                done_evt = {
+                    "type": "done",
+                    "answer": result_holder["answer"],
+                    "role": user_role,
+                    "task_id": result_holder["task_id"],
+                }
+                yield f"data: {json.dumps(done_evt, ensure_ascii=False)}\n\n"
 
         except GeneratorExit:
             pass
@@ -520,7 +589,7 @@ def resume_task():
     """
     从断点恢复执行指定任务（需登录），以 SSE 流返回。
 
-    复用 /api/query/stream 的 ProgressWriter + 后台线程模式：resume 内部
+    复用 /api/query/stream 的 stdout 多路复用 + 后台线程模式：resume 内部
     要重跑 LangGraph 图（30-90s），改成流式后前端能实时看到进度日志，
     并能用刚加的 ⏹ 中断按钮中止（AbortController）。
     """
@@ -550,12 +619,13 @@ def resume_task():
 
     def generate():
         output_queue = queue.Queue()
-        original_stdout = sys.stdout
-        sys.stdout = ProgressWriter(output_queue, original_stdout)
 
         result_holder = {"answer": None, "error": None}
 
         def run_resume():
+            # 与 /api/query/stream 同理：由工作线程自己登记日志路由，
+            # 退出前在 finally 注销，避免并发 resume 之间日志串台。
+            _stdout_mux.register(output_queue)
             try:
                 result_holder["answer"] = orchestrator.resume_task(
                     task_id, session_id, user_id=user_id
@@ -567,6 +637,8 @@ def resume_task():
                     "type": "log",
                     "text": f"[ERROR] {_tb.format_exc()}",
                 })
+            finally:
+                _stdout_mux.unregister()
 
         # 推送首事件
         evt = json.dumps({"type": "start", "task_id": task_id}, ensure_ascii=False)
@@ -586,7 +658,7 @@ def resume_task():
                 if not thread.is_alive():
                     finished = True
 
-        sys.stdout = original_stdout
+        # stdout 无需恢复（全局多路复用器常驻，路由已由工作线程自行注销）
 
         if result_holder["error"]:
             get_audit_logger().log(
@@ -838,6 +910,336 @@ def get_history():
         return jsonify({"session_id": session_id, "messages": visible})
     except Exception as e:
         return jsonify({"session_id": session_id, "messages": [], "error": str(e)})
+
+
+_BADCASE_PAGE = r"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bad Case 复盘 - RAG Agent</title>
+<style>
+  :root{
+    --bg:#f5f6fa;--surface:#fff;--border:#e2e5ed;
+    --text:#1a1a2e;--text-2:#6b7280;--text-3:#9ca3af;
+    --primary:#2563eb;--danger:#dc2626;--success:#16a34a;
+    --radius:12px;--radius-sm:8px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans SC',sans-serif;background:var(--bg);color:var(--text)}
+  .topbar{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border-bottom:1px solid var(--border);padding:12px 22px}
+  .topbar h1{font-size:17px;font-weight:600;margin:0;display:flex;align-items:center;gap:8px}
+  .topbar .links{display:flex;gap:14px;align-items:center;font-size:13px}
+  .topbar a{color:var(--primary);text-decoration:none}
+  .wrap{max-width:1200px;margin:0 auto;padding:18px 22px}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
+  .stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px}
+  .stat .l{font-size:13px;color:var(--text-2)}
+  .stat .n{font-size:24px;font-weight:600;margin-top:4px}
+  .stat .s{font-size:12px;margin-top:2px;color:#854F0B}
+  .filterbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:14px}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}
+  .seg button{border:none;background:var(--surface);padding:6px 14px;font-size:13px;color:var(--text-2);cursor:pointer}
+  .seg button.active{background:var(--primary);color:#fff}
+  .filterbar select,.filterbar input{padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;color:var(--text)}
+  .filterbar .spacer{margin-left:auto}
+  .layout{display:flex;gap:14px;align-items:flex-start}
+  .listcard{flex:1.6;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;min-width:0}
+  .detailcard{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;min-width:0;position:sticky;top:14px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #f0f1f4}
+  th{color:var(--text-2);font-weight:600;background:#fafbfc;font-size:12px}
+  tr:hover td{background:#fafbff}
+  .badge{font-size:12px;padding:2px 9px;border-radius:11px;display:inline-block}
+  .b-open{background:#FAEEDA;color:#854F0B}
+  .b-in_progress{background:#E6F1FB;color:#185FA5}
+  .b-resolved{background:#EAF3DE;color:#3B6D11}
+  .rc{font-size:12px;padding:2px 8px;border-radius:10px;background:#E6F1FB;color:#185FA5}
+  .link{color:var(--primary);cursor:pointer}
+  .muted{color:var(--text-3);font-size:12px}
+  .detail .row{margin-bottom:12px}
+  .detail .k{font-size:12px;color:var(--text-2);margin-bottom:3px}
+  .detail .v{font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+  textarea{width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;font-size:13px;font-family:inherit;resize:vertical}
+  .btn{border:none;border-radius:var(--radius-sm);padding:8px 14px;font-size:13px;cursor:pointer;font-weight:500}
+  .btn-primary{background:var(--success);color:#fff}
+  .btn-blue{background:var(--primary);color:#fff}
+  .btn-ghost{background:var(--surface);border:1px solid var(--border);color:var(--text)}
+  .btn-danger{background:var(--surface);border:1px solid var(--danger);color:var(--danger)}
+  .actions{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .empty{color:var(--text-3);text-align:center;padding:40px;font-size:13px}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>🐞 Bad Case 复盘</h1>
+    <div class="links">
+      <a href="/admin">← 返回管理后台</a>
+      <button class="btn btn-ghost" onclick="loadCases()">↻ 刷新</button>
+    </div>
+  </div>
+  <div class="wrap">
+    <div class="stats" id="stats"></div>
+    <div class="filterbar">
+      <div class="seg" id="segStatus">
+        <button data-s="" class="active" onclick="setStatus('')">全部</button>
+        <button data-s="open" onclick="setStatus('open')">待处理</button>
+        <button data-s="in_progress" onclick="setStatus('in_progress')">处理中</button>
+        <button data-s="resolved" onclick="setStatus('resolved')">已解决</button>
+      </div>
+      <select id="fRoot" onchange="applyFilter()">
+        <option value="">根因: 全部</option>
+        <option value="R1">R1 检索缺失</option>
+        <option value="R2">R2 检索噪声</option>
+        <option value="R3">R3 改写失败</option>
+        <option value="R4">R4 生成偏离</option>
+        <option value="R5">R5 答案不符</option>
+        <option value="R6">R6 引用错误</option>
+        <option value="R7">R7 超时/异常</option>
+        <option value="OK">OK 隔离负例</option>
+      </select>
+      <input id="fQ" placeholder="搜索问题 / case id" oninput="applyFilter()" style="min-width:200px">
+      <span class="spacer"></span>
+      <span class="muted" id="countTip"></span>
+    </div>
+    <div class="layout">
+      <div class="listcard">
+        <table>
+          <thead><tr><th>状态</th><th>问题</th><th>来源</th><th>根因</th><th>时间</th><th></th></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+        <div class="empty" id="emptyTip" style="display:none">暂无 bad case</div>
+      </div>
+      <div class="detailcard detail" id="detail">
+        <div class="muted">点击左侧任意一条查看详情</div>
+      </div>
+    </div>
+  </div>
+<script>
+let token = localStorage.getItem('rag_token') || '';
+let allCases = [];
+let curStatus = '';
+let curId = null;
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtTime(v){
+  if(v==null) return '—';
+  let t = (typeof v === 'number') ? new Date(v*1000) : new Date(v);
+  if(isNaN(t.getTime())) return String(v);
+  const p=n=>String(n).padStart(2,'0');
+  return t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate())+' '+p(t.getHours())+':'+p(t.getMinutes());
+}
+function statusBadge(s){ const m={open:['b-open','待处理'],in_progress:['b-in_progress','处理中'],resolved:['b-resolved','已解决']}; const x=m[s]||['b-open',s]; return '<span class="badge '+x[0]+'">'+x[1]+'</span>'; }
+
+async function loadCases(){
+  try{
+    const r = await fetch('/api/admin/bad_cases', {headers:{'Authorization':'Bearer '+token}});
+    if(r.status===403){ document.getElementById('tbody').innerHTML=''; const e=document.getElementById('emptyTip'); e.style.display='block'; e.textContent='需要管理员权限'; return; }
+    const d = await r.json();
+    allCases = d.items || [];
+    applyFilter();
+  }catch(e){ console.error(e); }
+}
+
+function applyFilter(){
+  const q = (document.getElementById('fQ').value||'').trim().toLowerCase();
+  const rc = document.getElementById('fRoot').value;
+  const rows = allCases.filter(c=>{
+    if(curStatus && c.status!==curStatus) return false;
+    if(rc && (c.root_cause||'')!==rc) return false;
+    if(q && !((c.query||'').toLowerCase().includes(q)) && !String(c.id).includes(q)) return false;
+    return true;
+  });
+  renderStats();
+  renderTable(rows);
+  document.getElementById('countTip').textContent = '共 '+rows.length+' 条';
+}
+
+function renderStats(){
+  const open = allCases.filter(c=>c.status==='open').length;
+  const prog = allCases.filter(c=>c.status==='in_progress').length;
+  const resolved = allCases.filter(c=>c.status==='resolved').length;
+  const rate = allCases.length ? Math.round(resolved/allCases.length*100) : 0;
+  document.getElementById('stats').innerHTML =
+    '<div class="stat"><div class="l">待处理 open</div><div class="n">'+open+'</div></div>'+
+    '<div class="stat"><div class="l">处理中 in_progress</div><div class="n">'+prog+'</div></div>'+
+    '<div class="stat"><div class="l">已解决率</div><div class="n">'+rate+'%</div><div class="s">近全部 '+allCases.length+' 条</div></div>';
+}
+
+function renderTable(rows){
+  const tb = document.getElementById('tbody');
+  const empty = document.getElementById('emptyTip');
+  if(!rows.length){ tb.innerHTML=''; empty.style.display='block'; empty.textContent='暂无匹配的 bad case'; return; }
+  empty.style.display='none';
+  tb.innerHTML = rows.map(c=>
+    '<tr onclick="openDetail('+c.id+')" style="cursor:pointer">'+
+      '<td>'+statusBadge(c.status)+'</td>'+
+      '<td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.query)+'</td>'+
+      '<td class="muted">'+esc(c.source||'')+'</td>'+
+      '<td>'+(c.root_cause?'<span class="rc">'+esc(c.root_cause)+'</span>':'<span class="muted">—</span>')+'</td>'+
+      '<td class="muted">'+fmtTime(c.created_at)+'</td>'+
+      '<td class="link">查看</td>'+
+    '</tr>').join('');
+}
+
+function setStatus(s){
+  curStatus = s;
+  document.querySelectorAll('#segStatus button').forEach(b=>b.classList.toggle('active', b.dataset.s===s));
+  applyFilter();
+}
+
+function openDetail(id){
+  curId = id;
+  const c = allCases.find(x=>x.id===id);
+  if(!c) return;
+  const detail = document.getElementById('detail');
+  detail.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'+
+      '<strong style="font-size:15px">Case #'+c.id+'</strong>'+statusBadge(c.status)+
+    '</div>'+
+    '<div class="row"><div class="k">问题</div><div class="v">'+esc(c.query)+'</div></div>'+
+    '<div class="row"><div class="k">用户得到的答案</div><div class="v">'+(esc(c.answer)||'<span class="muted">（空）</span>')+'</div></div>'+
+    '<div class="row"><div class="k">标准答案 / 期望</div><div class="v">'+(esc(c.expected)||'<span class="muted">（待补）</span>')+'</div></div>'+
+    '<div class="row"><div class="k">自动根因 (triage)</div><div class="v">'+(c.root_cause?'<span class="rc">'+esc(c.root_cause)+'</span> ':'')+(esc(c.diagnosis)||'<span class="muted">（待 triage）</span>')+'</div></div>'+
+    '<div class="row"><div class="k">来源 / 套件</div><div class="v">'+esc(c.source||'')+' · '+esc(c.suite||'')+'</div></div>'+
+    '<div class="row"><div class="k">创建时间</div><div class="v muted">'+fmtTime(c.created_at)+'</div></div>'+
+    '<div class="row"><div class="k">处理人</div><div class="v muted">'+esc(c.resolved_by||'—')+(c.resolved_at?(' · '+fmtTime(c.resolved_at)):'')+'</div></div>'+
+    '<div class="row"><div class="k">处理记录</div><textarea id="detDiag" rows="3" placeholder="补充根因分析 / 修复说明...">'+esc(c.diagnosis||'')+'</textarea></div>'+
+    '<div class="row"><div class="k">标准答案（可选，用于回归验证）</div><textarea id="detExp" rows="2" placeholder="填写标准答案...">'+esc(c.expected||'')+'</textarea></div>'+
+    '<div class="actions">'+
+      '<button class="btn btn-primary" onclick="updateCase(\'resolved\')">✓ 标记为已解决</button>'+
+      '<button class="btn btn-blue" onclick="updateCase(\'in_progress\')">处理中</button>'+
+      '<button class="btn btn-danger" onclick="updateCase(\'open\')">退回重测</button>'+
+    '</div>';
+}
+
+async function updateCase(status){
+  if(!curId) return;
+  const diag = document.getElementById('detDiag').value;
+  const exp = document.getElementById('detExp').value;
+  try{
+    const r = await fetch('/api/admin/bad_cases/'+curId, {
+      method:'PATCH', headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body: JSON.stringify({status:status, diagnosis:diag, expected:exp})
+    });
+    const d = await r.json();
+    if(d.ok){ await loadCases(); openDetail(curId); }
+    else alert('更新失败：'+(d.error||'未知'));
+  }catch(e){ alert('更新失败：'+e.message); }
+}
+
+loadCases();
+</script>
+</body>
+</html>
+"""
+
+@app.route("/admin/bad_cases")
+def admin_bad_cases_page():
+    """Bad Case 复盘页（独立管理页，角色感知）。仅管理员可访问。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    if g.current_user.get("role") not in ("admin", "super_admin"):
+        return jsonify({"ok": False, "error": "需要管理员权限"}), 403
+    return _BADCASE_PAGE
+
+
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    """
+    用户反馈入口 —— bad case 闭环的「源头」。
+
+    请求体：{task_id?, query, answer?, rating(-1=踩/0=无/1=赞), feedback_text?}
+    行为：
+      1. 落库 qa_feedback（关联 task_id，可回溯完整 task_checkpoints trace）
+      2. 若 rating == -1（点踩），同步写入一条 open 状态的 bad_cases，
+         待 evalkit.triage 结合检索结果补 root_cause，或管理员在后台处理
+    返回：{ok, feedback_id, bad_case_id?}
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    user = g.current_user
+    data = request.get_json(silent=True) or {}
+    query = (data.get("query") or "").strip()
+    try:
+        rating = int(data.get("rating", 0) or 0)
+    except (TypeError, ValueError):
+        rating = 0
+    if not query:
+        return jsonify({"ok": False, "error": "query 必填"}), 400
+
+    ms = _get_memory_store()
+    if ms is None:
+        return jsonify({"ok": False, "error": "记忆层不可用"}), 503
+
+    fb_id = ms.save_feedback(
+        query=query,
+        answer=data.get("answer"),
+        rating=rating,
+        feedback_text=data.get("feedback_text"),
+        task_id=data.get("task_id"),
+        user_id=user["user_id"],
+        tenant_id=user.get("tenant_id", "default"),
+        session_id=data.get("session_id"),
+    )
+
+    # 点踩 = 真实失败样本，沉淀到 bad_cases 驱动自进化
+    bad_case_id = None
+    if rating == -1:
+        bad_case_id = ms.add_bad_case(
+            query=query, source="feedback", suite="answer",
+            case_id=None, answer=data.get("answer"), expected=None,
+            root_cause=None,
+            diagnosis=f"用户点踩（tenant={user.get('tenant_id','default')}），待 triage。",
+            status="open",
+        )
+    return jsonify({"ok": True, "feedback_id": fb_id, "bad_case_id": bad_case_id})
+
+
+@app.route("/api/admin/bad_cases", methods=["GET"])
+def api_admin_bad_cases():
+    """
+    管理后台：列出 bad case 库，供「Bad Case 复盘」Tab 使用。
+    支持 ?status=open / ?root_cause=R5 筛选。仅管理员可访问。
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    if g.current_user.get("role") not in ("admin", "super_admin"):
+        return jsonify({"ok": False, "error": "需要管理员权限"}), 403
+    ms = _get_memory_store()
+    if ms is None:
+        return jsonify({"ok": False, "error": "记忆层不可用"}), 503
+    status = request.args.get("status")
+    root_cause = request.args.get("root_cause")
+    rows = ms.list_bad_cases(status=status, root_cause=root_cause, limit=500)
+    return jsonify({"ok": True, "count": len(rows), "items": rows})
+
+
+@app.route("/api/admin/bad_cases/<int:bc_id>", methods=["PATCH"])
+def api_admin_bad_case_update(bc_id):
+    """管理后台：更新某条 bad case 的状态 / 处理记录（bad case 闭环「修复→验证」落点）。
+
+    请求体：{status?(open|in_progress|resolved), diagnosis?, expected?}
+    仅管理员可访问；resolved_by 自动取当前登录用户。
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    if g.current_user.get("role") not in ("admin", "super_admin"):
+        return jsonify({"ok": False, "error": "需要管理员权限"}), 403
+    ms = _get_memory_store()
+    if ms is None:
+        return jsonify({"ok": False, "error": "记忆层不可用"}), 503
+    data = request.get_json(silent=True) or {}
+    resolved_by = g.current_user.get("username") or g.current_user.get("user_id")
+    ok = ms.update_bad_case_status(
+        bc_id, status=data.get("status"), resolved_by=resolved_by,
+        diagnosis=data.get("diagnosis"), expected=data.get("expected"))
+    return jsonify({"ok": bool(ok)})
 
 
 @app.route("/api/change-password", methods=["POST"])
@@ -2154,6 +2556,12 @@ _ADMIN_PAGE = r"""
   .qa-msg.assistant .qa-bubble{background:var(--surface);border:1px solid var(--border)}
   .qa-msg.user .qa-bubble{background:var(--primary);color:#fff}
   .qa-progress-head{font-size:13px;font-weight:600;color:var(--primary);margin-bottom:8px;display:flex;align-items:center;gap:6px}
+  .fb-bar{display:flex;gap:6px;align-items:center;margin-top:10px}
+  .fb-btn{font-size:12px;color:#6b7280;border:1px solid #e2e5ed;background:#fff;border-radius:7px;padding:4px 11px;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:4px}
+  .fb-btn:hover{background:#f5f6fa;color:#1a1a2e}
+  .fb-up.on{color:#3B6D11;border-color:#3B6D11;background:#EAF3DE}
+  .fb-down.on{color:#A32D2D;border-color:#A32D2D;background:#FCEBEB}
+  .fb-tip{font-size:11px;color:#9ca3af;margin-left:4px}
   .qa-progress-head .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--primary-light);border-top-color:var(--primary);border-radius:50%;animation:qaSpin .8s linear infinite}
   .qa-progress-logs{max-height:240px;overflow-y:auto;font-size:12px;color:var(--text-2);line-height:1.6;font-family:ui-monospace,Menlo,Consolas,monospace}
   .qa-progress-logs .log-line{padding:2px 0;border-bottom:1px dashed var(--border)}
@@ -2263,6 +2671,7 @@ _ADMIN_PAGE = r"""
       <span>👤</span>
       <span class="name" id="displayName"></span>
       <a href="/admin" style="color:var(--primary);text-decoration:none;font-size:13px">🔧 提示词管理</a>
+      <a href="/admin/bad_cases" style="color:var(--danger);text-decoration:none;font-size:13px">🐞 Bad Case</a>
       <button class="btn btn-sm btn-outline" onclick="changePassword()">🔑 修改密码</button>
       <button class="btn btn-sm btn-outline" onclick="doLogout()">退出</button>
     </div>
@@ -2944,6 +3353,35 @@ function updateQASendButton() {
   }
 }
 
+function fbToken(){ try{ if(typeof getRagToken==='function'){const t=getRagToken(); if(t) return t;} }catch(e){} try{ if(typeof token!=='undefined'&&token) return token; }catch(e){} try{ return localStorage.getItem('rag_token')||''; }catch(e){ return ''; } }
+function buildFeedbackBar(query, answer){
+  const bar=document.createElement('div'); bar.className='fb-bar';
+  bar.setAttribute('data-query', query||''); bar.setAttribute('data-answer', answer||'');
+  bar.innerHTML='<button class="fb-btn fb-up" onclick="fbVote(this,1)">👍 有帮助</button>'+
+                '<button class="fb-btn fb-down" onclick="fbVote(this,-1)">👎 没帮助</button>'+
+                '<button class="fb-btn" onclick="fbText(this)">💬 反馈</button>'+
+                '<span class="fb-tip">点踩自动记入 Bad Case</span>';
+  return bar;
+}
+async function fbVote(btn, rating){
+  const bar=btn.parentElement; if(bar.getAttribute('data-voted')) return;
+  const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
+  try{
+    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:rating})});
+    bar.setAttribute('data-voted','1');
+    if(rating>0){ bar.querySelector('.fb-up').classList.add('on'); }
+    else { bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）'; }
+  }catch(e){ console.error(e); }
+}
+async function fbText(btn){
+  const bar=btn.parentElement; const txt=prompt('请描述问题（可选）：',''); if(txt===null) return;
+  const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
+  try{
+    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:-1,feedback_text:txt})});
+    bar.setAttribute('data-voted','1'); bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）';
+  }catch(e){ console.error(e); }
+}
+
 async function askQA() {
   const input = document.getElementById('qaInput');
   const sendBtn = document.getElementById('qaSendBtn');
@@ -3043,6 +3481,7 @@ async function askQA() {
     if (finalAnswer !== null) {
       bubble.innerHTML = '<div class="qa-progress-head" style="margin-bottom:6px"><span style="color:var(--success)">✓</span><span>回答完成</span></div>' +
                          '<div style="white-space:pre-wrap;font-size:14px;line-height:1.7">' + escapeHtml(finalAnswer) + '</div>';
+      bubble.appendChild(buildFeedbackBar(question, finalAnswer));
     } else {
       bubble.innerHTML = '<div style="color:var(--text-3)">无响应</div>';
     }
@@ -3153,6 +3592,7 @@ async function sendQuestionWithQA(taskId, question) {
     if (finalAnswer !== null) {
       bubble.innerHTML = '<div class="qa-progress-head" style="margin-bottom:6px"><span style="color:var(--success)">✓</span><span>恢复完成</span></div>' +
                          '<div style="white-space:pre-wrap;font-size:14px;line-height:1.7">' + escapeHtml(finalAnswer) + '</div>';
+      bubble.appendChild(buildFeedbackBar(question, finalAnswer));
     } else if (errored) {
       bubble.innerHTML = '<div style="color:var(--danger)">恢复过程出现异常，请稍后重试。</div>';
     } else {
@@ -3658,6 +4098,12 @@ _HTML_PAGE = r"""
   .msg-content h3:first-child{margin-top:0}
   .msg-content strong{color:var(--text)}
   .msg-time{font-size:11px;color:var(--text-3);margin-top:6px}
+  .fb-bar{display:flex;gap:6px;align-items:center;margin-top:10px}
+  .fb-btn{font-size:12px;color:#6b7280;border:1px solid #e2e5ed;background:#fff;border-radius:7px;padding:4px 11px;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:4px}
+  .fb-btn:hover{background:#f5f6fa;color:#1a1a2e}
+  .fb-up.on{color:#3B6D11;border-color:#3B6D11;background:#EAF3DE}
+  .fb-down.on{color:#A32D2D;border-color:#A32D2D;background:#FCEBEB}
+  .fb-tip{font-size:11px;color:#9ca3af;margin-left:4px}
 
   /* ===== Progress (streaming) ===== */
   .progress-box{
@@ -4523,9 +4969,10 @@ async function loadHistory() {
     // 有历史时隐藏欢迎页
     const welcome = document.getElementById('welcome');
     if (welcome) welcome.style.display = 'none';
+    let lastUser = '';
     for (const m of msgs) {
-      if (m.role === 'user') addUserMessage(m.content);
-      else if (m.role === 'assistant') addAssistantMessage(m.content);
+      if (m.role === 'user') { lastUser = m.content; addUserMessage(m.content); }
+      else if (m.role === 'assistant') addAssistantMessage(m.content, lastUser);
       else if (m.role === 'summary') addSummaryMessage(m.content);
     }
   } catch (e) {
@@ -4605,7 +5052,7 @@ async function sendQuestion() {
 
     // 添加最终答案
     if (finalAnswer) {
-      addAssistantMessage(finalAnswer);
+      addAssistantMessage(finalAnswer, question);
     } else {
       addErrorMessage('查询过程出现异常，请稍后重试。');
     }
@@ -4693,7 +5140,7 @@ async function sendQuestionWith(taskId, question) {
     if (errored) {
       addErrorMessage('恢复过程出现异常，请稍后重试。');
     } else if (finalAnswer) {
-      addAssistantMessage(finalAnswer);
+      addAssistantMessage(finalAnswer, question);
     } else {
       addErrorMessage('恢复过程出现异常，请稍后重试。');
     }
@@ -4781,7 +5228,36 @@ function addUserMessage(text) {
   scrollToBottom();
 }
 
-function addAssistantMessage(text) {
+function fbToken(){ try{ if(typeof getRagToken==='function'){const t=getRagToken(); if(t) return t;} }catch(e){} try{ if(typeof token!=='undefined'&&token) return token; }catch(e){} try{ return localStorage.getItem('rag_token')||''; }catch(e){ return ''; } }
+function buildFeedbackBar(query, answer){
+  const bar=document.createElement('div'); bar.className='fb-bar';
+  bar.setAttribute('data-query', query||''); bar.setAttribute('data-answer', answer||'');
+  bar.innerHTML='<button class="fb-btn fb-up" onclick="fbVote(this,1)">👍 有帮助</button>'+
+                '<button class="fb-btn fb-down" onclick="fbVote(this,-1)">👎 没帮助</button>'+
+                '<button class="fb-btn" onclick="fbText(this)">💬 反馈</button>'+
+                '<span class="fb-tip">点踩自动记入 Bad Case</span>';
+  return bar;
+}
+async function fbVote(btn, rating){
+  const bar=btn.parentElement; if(bar.getAttribute('data-voted')) return;
+  const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
+  try{
+    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:rating})});
+    bar.setAttribute('data-voted','1');
+    if(rating>0){ bar.querySelector('.fb-up').classList.add('on'); }
+    else { bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）'; }
+  }catch(e){ console.error(e); }
+}
+async function fbText(btn){
+  const bar=btn.parentElement; const txt=prompt('请描述问题（可选）：',''); if(txt===null) return;
+  const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
+  try{
+    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:-1,feedback_text:txt})});
+    bar.setAttribute('data-voted','1'); bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）';
+  }catch(e){ console.error(e); }
+}
+
+function addAssistantMessage(text, query) {
   const area = document.getElementById('chatArea');
   const div = document.createElement('div');
   div.className = 'message';
@@ -4797,6 +5273,11 @@ function addAssistantMessage(text) {
     </div>
   `;
   area.appendChild(div);
+  // 聊天反馈按钮（赞/踩/反馈）：挂在答案下方，点踩自动沉淀 bad case
+  if (query) {
+    const body = div.querySelector('.msg-body');
+    if (body) body.appendChild(buildFeedbackBar(query, text));
+  }
   scrollToBottom();
 }
 

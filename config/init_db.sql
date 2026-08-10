@@ -115,6 +115,48 @@ CREATE TABLE IF NOT EXISTS `chat_summaries` (
   CONSTRAINT `fk_chat_summaries_user` FOREIGN KEY (`user_id`) REFERENCES `admin_users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对话摘要表：压缩历史对话的产物，支持跨会话语义召回';
 
+-- ---------- 表 7: 用户反馈（答案点赞 / 点踩 / 文字） ----------
+-- 这是 bad case 闭环的「源头」：真实用户在生产环境踩到的失败，比挖掘 trace 更珍贵。
+-- 一条 feedback 可关联 task_id，回溯完整 task_checkpoints 全链路 trace；
+-- 经 triage 自动归类根因（root_cause = R1..R8）后，可转成 bad_cases 驱动自进化。
+CREATE TABLE IF NOT EXISTS `qa_feedback` (
+  `id`           BIGINT AUTO_INCREMENT PRIMARY KEY                     COMMENT '自增主键',
+  `task_id`      VARCHAR(64)  NULL                                     COMMENT '关联任务ID（→ task_queue.id），回溯全链路trace',
+  `user_id`      BIGINT        NULL                                    COMMENT '反馈用户ID（→ admin_users.id）',
+  `tenant_id`    VARCHAR(32)   NULL                                    COMMENT '租户ID（多租户隔离）',
+  `session_id`   VARCHAR(128)  NULL                                    COMMENT '会话ID',
+  `query`        TEXT          NOT NULL                                COMMENT '用户原始问题',
+  `answer`       TEXT          NULL                                    COMMENT '系统给出的答案（落库快照，避免task被清后丢失）',
+  `rating`       TINYINT       NOT NULL DEFAULT 0                       COMMENT '评分：-1=踩(差) / 0=无 / 1=赞(好)',
+  `feedback_text` TEXT         NULL                                    COMMENT '用户自由文字反馈',
+  `root_cause`   VARCHAR(8)    NULL                                    COMMENT 'triage 自动归类根因：R1..R8（NULL=未分类）',
+  `created_at`   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP     COMMENT '反馈时间',
+  INDEX `idx_tenant_created` (`tenant_id`, `created_at` DESC),
+  INDEX `idx_rating` (`rating`, `created_at` DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户反馈表：答案点赞/点踩/文字，bad case 闭环源头';
+
+-- ---------- 表 8: Bad Case 库（驱动自进化） ----------
+-- 沉淀「失败样本 + 根因 + 修复记录」，是强化自进化（evolution.py）的输入。
+-- 来源：用户反馈转（source=feedback）/ 评测失败（source=eval）/ 人工录入（source=manual）。
+-- status 流转：open → triaged → fixed(wontfix)。resolved_by 记录修复它的 evolution patch / 评测 run。
+CREATE TABLE IF NOT EXISTS `bad_cases` (
+  `id`           BIGINT AUTO_INCREMENT PRIMARY KEY                     COMMENT '自增主键',
+  `source`       VARCHAR(16)   NOT NULL DEFAULT 'feedback'             COMMENT '来源：feedback / eval / manual',
+  `suite`        VARCHAR(16)   NOT NULL DEFAULT 'answer'              COMMENT '所属评测层：retrieval / answer',
+  `case_id`      VARCHAR(64)   NULL                                    COMMENT '关联黄金集case_id（若是评测失败转来）',
+  `query`        TEXT          NOT NULL                                COMMENT '问题',
+  `answer`       TEXT          NULL                                    COMMENT '系统故障答案（快照）',
+  `expected`     TEXT          NULL                                    COMMENT '期望答案 / 期望召回规范（参考）',
+  `root_cause`   VARCHAR(8)    NULL                                    COMMENT '根因分类：R1..R8',
+  `diagnosis`    TEXT          NULL                                    COMMENT 'triage 诊断理由 + 建议修复方向',
+  `status`       VARCHAR(16)   NOT NULL DEFAULT 'open'                 COMMENT '状态：open / triaged / fixed / wontfix',
+  `resolved_by`  VARCHAR(64)   NULL                                    COMMENT '修复它的 evolution patch id / 评测 run_id',
+  `created_at`   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP     COMMENT '入库时间',
+  `resolved_at`  DATETIME      NULL                                    COMMENT '修复时间',
+  INDEX `idx_status` (`status`, `root_cause`),
+  INDEX `idx_source` (`source`, `created_at` DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Bad Case 库：失败样本+根因+修复记录，驱动强化自进化';
+
 -- ============================================================================
 -- 种子数据：账号（role 区分特权 / 普通）
 -- 密码哈希算法：salt = 16字节十六进制；hash = sha256(salt + password)；格式 "salt:hash"

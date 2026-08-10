@@ -182,6 +182,8 @@ class MySQLMemoryStore:
         self._fallback_history: Dict[str, List[Dict]] = {}
         self._fallback_checkpoints: Dict[str, List[Dict]] = {}
         self._fallback_tasks: Dict[str, Dict] = {}
+        self._fallback_feedback: List[Dict] = []
+        self._fallback_bad_cases: List[Dict] = []
 
         try:
             import pymysql
@@ -253,6 +255,7 @@ class MySQLMemoryStore:
         required = [
             "chat_messages", "task_checkpoints", "task_queue",
             "chat_summaries", "prompt_templates", "admin_users",
+            "qa_feedback", "bad_cases",
         ]
         # 连接失败直接抛，由 __init__ 的 except 统一降级为内存模式
         conn = self._get_conn()
@@ -601,6 +604,221 @@ class MySQLMemoryStore:
             conn.close()
         except Exception as e:
             print(f"  [MySQLMemoryStore] update_task_status 失败: {e}")
+
+    # ========================================================================
+    # 用户反馈 & Bad Case 库（bad case 闭环 / 强化自进化）
+    # ========================================================================
+    # 这两类数据直接驱动 evalkit 的 triage + evolution：
+    #   qa_feedback  用户在生产环境踩到的失败（最珍贵）
+    #   bad_cases    沉淀后的失败样本 + 根因 + 修复记录
+
+    def save_feedback(
+        self, query: str, answer: str = None, rating: int = 0,
+        feedback_text: str = None, task_id: str = None,
+        user_id: int = 0, tenant_id: str = "default", session_id: str = None,
+        root_cause: str = None,
+    ) -> int:
+        """
+        保存一条用户反馈。rating: -1=踩 / 0=无 / 1=赞。
+        返回新插入行的自增 id；MySQL 不可用时降级内存并返回内存 id。
+        """
+        if not self.available:
+            fb = {
+                "id": len(self._fallback_feedback) + 1, "query": query,
+                "answer": answer, "rating": rating, "feedback_text": feedback_text,
+                "task_id": task_id, "user_id": user_id, "tenant_id": tenant_id,
+                "session_id": session_id, "root_cause": root_cause,
+                "created_at": time.time(),
+            }
+            self._fallback_feedback.append(fb)
+            return fb["id"]
+
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO qa_feedback "
+                "(task_id, user_id, tenant_id, session_id, query, answer, rating, "
+                " feedback_text, root_cause) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (task_id, user_id, tenant_id, session_id, query, answer,
+                 rating, feedback_text, root_cause),
+            )
+            new_id = cursor.lastrowid
+            cursor.close()
+            conn.close()
+            return new_id
+        except Exception as e:
+            print(f"  [MySQLMemoryStore] save_feedback 失败: {e}")
+            return -1
+
+    def list_feedback(self, limit: int = 100, tenant_id: str = None,
+                      rating: int = None) -> List[Dict]:
+        """查询反馈。可按月租户 / 评分筛选（rating=-1 即只看点踩）。"""
+        if not self.available:
+            rows = list(self._fallback_feedback)
+        else:
+            try:
+                conn = self._get_conn()
+                cursor = conn.cursor()
+                sql = ("SELECT id, task_id, user_id, tenant_id, session_id, query, "
+                       "answer, rating, feedback_text, root_cause, created_at "
+                       "FROM qa_feedback WHERE 1=1")
+                params = []
+                if tenant_id:
+                    sql += " AND tenant_id = %s"
+                    params.append(tenant_id)
+                if rating is not None:
+                    sql += " AND rating = %s"
+                    params.append(rating)
+                sql += " ORDER BY created_at DESC LIMIT %s"
+                params.append(limit)
+                cursor.execute(sql, params)
+                cols = [c[0] for c in cursor.description]
+                rows = [dict(zip(cols, r)) for r in cursor.fetchall()]
+                cursor.close()
+                conn.close()
+                return rows
+            except Exception as e:
+                print(f"  [MySQLMemoryStore] list_feedback 失败: {e}")
+                return []
+        # 内存降级路径的筛选
+        if tenant_id:
+            rows = [r for r in rows if r.get("tenant_id") == tenant_id]
+        if rating is not None:
+            rows = [r for r in rows if r.get("rating") == rating]
+        return rows[:limit]
+
+    def add_bad_case(
+        self, query: str, source: str = "feedback", suite: str = "answer",
+        case_id: str = None, answer: str = None, expected: str = None,
+        root_cause: str = None, diagnosis: str = None, status: str = "open",
+    ) -> int:
+        """写入一条 bad case。返回自增 id。"""
+        if not self.available:
+            bc = {
+                "id": len(self._fallback_bad_cases) + 1, "source": source,
+                "suite": suite, "case_id": case_id, "query": query,
+                "answer": answer, "expected": expected,
+                "root_cause": root_cause, "diagnosis": diagnosis,
+                "status": status, "created_at": time.time(),
+            }
+            self._fallback_bad_cases.append(bc)
+            return bc["id"]
+
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO bad_cases "
+                "(source, suite, case_id, query, answer, expected, root_cause, "
+                " diagnosis, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (source, suite, case_id, query, answer, expected,
+                 root_cause, diagnosis, status),
+            )
+            new_id = cursor.lastrowid
+            cursor.close()
+            conn.close()
+            return new_id
+        except Exception as e:
+            print(f"  [MySQLMemoryStore] add_bad_case 失败: {e}")
+            return -1
+
+    def list_bad_cases(self, status: str = None, root_cause: str = None,
+                       limit: int = 200) -> List[Dict]:
+        """查询 bad case 库。可按状态 / 根因筛选。"""
+        if not self.available:
+            rows = list(self._fallback_bad_cases)
+        else:
+            try:
+                conn = self._get_conn()
+                cursor = conn.cursor()
+                sql = ("SELECT id, source, suite, case_id, query, answer, expected, "
+                       "root_cause, diagnosis, status, resolved_by, created_at, resolved_at "
+                       "FROM bad_cases WHERE 1=1")
+                params = []
+                if status:
+                    sql += " AND status = %s"
+                    params.append(status)
+                if root_cause:
+                    sql += " AND root_cause = %s"
+                    params.append(root_cause)
+                sql += " ORDER BY created_at DESC LIMIT %s"
+                params.append(limit)
+                cursor.execute(sql, params)
+                cols = [c[0] for c in cursor.description]
+                rows = [dict(zip(cols, r)) for r in cursor.fetchall()]
+                cursor.close()
+                conn.close()
+                return rows
+            except Exception as e:
+                print(f"  [MySQLMemoryStore] list_bad_cases 失败: {e}")
+                return []
+        if status:
+            rows = [r for r in rows if r.get("status") == status]
+        if root_cause:
+            rows = [r for r in rows if r.get("root_cause") == root_cause]
+        return rows[:limit]
+
+    def update_bad_case_status(self, bc_id, status: str = None,
+                               resolved_by: str = None, diagnosis: str = None,
+                               expected: str = None) -> bool:
+        """更新 bad case 状态 / 处理记录（bad case 闭环的「修复→验证」落点）。
+
+        返回是否成功。status 仅允许 open/in_progress/resolved；
+        status=resolved 时自动写 resolved_at。
+        """
+        if status not in (None, "open", "in_progress", "resolved"):
+            status = None
+        # 降级：直接改内存对象
+        if not self.available:
+            for bc in self._fallback_bad_cases:
+                if bc.get("id") == bc_id:
+                    if status:
+                        bc["status"] = status
+                    if resolved_by is not None:
+                        bc["resolved_by"] = resolved_by
+                    if diagnosis is not None:
+                        bc["diagnosis"] = diagnosis
+                    if expected is not None:
+                        bc["expected"] = expected
+                    if status == "resolved":
+                        bc["resolved_at"] = time.time()
+                    return True
+            return False
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            sets, params = [], []
+            if status:
+                sets.append("status = %s")
+                params.append(status)
+            if resolved_by is not None:
+                sets.append("resolved_by = %s")
+                params.append(resolved_by)
+            if diagnosis is not None:
+                sets.append("diagnosis = %s")
+                params.append(diagnosis)
+            if expected is not None:
+                sets.append("expected = %s")
+                params.append(expected)
+            if status == "resolved":
+                sets.append("resolved_at = NOW()")
+            if not sets:
+                cursor.close()
+                conn.close()
+                return True
+            params.append(bc_id)
+            cursor.execute(
+                f"UPDATE bad_cases SET {', '.join(sets)} WHERE id = %s", params)
+            affected = cursor.rowcount
+            cursor.close()
+            conn.close()
+            return affected > 0
+        except Exception as e:
+            print(f"  [MySQLMemoryStore] update_bad_case_status 失败: {e}")
+            return False
 
     def get_unfinished_tasks(self, session_id: str, user_id: int = 0) -> List[Dict]:
         """
