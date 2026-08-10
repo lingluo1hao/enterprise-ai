@@ -112,6 +112,7 @@ warnings.filterwarnings("ignore")
 import re
 import sys
 import json
+import contextvars
 import time
 import hashlib
 import traceback
@@ -197,6 +198,15 @@ DEFAULT_ROLE = ROLE_USER   # 默认角色
 #  TTL: 7 天（CACHE_TTL）
 
 
+# CacheManager 是全局单例（被 orchestrator 持有），但 current_role / current_tenant
+# 描述的是「当前这次请求」的属性，二者放一起在并发下必然串：
+#   T1: admin 设 current_role="admin" → T2: guest 设 current_role="user"
+#   → admin 的缓存键被算成 user 角色，或反过来把 admin 的答案回给 guest（越权泄漏）。
+# 所以这两个值同样下沉到 ContextVar，按执行上下文隔离。
+_ctx_cache_role = contextvars.ContextVar("cache_current_role", default=DEFAULT_ROLE)
+_ctx_cache_tenant = contextvars.ContextVar("cache_current_tenant", default="global")
+
+
 class CacheManager:
     """
     Redis 智能缓存管理器
@@ -233,8 +243,30 @@ class CacheManager:
         self._hit_count = 0       # 命中计数
         self._miss_count = 0      # 未命中计数
         self._embed_fn = None     # 延迟加载 embedding 模型
+        # 下面两行走 property setter，实际写入 ContextVar（请求级隔离，见类上方注释）
         self.current_role = DEFAULT_ROLE  # 当前用户角色（影响缓存键，防止跨角色泄漏）
         self.current_tenant = "global"    # 当前租户（方案乙：决定缓存键里的 kb_version 粒度）
+
+    # ------------------------------------------------------------------
+    # 请求级上下文属性（读写语法不变，底层 ContextVar，并发不串）
+    # ------------------------------------------------------------------
+    @property
+    def current_role(self) -> str:
+        """当前请求的用户角色。参与缓存键计算，串了会跨角色泄漏答案。"""
+        return _ctx_cache_role.get()
+
+    @current_role.setter
+    def current_role(self, value: str):
+        _ctx_cache_role.set(value)
+
+    @property
+    def current_tenant(self) -> str:
+        """当前请求的租户。决定缓存键里的 kb_version 粒度。"""
+        return _ctx_cache_tenant.get()
+
+    @current_tenant.setter
+    def current_tenant(self, value: str):
+        _ctx_cache_tenant.set(value)
 
     # ------------------------------------------------------------------
     # 公开方法
