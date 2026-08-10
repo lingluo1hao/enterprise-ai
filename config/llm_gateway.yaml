@@ -99,7 +99,7 @@ models:
     recovery_sec: 60.0
     price_in_per_1m: 0.27
     price_out_per_1m: 1.10
-    enabled: false
+    enabled: true
 
   # ---- 云端备选：通义千问（.env 里已有 DASHSCOPE_API_KEY）-----------------
   qwen-plus:
@@ -165,10 +165,17 @@ models:
 routing:
   classify:   [local-qwen]           # 决定是否要走 RAG，质量优先
   grade:      [local-small, local-qwen]
+  # ---- 评测 judge：RAG 答案质量打分（faithfulness / relevancy）----
+  # 优先级 deepseek-chat（云端强模型，需 DEEPSEEK_API_KEY + enabled=true）；
+  # 未启用时自动回落 local-small（本地 1.5b，零成本可离线）。evalkit 走这条链。
+  evalgrade:  [deepseek-chat, local-small, local-qwen]
   rewrite:    [local-small, local-qwen]
   compress:   [local-small, local-qwen]
 
   generate:   [local-qwen-gen, deepseek-chat, qwen-plus]
+  # 难度路由专用链：技术/高风险 query 优先走 deepseek-chat 生成（压幻觉），
+  # 本地 qwen2:7b 作兜底回落。由 langgraph_rag_agent._do_generate 按难度切换 task。
+  generate-hard: [deepseek-chat, local-qwen-gen, qwen-plus]
   write:      [local-qwen-gen, deepseek-chat, qwen-plus]
   synthesize: [local-qwen-gen, deepseek-chat, qwen-plus]
   direct:     [local-qwen-gen, deepseek-chat, qwen-plus]

@@ -68,6 +68,7 @@ import time
 import json
 import re
 import traceback
+import contextvars
 from typing import TypedDict, List, Dict, Any, Optional
 
 import warnings
@@ -147,6 +148,33 @@ RETRIEVE_CANDIDATE_K = 20
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "true").lower() == "true"
 RERANK_URL = os.getenv("RERANK_URL", "http://192.168.200.128:11436/v1/rerank")
 RERANK_TIMEOUT = int(os.getenv("RERANK_TIMEOUT", "20"))
+RERANK_RETRIES = int(os.getenv("RERANK_RETRIES", "2"))          # 5xx 瞬时失败重试次数
+RERANK_RETRY_BACKOFF = float(os.getenv("RERANK_RETRY_BACKOFF", "1.0"))  # 退避基数(秒)
+
+# ===== 生成侧难度路由：难的 query 走 deepseek 生成，简单走本地 qwen2:7b =====
+# 依据：tenant 命中硬 tenant 集合（jm/yh 等技术协议库，幻觉高发）或 query 命中
+# 技术/结构类关键词（协议号/字段/组成/优先级…）。目标：难的给强模型、简单的给本地
+# 模型，既控成本又压幻觉。开关/名单/模式均可用环境变量覆盖。
+GEN_ROUTING_ENABLED = os.getenv("GENERATION_ROUTING_ENABLED", "true").lower() == "true"
+GEN_HARD_TENANTS = {t.strip() for t in os.getenv("GENERATION_HARD_TENANTS", "jm,yh").split(",") if t.strip()}
+GEN_HARD_PATTERN = os.getenv(
+    "GENERATION_HARD_PATTERN",
+    r"0x[0-9a-fA-F]+|由哪几部分组成|组成|分别代表|优先级|上报|字段|协议包|协议号|起始位|校验位|格式|结构",
+)
+_GEN_HARD_RE = re.compile(GEN_HARD_PATTERN)
+
+
+def _select_gen_task(query: str, tenant: str = "") -> str:
+    """难度路由：返回 'generate' 或 'generate-hard'。
+
+    难的 query（硬 tenant 或命中技术关键词）→ generate-hard（deepseek 优先）；
+    简单的 → 本地 qwen2:7b。关闭开关时一律走默认 generate。
+    """
+    if not GEN_ROUTING_ENABLED:
+        return "generate"
+    if (tenant in GEN_HARD_TENANTS) or bool(_GEN_HARD_RE.search(query or "")):
+        return "generate-hard"
+    return "generate"
 
 # 文档片段截断长度。
 # 给 LLM 生成答案时，每个文档片段只取前 N 个字符。
@@ -387,6 +415,40 @@ def _extract_figs_from_text(text: str) -> List[str]:
 # ============================================================================
 # LangGraph RAG 应用主类
 # ============================================================================
+# ============================================================================
+# 请求级上下文（并发隔离）
+# ============================================================================
+# 【为什么需要】
+# LangGraphRAGApp 在 Web 模式下是「全局单例」（rag_web_server 的 orchestrator），
+# 而每个 SSE 请求都会起一个后台线程调用 app.query(...)。
+# 如果把「当前用户 / 租户 / 任务 ID」存成实例属性（self.user = ...），
+# 两个用户同时提问时会互相覆盖：
+#   T1: A 设 self.tenant_id="acme"  →  T2: B 设 self.tenant_id="globex"
+#   →  A 的检索被下推到 B 的租户，A 的 checkpoint 写进 B 的 task_id。
+# 这是数据串户 + 归因错乱，属于 P0 级安全问题。
+#
+# 【怎么修】
+# 用 contextvars.ContextVar 把这些值绑定到「执行上下文」而不是「对象」。
+# threading.Thread 启动时会拿到一份独立的空 Context，
+# 因此每个请求线程读写这些变量互不干扰，天然隔离。
+#
+# 【为什么用 property 包一层而不是直接改 40 处调用点】
+# 类里有 40+ 处 self.user / self.username / self.tenant_id / self.current_task_id。
+# 定义成 property 后，读写语法完全不变（self.user 照旧），
+# 底层自动路由到 ContextVar —— 调用点零改动，回归风险最低。
+#
+# 注意：default 值必须与 __init__ 中的初始赋值一致。
+# 因为新线程拿到的是空 Context，读不到主线程 __init__ 时设过的值，会 fallback 到 default。
+_ctx_user_id = contextvars.ContextVar("rag_user_id", default=1)
+_ctx_username = contextvars.ContextVar("rag_username", default="anonymous")
+_ctx_tenant_id = contextvars.ContextVar("rag_tenant_id", default="default")
+_ctx_task_id = contextvars.ContextVar("rag_task_id", default=None)
+# last_task_id：query() 结束时 current_task_id 会被清空（用于表示「当前无运行中任务」），
+# 但前端点赞/点踩需要拿到刚才那次问答的 task_id 去关联全链路 trace，
+# 所以额外留一个「最近一次任务 ID」，query() 返回后调用方仍可读到。
+_ctx_last_task_id = contextvars.ContextVar("rag_last_task_id", default=None)
+
+
 class LangGraphRAGApp:
     """
     LangGraph 版 RAG Agent — 状态图驱动的知识库问答引擎。
@@ -403,6 +465,54 @@ class LangGraphRAGApp:
     - 可观测：节点级追踪，每一步的执行记录清晰可见
     - 可测试：每个节点可独立单元测试
     """
+
+    # ------------------------------------------------------------------
+    # 请求级上下文属性（读写语法不变，底层走 ContextVar，多请求并发不串号）
+    # ------------------------------------------------------------------
+    @property
+    def user(self) -> int:
+        """当前调用用户的 ID（admin_users.id）。请求级隔离。"""
+        return _ctx_user_id.get()
+
+    @user.setter
+    def user(self, value: int):
+        _ctx_user_id.set(value)
+
+    @property
+    def username(self) -> str:
+        """当前调用用户名，用于 token 用量归因。请求级隔离。"""
+        return _ctx_username.get()
+
+    @username.setter
+    def username(self, value: str):
+        _ctx_username.set(value)
+
+    @property
+    def tenant_id(self) -> str:
+        """当前租户，用于检索下推隔离。请求级隔离（串了会跨租户泄漏）。"""
+        return _ctx_tenant_id.get()
+
+    @tenant_id.setter
+    def tenant_id(self, value: str):
+        _ctx_tenant_id.set(value)
+
+    @property
+    def current_task_id(self) -> Optional[str]:
+        """当前正在执行的任务 ID，节点 checkpoint 按它归档。请求级隔离。"""
+        return _ctx_task_id.get()
+
+    @current_task_id.setter
+    def current_task_id(self, value: Optional[str]):
+        _ctx_task_id.set(value)
+        # 只记录「非空」的任务 ID：query() 收尾会把 current_task_id 置 None，
+        # 但 last_task_id 要保留下来给前端做反馈关联。
+        if value:
+            _ctx_last_task_id.set(value)
+
+    @property
+    def last_task_id(self) -> Optional[str]:
+        """最近一次问答的任务 ID（只读）。供前端点赞/点踩关联全链路 trace。"""
+        return _ctx_last_task_id.get()
 
     def __init__(self, fast_mode: bool = False):
         """
@@ -427,9 +537,11 @@ class LangGraphRAGApp:
         # 所以本文件里 11 处 self.llm.chat(system, user) 一行都不用改。
         print("\n[1/3] 连接 LLM...")
         self.llm = create_llm()
-        self.user = 1              # 当前调用用户的 ID（admin_users.id）；Web 模式会被覆盖为真实登录用户 ID
+        # 下面三行走的是本类的 property setter，实际写入 ContextVar（请求级隔离）。
+        # 这里赋值只是让 CLI 模式有个明确起点；Web 模式每次 query() 都会按真实登录态覆盖。
+        self.user = 1              # 当前调用用户的 ID（admin_users.id）
         self.username = "anonymous"  # 当前调用用户的用户名，用于 token 用量归因
-        self.tenant_id = "default" # 当前调用用户所属租户；Web 模式会被覆盖为真实登录租户
+        self.tenant_id = "default" # 当前调用用户所属租户
 
         # 2. 向量数据库（复用现有 VectorStoreManager）
         # VectorStoreManager 封装了 Milvus 的初始化、文档索引、向量检索，
@@ -449,7 +561,7 @@ class LangGraphRAGApp:
         self.cache = CacheManager()
         self.memory_store = MySQLMemoryStore()
         self._active_context: Dict[str, List[Dict]] = {}  # Layer 1: 内存加速
-        self.current_task_id: Optional[str] = None  # 当前正在执行的任务 ID
+        self.current_task_id = None  # 当前正在执行的任务 ID（property → ContextVar）
         self.fast_mode = fast_mode
 
         # 4. 提示词管理器（从 MySQL 动态加载，DB 不可用时回退到默认值）
@@ -779,12 +891,19 @@ class LangGraphRAGApp:
 
         # —— 自进化（方案 A）：查相似 playbook，命中则预填已知好 rewrite ——
         prefill: List[str] = []
+        used_playbook_pk: Optional[str] = None
         try:
             store = getattr(self, "playbook_store", None)
             if store is not None:
                 hit = store.query_similar(query, self.tenant_id, top_k=1)
                 if hit and hit.get("rewrite_text"):
                     prefill = json.loads(hit["rewrite_text"])
+                    used_playbook_pk = hit.get("pk")
+                    # 命中即复用：success_count +1（越用越快，强化自进化 #168）
+                    try:
+                        store.patch_success(used_playbook_pk)
+                    except Exception as _e:
+                        print(f"  [classify] patch_success 异常(忽略): {_e}")
                     print(f"  [classify] ♻ 命中经验 playbook(相似度={hit['score']:.2f})，预填 rewrite: {prefill}")
         except Exception as e:
             print(f"  [classify] 经验查询异常(忽略): {e}")
@@ -795,7 +914,8 @@ class LangGraphRAGApp:
         # 直接判定 complex 并用原始 query，消除历史依赖带来的随机性。
         if query.count("？") >= 2 or query.count("?") >= 2:
             print(f"  [classify] 类型=complex（多问句强制，跳过 LLM 消解）")
-            return {"query_type": "complex", "resolved_query": query, "prefill_rewrites": prefill}
+            return {"query_type": "complex", "resolved_query": query,
+                    "prefill_rewrites": prefill, "used_playbook_pk": used_playbook_pk}
 
         # 构建最近 4 轮对话历史的文本摘要
         history_text = self._format_history(messages, max_turns=4)
@@ -804,7 +924,8 @@ class LangGraphRAGApp:
             # 快速模式或无历史：跳过 LLM，用规则快速分类
             qtype = self._quick_classify(query)
             print(f"  [classify] 类型={qtype}（快速分类）")
-            return {"query_type": qtype, "resolved_query": query, "prefill_rewrites": prefill}
+            return {"query_type": qtype, "resolved_query": query,
+                    "prefill_rewrites": prefill, "used_playbook_pk": used_playbook_pk}
 
         # 从提示词管理器获取 classify 模板
         prompt = self.pm.get_prompt("classify")
@@ -818,7 +939,8 @@ class LangGraphRAGApp:
         # 解析 LLM 输出的 JSON（含容错兜底）
         qtype, resolved = self._parse_classify(result, query)
         print(f"  [classify] 类型={qtype}, 消解问题={resolved[:40]}")
-        return {"query_type": qtype, "resolved_query": resolved, "prefill_rewrites": prefill}
+        return {"query_type": qtype, "resolved_query": resolved,
+                "prefill_rewrites": prefill, "used_playbook_pk": used_playbook_pk}
 
     # ========================================================================
     # 条件边路由函数
@@ -974,14 +1096,33 @@ class LangGraphRAGApp:
         messages = self._append_history(session_id, query, answer, user_id=self.user)
         print(f"  [save_history] 已保存到 MySQL + 内存，历史 {len(messages)} 条消息")
 
-        # —— 自进化（方案 A）：沉淀本次成功经验为 playbook ——
+        # —— 自进化（方案 A / 强化 #168）：沉淀成功经验 + 失败样本闭环 ——
         try:
             store = getattr(self, "playbook_store", None)
             ext = getattr(self, "_Extractor", None)
             if store is not None and ext is not None:
-                pb = ext.extract(state, self.tenant_id, self.username)
-                if pb is not None:
-                    store.save(pb)
+                # 三级成功信号评估：是否值得作为正向经验沉淀
+                ok, _level = ext.evaluate_success(state)
+                if ok:
+                    pb = ext.extract(state, self.tenant_id, self.username)
+                    if pb is not None:
+                        # save_or_merge：同问题去重合并，避免重复插（越用越快）
+                        store.save_or_merge(pb)
+                else:
+                    # 检索未走通 / 答案级或反馈级为负 -> 沉淀为负样本到 bad_cases，
+                    # 形成「失败样本 -> triage 诊断 -> 修复 -> 回归验证」自进化闭环
+                    fail = ext.extract_failure(state, self.tenant_id, self.username)
+                    if fail is not None:
+                        ms = getattr(self, "memory_store", None)
+                        if ms is not None and getattr(ms, "available", False):
+                            ms.add_bad_case(
+                                query=fail["query"], source=fail["source"],
+                                suite=fail["suite"], expected=fail["expected"],
+                                root_cause=fail["root_cause"],
+                                diagnosis=fail["diagnosis"], status="open",
+                            )
+                            print(f"  [evolution] ⚠ 本次未走通，已沉淀负样本到 bad_cases: "
+                                  f"{fail['query'][:40]}")
         except Exception as e:
             print(f"  [evolution] 沉淀异常(忽略): {e}")
 
@@ -1615,14 +1756,33 @@ class LangGraphRAGApp:
                 "query": (query or "").strip()[:512],
                 "documents": cleaned,
             }
-            resp = requests.post(RERANK_URL, json=payload, timeout=RERANK_TIMEOUT)
-            resp.raise_for_status()
-            order = sorted(resp.json().get("results", []),
-                           key=lambda x: x["relevance_score"], reverse=True)
-            reranked = [docs[idx_map[it["index"]]] for it in order[:top_n]]
-            print(f"  [rerank] {len(docs)} 候选 → 精排 {len(reranked)} 条 (query={query[:30]!r})")
-            return reranked
+            last_err = None
+            for _attempt in range(RERANK_RETRIES + 1):
+                try:
+                    resp = requests.post(RERANK_URL, json=payload, timeout=RERANK_TIMEOUT)
+                    if resp.status_code >= 500:
+                        # 瞬时 500（VM 上 reranker 抖动）：退避后重试，不直接回退 RRF
+                        last_err = f"HTTP {resp.status_code}"
+                        if _attempt < RERANK_RETRIES:
+                            time.sleep(RERANK_RETRY_BACKOFF * (_attempt + 1))
+                            continue
+                        break
+                    resp.raise_for_status()
+                    order = sorted(resp.json().get("results", []),
+                                   key=lambda x: x["relevance_score"], reverse=True)
+                    reranked = [docs[idx_map[it["index"]]] for it in order[:top_n]]
+                    print(f"  [rerank] {len(docs)} 候选 → 精排 {len(reranked)} 条 (query={query[:30]!r})")
+                    return reranked
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    if _attempt < RERANK_RETRIES:
+                        time.sleep(RERANK_RETRY_BACKOFF * (_attempt + 1))
+                        continue
+                    break
+            print(f"  [rerank] 失败，回退 RRF 顺序: {last_err}")
+            return docs[:top_n]
         except Exception as e:
+            # 覆盖 import requests / 候选清洗等前置阶段的异常，同样优雅回退 RRF
             print(f"  [rerank] 失败，回退 RRF 顺序: {e}")
             return docs[:top_n]
 
@@ -1765,7 +1925,11 @@ class LangGraphRAGApp:
             prompt["user_template"],
             query=query, context=context
         )
-        answer = self.llm.chat(system, user, task="generate", user=self.username)
+        # ---- 生成侧难度路由：难的 query 走 deepseek 生成，简单走本地 qwen2:7b ----
+        gen_task = _select_gen_task(query, getattr(self, "tenant_id", "") or "")
+        answer = self.llm.chat(system, user, task=gen_task, user=self.username)
+        if gen_task != "generate":
+            print(f"  [generate] 难度路由 → task={gen_task} (tenant={getattr(self, 'tenant_id', '')!r})")
 
         # ===== 图渲染：服务端确定性追加，取「本次检索涉及的最相关图」拼到答案末尾 =====
         # 之前把 [[FIG:...]] 放进 context 指望 LLM 原样保留，但 LLM 常把占位符当噪音删掉，
@@ -2318,14 +2482,18 @@ class LangGraphRAGApp:
         返回：
             生成的回答文本
         """
-        # 把 user_id（admin_users.id，外键）记到实例上，
+        # 把 user_id（admin_users.id，外键）写进请求级上下文，
         # 本次问答里所有 memory_store 写入都用它做用户隔离（不再冗余存用户名）。
         if user_id is not None:
             self.user = user_id
         # 用户名：用于 token 用量归因（用量表按 username 关联租户）
         self.username = username or user or str(self.user)
-        # 租户：记到实例上，检索下推隔离用（super-admin 传 "__global__" 做跨租户巡检）
+        # 租户：请求级隔离，检索下推用（super-admin 传 "__global__" 做跨租户巡检）
         self.tenant_id = tenant_id or "default"
+        # 清空上一轮遗留的任务 ID：同一线程被连接池复用时，
+        # 若本轮 create_task 失败，前端不应该拿到上一轮的过期 task_id 去打反馈。
+        _ctx_task_id.set(None)
+        _ctx_last_task_id.set(None)
         total_start = time.time()
 
         print("\n" + "=" * 70)
@@ -2352,6 +2520,7 @@ class LangGraphRAGApp:
         # 命中相似问题 → 带「经验改写词」跑完整管线，答案仍实时生成（永远新鲜）。
         # 注意：这里复用的是「检索策略」，不是「答案」，所以绝不回旧答案。
         prefill_rewrites: List[str] = []
+        used_playbook_pk: Optional[str] = None
         try:
             store = getattr(self, "playbook_store", None)
             if store is not None:
@@ -2361,6 +2530,12 @@ class LangGraphRAGApp:
                         prefill_rewrites = json.loads(hit["rewrite_text"])
                     except Exception:
                         prefill_rewrites = []
+                    used_playbook_pk = hit.get("pk")
+                    # 命中即复用：success_count +1（越用越快）
+                    try:
+                        store.patch_success(used_playbook_pk)
+                    except Exception as _e:
+                        print(f"[evolution] patch_success 异常(忽略): {_e}")
                     print(f"[evolution] ♻ 顶层命中 playbook (score={hit.get('score')}, "
                           f"success_count={hit.get('success_count')})")
         except Exception as e:
@@ -2390,6 +2565,8 @@ class LangGraphRAGApp:
             "review_rounds": 0,
             # 方案 A：若顶层命中 Playbook，则带上经验改写词；node_query_rewrite 首轮优先复用。
             "prefill_rewrites": prefill_rewrites,
+            # 强化自进化 #168：记录本次复用的 playbook pk，供用户反馈级信号回调强化
+            "used_playbook_pk": used_playbook_pk,
         }
 
         try:
