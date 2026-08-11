@@ -16,8 +16,9 @@
 
 3. **父子文档（small-to-big / parent-child）**
    - 子片段：小窗口（默认 400 字，精确匹配）；
-   - 父窗口：每个 section 的完整文本，作为 `parent_content` 随子片段一起落库；
-   - 检索时命中子片段，但透传 `parent_content` 给 LLM，兼顾「召回准」与「上下文足」。
+   - 父窗口（P1 方案 a）：**不再存整章**，改存「子片段前后各 `PARENT_WINDOW_CHARS` 字滑动窗口」
+     （`_window_around`），每个子片段自足、天然 < 8192 字节、不共享不截断不膨胀；
+   - 检索时命中子片段，透传 `parent_content` 窗口给 LLM，兼顾「召回准」与「上下文足」。
 
 `chunk_documents` 保留为 legacy 接口（固定 600/120），供 `structure_aware=False`
 时回退，确保行为可对比、可降级。
@@ -42,6 +43,28 @@ DEFAULT_PARENT_SIZE = 1200
 DEFAULT_PARENT_OVERLAP = 150
 # 原子片段（代码/表格）超过该长度才按空行安全切
 MAX_ATOMIC = 2000
+
+# P1（方案 a）：父窗口改存「子片段前后各 N 字滑动窗口」而非整章。
+# 每个子片段自足、天然 < 8192 字节、不共享不截断不膨胀；
+# Plan A 尾部锚点（child[-80:]）必落在窗口内 → 命令集等被截断章节也能吃到 [章节续文]。
+PARENT_WINDOW_CHARS = 550  # 前后各 550 字，窗口总长 ≈ 子片段 + 1100 字 ≪ 8192 字节上限
+
+
+def _window_around(child: str, parent: str, n: int) -> str:
+    """返回 child 在 parent 中的滑动窗口（前 n + child + 后 n 字）。
+
+    child 是 parent 的连续子串（切分保证），用 parent.find(child) 定位。
+    若找不到（极端规范化/子串被改写），返回空串——宁可不补也不拼整章，
+    避免重新引入 8192 字节截断与同章膨胀两个老问题。
+    """
+    if not child or not child.strip() or not parent:
+        return ""
+    pos = parent.find(child)
+    if pos < 0:
+        return ""
+    start = max(0, pos - n)
+    end = min(len(parent), pos + len(child) + n)
+    return parent[start:end]
 
 _CODE_RE = re.compile(r"```.*?```", re.DOTALL)
 
@@ -398,7 +421,7 @@ class StructureAwareChunker:
                     access_level=raw.access_level,
                     chunk_index=idx,
                     parent_id=pid,
-                    parent_content=pcontent,
+                    parent_content=_window_around(p, pcontent, PARENT_WINDOW_CHARS),
                     is_parent=False,
                     section_path=path or None,
                     chunk_type=kind,
@@ -416,12 +439,13 @@ class StructureAwareChunker:
         - **父 chunk** = 整章全文（含下属小章节的文字/表格/图片），
           即「大章节包含小章节」；父 chunk 仅入库不检索（主检索已排除 is_parent）。
         - **子 chunk** = 整章细切的小片段（检索单元）；每个子 chunk 透传
-          整章 parent_content，且 figure_paths = 整章所有图片，
-          生成答案时可把本章全部相关图片一并还原（解决「只返回一张图」的问题）。
+          **滑动窗口** parent_content（`_window_around`，子片段前后各 N 字），
+          而非整章——根治整章超 8192 字节被静默截断、长章节答案入库即丢的问题。
+          figure_paths = 整章所有图片，生成答案时可把本章全部相关图片一并还原。
 
         表格块 [TABLE]...[/TABLE] 经 `_segment` 保护为原子片段，不被切断。
-        每个章节单元长度已在 loader 端约束在 ~8000 字内，确保父窗口不超
-        Milvus 字段上限（content/parent_content 均为 8192）。
+        每个章节单元长度已在 loader 端约束在 ~8000 字内；滑动窗口总长 ≪ 8192，
+        Milvus 字段上限（content/parent_content 均为 8192 字节）永不会触发。
         """
         CONTENT_CAP = 8192  # Milvus 字段上限保护
         pcontent = raw.text[:CONTENT_CAP]
@@ -465,7 +489,7 @@ class StructureAwareChunker:
                     access_level=raw.access_level,
                     chunk_index=idx,
                     parent_id=pid,
-                    parent_content=pcontent,
+                    parent_content=_window_around(p, pcontent, PARENT_WINDOW_CHARS),
                     is_parent=False,
                     section_path=raw.section_path or None,
                     chunk_type=kind,

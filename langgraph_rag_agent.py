@@ -86,6 +86,7 @@ from advanced_rag_agent import (
     ROLE_ADMIN,
     ROLE_USER,
     DEFAULT_ROLE,
+    _doc_key,          # 文档身份去重键（勿用 page_content 前缀，见 BadCase #9）
 )
 
 # Layer 2: MySQL 多层记忆持久化模块
@@ -181,6 +182,89 @@ def _select_gen_task(query: str, tenant: str = "") -> str:
 # LLM 的上下文窗口有限（qwen2:7b 约 32K tokens），
 # 截断可避免 token 溢出，同时保留足够的语义信息。
 DOC_TRUNCATE = 350
+
+
+# ============================================================================
+# 父窗口回填（small-to-big 的「big」半边）—— 方案 A：尾部锚点单侧后扩
+# ============================================================================
+# 背景：_parse_hits 修复后 page_content 只返回子片段，parent_content 挪进 metadata 旁路。
+# 但长答案需要章节邻域上下文，纯子片段会丢细节（实测最差章节覆盖率仅 25.5%）。
+# 这里在生成侧按需把父窗口邻域拼回，补上 big 半边。
+#
+# 三个设计点（均经探针实测验证，见 scripts/_probe_parent_expand*.py）：
+#   1) 尾部锚点 child[-80:] 是唯一可靠定位点：pipeline 给 child 前加了 37 字章节标题前缀，
+#      头部不可靠；尾部是纯净正文且必在 parent 中（除非父被 8192B 截断）。
+#   2) 只向后扩：向前会撞上章节前缀已覆盖区造成重复；答案延续在命中点之后，保守够用。
+#   3) parent_id 去重 + 双重预算 + 降级：同章只补一次（否则同章 N 条拼 N 遍直接爆 context），
+#      单次 RADIUS / 总量 TOTAL 双封顶；定位失败（父截断/前缀异常）静默降级为纯子片段。
+PARENT_EXPAND_RANKS = 2      # 只给 rerank 前 N 名扩容，rank 3-4 维持纯子片段
+PARENT_EXPAND_RADIUS = 400   # 命中点向后扩 400 字
+PARENT_EXPAND_TOTAL = 1600   # 父窗口补充总量封顶，防止预算失控
+
+
+def _build_context(query: str, docs: "List") -> "tuple[str, list]":
+    """构建喂给 LLM 的检索上下文（small-to-big 的 big 半边在此回填）。
+
+    参数 docs: [(Document, score), ...]，通常已按相关性排好序（取前 5 进上下文）。
+    返回 (context, top_docs)：context 为拼接后的字符串；top_docs 为实际进入上下文的
+    前 5 个 (doc, score) 对，供调用方（图渲染等）复用。调用方需保证 docs 非空。
+    """
+    import re as _re
+    _FIG_RE = _re.compile(r"\[\[FIG:[^\]]*\]\]")
+
+    def _clean_body(text: str) -> str:
+        return _FIG_RE.sub("", text).strip()
+
+    # 章节优先（B3）：把「与问题同属一个章节」的文档排到最前，
+    # 避免被同文档其他章节（如命令集表格）的噪声带偏。
+    _q_segs = [s for s in _re.findall(r"[\u4e00-\u9fff]{2,}", query)]
+
+    def _section_priority(doc) -> int:
+        sp = doc.metadata.get("section_path", "") or ""
+        if not sp:
+            return 0
+        return sum(1 for seg in sp.split("§") if any(seg in qseg for qseg in _q_segs))
+
+    docs = sorted(docs, key=lambda d: _section_priority(d[0]), reverse=True)
+
+    # ---- 分级上下文预算（按 B3 排序后的名次分配字数）----
+    # 旧逻辑「带图就放宽到 2000 字」本意只覆盖极少数图页，但 chunker 把整章图片清单
+    # 透传给该章每个子 chunk（实测 97% 的 chunk 都带图），等于对全体生效；叠加旧
+    # _parse_hits 优先返回整章 parent_content（中位数 5468 字），上下文涨到 8348 字符。
+    # 致命后果：Ollama num_ctx 默认 2048，超出部分从 prompt 开头静默截断，而 B3 恰把
+    # 最相关章节排第一 → 正确答案第一个被丢 → 答成「心跳/补传/GPRS 数传」。
+    # 现在按名次给预算：命中章节给足，旁证给少量，兜底给最少。
+    RANK_BUDGET = (1200, 500, 500, 350, 350)  # 合计 ≈ 2900 字，约 1700 token
+    parts = []
+    top_docs = docs[:5]
+    seen_parents = set()
+    used = 0  # 父窗口补充累计字数，循环外初始化
+    for i, d in enumerate(top_docs):
+        doc = d[0]
+        src = os.path.basename(doc.metadata.get("source", "未知"))
+        page = doc.metadata.get("page")
+        label = f"[{src} 第{page}页]" if page else f"[{src}]"
+        trunc = RANK_BUDGET[i] if i < len(RANK_BUDGET) else DOC_TRUNCATE
+        body = _clean_body(doc.page_content[:trunc])
+
+        # ---- 方案 A：命中且相关的 top 文档，按需把父窗口邻域拼回 ----
+        # 仅前 PARENT_EXPAND_RANKS 名扩容；同一 parent_id 只补一次（防同章 N 条拼 N 遍）。
+        pid = doc.metadata.get("parent_id") or ""
+        if i < PARENT_EXPAND_RANKS and pid and pid not in seen_parents:
+            seen_parents.add(pid)
+            pc = doc.metadata.get("parent_content") or ""
+            anchor = (doc.page_content or "")[-80:]   # 尾部锚点，避开章节前缀
+            pos = pc.rfind(anchor)                     # rfind：模板化文档协议头重复，取最后更准
+            if anchor and pos >= 0:
+                tail = pc[pos + len(anchor): pos + len(anchor) + PARENT_EXPAND_RADIUS]
+                tail_clean = _clean_body(tail)
+                if tail_clean and used + len(tail_clean) <= PARENT_EXPAND_TOTAL:
+                    body += "\n[章节续文] " + tail_clean
+                    used += len(tail_clean)
+            # 定位失败（父被 8192B 截断 / 前缀异常）→ 静默降级为纯子片段，不膨胀
+
+        parts.append(f"{label} {body}")
+    return "\n\n".join(parts), top_docs
 
 
 # ============================================================================
@@ -1656,7 +1740,13 @@ class LangGraphRAGApp:
         per_query_results = []
         for q in queries:
             results = self.vector_db.similarity_search_with_score(
-                q, k=RETRIEVE_TOP_K, filter_role=role,
+                # 用 RETRIEVE_CANDIDATE_K（20）作为单 query 召回量，配合下方 RRF
+                # 融合到同一宽度（line 1666），让 cross-encoder 在 20 宽池里把 gold
+                # 拉回顶部。Bug 复盘（2026-08-11 Bad Case #9 "产品有 4 种工作模式
+                # 分别是什么"）：之前这里写的是 RETRIEVE_TOP_K=5，每 query 只召回
+                # 5 个，RRF 融合后正确 chunk 排不进前 5 被永久丢弃，DeepSeek 被喂
+                # 无关 context 拒答，附带了"技术对接"章节的通信协议表图。
+                q, k=RETRIEVE_CANDIDATE_K, filter_role=role,
                 user_id=self.user, tenant_id=self.tenant_id)
             results = AccessControlFilter.filter_results(results, role)
             per_query_results.append(results)
@@ -1666,7 +1756,10 @@ class LangGraphRAGApp:
         rrf_results = self._rrf_fuse_queries(per_query_results, RETRIEVE_CANDIDATE_K)
 
         # ③④ 两阶段精排（可选，失败优雅回退到 RRF 顺序）
-        candidate = self._rerank(queries[0] if queries else "", rrf_results, RETRIEVE_TOP_K)
+        # rerank 在 RETRIEVE_CANDIDATE_K（20）宽池里精排，避免只精排前 5 把正确
+        # chunk 挤出（Bad Case #9 同因：gold 排第 6~10 时直接被 rerank 入口 top_n=5 丢）。
+        # generate 端再 docs[:5] 收窄到喂 LLM 的窗口（line 1908）。
+        candidate = self._rerank(queries[0] if queries else "", rrf_results, RETRIEVE_CANDIDATE_K)
 
         # ⑤ figure-aware 二次召回：原句（queries[0]）含图关键词时，图页顶到最前
         original_q = queries[0] if queries else ""
@@ -1684,12 +1777,12 @@ class LangGraphRAGApp:
             merged = []
             seen2 = set()
             for doc, score in figure_results:
-                key = doc.page_content[:80]
+                key = _doc_key(doc)
                 if key not in seen2:
                     seen2.add(key)
                     merged.append((doc, score))
             for doc, score in candidate:
-                key = doc.page_content[:80]
+                key = _doc_key(doc)
                 if key not in seen2:
                     seen2.add(key)
                     merged.append((doc, score))
@@ -1710,8 +1803,12 @@ class LangGraphRAGApp:
         docs = {}
         for qres in per_query_results:
             for rank, (doc, _) in enumerate(qres):
-                key = doc.page_content[:80]
-                docs[key] = doc
+                # 身份去重：曾用 page_content[:80]，在模板化文档上把不同分片误判为重复
+                # （BadCase #9：含答案的 ci=14 被 ci=13 顶掉）。详见 _doc_key 说明。
+                key = _doc_key(doc)
+                # setdefault：同一分片被多个 query 召回时保留**首次**（排名更靠前）那份，
+                # 原先的 docs[key] = doc 是后者覆盖前者，会把高排名结果换成低排名的。
+                docs.setdefault(key, doc)
                 fused[key] = fused.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
         ranked = sorted(fused, key=lambda h: fused[h], reverse=True)
         return [(docs[h], -fused[h]) for h in ranked[:top_k]]
@@ -1867,54 +1964,9 @@ class LangGraphRAGApp:
         if not docs:
             return "未检索到与问题相关的文档内容，无法回答。"
 
-        # 构建上下文：最多 5 个文档，每个截断到 DOC_TRUNCATE 字符。
-        # 带 figure_paths 的文档放宽到 2000 字符，避免 PyPDF 抽取的 caption
-        # （如「I 通信流程图」）落在截断点之后被吃掉，导致 LLM 看不到图上下文。
-        # 同时剥离 chunk 文本里内嵌的 [[FIG:assets/...]] 占位符——
-        # 图由本方法末尾「服务端确定性追加」逻辑统一处理（1581 行起），
-        # 不应出现在喂给 LLM 的正文里，否则 LLM 会把它当噪音或原样吐回答案。
-        import re as _re
-        _FIG_RE = _re.compile(r"\[\[FIG:[^\]]*\]\]")
-
-        def _clean_body(text: str) -> str:
-            return _FIG_RE.sub("", text).strip()
-
-        # 章节优先（B3）：把「与问题同属一个章节」的文档排到最前，
-        # 避免被同文档其他章节（如命令集表格）的噪声带偏。
-        # 匹配规则：doc 的 section_path（"§" 连接）中包含 query 里的连续中文字片段越多，
-        # 优先级越高；query 不含章节名时（如"MCC 是什么"）全部为 0，退化为按原 score 序。
-        _q_segs = [s for s in re.findall(r"[\u4e00-\u9fff]{2,}", query)]
-
-        def _section_priority(doc) -> int:
-            sp = doc.metadata.get("section_path", "") or ""
-            if not sp:
-                return 0
-            return sum(1 for seg in sp.split("§") if any(seg in qseg for qseg in _q_segs))
-
-        docs = sorted(docs, key=lambda d: _section_priority(d[0]), reverse=True)
-
-        # ---- 分级上下文预算（按上面 B3 排序后的名次分配字数）----------------
-        # 旧逻辑是「带图就放宽到 2000 字」，本意只覆盖极少数图页；但 chunker 会把
-        # 整章图片清单透传给该章每一个子 chunk（实测 97% 的 chunk 都带图），
-        # 这条规则等于对全体生效。再叠加 _parse_hits 优先返回整章 parent_content
-        # （中位数 5468 字，子 chunk 自身只有 269 字），上下文直接涨到 8348 字符
-        # / 4000+ token。
-        # 致命后果：Ollama 默认 num_ctx=2048，超出部分**从 prompt 开头静默截断**，
-        # 而 B3 恰好把最相关的章节排在第一位 —— 正确答案第一个被丢掉，模型只剩
-        # 末尾的无关章节可看，于是答成「心跳/补传/GPRS 数传」。
-        # 现在按名次给预算：命中章节给足，旁证给少量，兜底给最少。
-        RANK_BUDGET = (1200, 500, 500, 350, 350)  # 合计 ≈ 2900 字，约 1700 token
-        parts = []
-        top_docs = docs[:5]
-        for i, d in enumerate(top_docs):
-            doc = d[0]
-            src = os.path.basename(doc.metadata.get("source", "未知"))
-            page = doc.metadata.get("page")
-            label = f"[{src} 第{page}页]" if page else f"[{src}]"
-            trunc = RANK_BUDGET[i] if i < len(RANK_BUDGET) else DOC_TRUNCATE
-            body = _clean_body(doc.page_content[:trunc])
-            parts.append(f"{label} {body}")
-        context = "\n\n".join(parts)
+        # 上下文构建抽成模块级 _build_context：把分级预算 + B3 排序 + 方案 A 父窗口回填
+        # 集中在一处，便于检索层回归直接调用（无需构造整个 RAG App）。
+        context, top_docs = _build_context(query, docs)
         # 过滤后上下文仍为空（理论上不会，但做兜底）
         if not context.strip():
             return "未检索到与问题相关的文档内容，无法回答。"

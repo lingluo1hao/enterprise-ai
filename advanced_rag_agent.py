@@ -141,6 +141,35 @@ SEMANTIC_THRESHOLD = 0.80          # 语义匹配阈值（已停用：方案 A �
 CACHE_MAX_SCAN = 500               # 语义查找时最多扫描的缓存条目数（已停用）
 from kb_version import get_kb_version   # 方案乙：缓存键嵌入知识库版本号，文档更新即失效
 
+
+def _doc_key(doc) -> str:
+    """文档去重的**身份标识**（勿再用 page_content 前缀，见 BadCase #9）。
+
+    历史 bug：多处去重曾用 `doc.page_content[:50/:80]`。在模板化的技术文档里这是致命的——
+    实测协议文档中 ci=13 与 ci=14 两个不同子片段的前 80 字**逐字相同**：
+        37 字章节标题前缀（pipeline 拼的）+ 43 字模板协议头 "V4,CMD,seq,HHMMSS,S,latitude..."
+    于是含答案的 ci=14 被判为「重复」丢弃，检索已排 #1 的正确答案在融合阶段凭空消失。
+
+    正确做法（按可靠性降序）：
+      1. Milvus 主键 `_pk`（_parse_hits 已透传）——绝对唯一，首选；
+      2. `source + parent_id + chunk_index`——注意 **chunk_index 是章节内序号**
+         （ingest/chunk.py:466，每章从 0 重新计数），必须带上 parent_id（章节指纹）
+         才唯一，只用 source+chunk_index 会把不同章节的同序号分片误判为重复；
+      3. 全文 md5——metadata 缺失时兜底，用全文而非前缀，避免同样的前缀碰撞。
+    """
+    md = getattr(doc, "metadata", {}) or {}
+    pk = md.get("_pk")
+    if pk is not None and pk != "":
+        return f"pk:{pk}"
+    src = md.get("source") or md.get("file_name") or ""
+    ci = md.get("chunk_index")
+    pid = md.get("parent_id") or ""
+    if src and ci is not None:
+        return f"{src}#{pid}#{ci}"
+    text = getattr(doc, "page_content", "") or ""
+    return "h:" + hashlib.md5(text.encode("utf-8", "ignore")).hexdigest()
+
+
 # ============================================================================
 # 文档访问权限配置
 # ============================================================================
@@ -715,10 +744,26 @@ class VectorStoreManager:
                 # 章节路径（动态字段）：生成侧据此做「章节优先」重排，
                 # 避免同文档他章节的高分噪声把正确章节挤出 top-k
                 "section_path": entity.get("section_path", "") or "",
+                # small-to-big 的父窗口走**旁路**，由生成侧按需展开；
+                # 严禁再顶替 page_content（见下方契约说明）
+                "parent_content": entity.get("parent_content", "") or "",
+                # Milvus 主键：下游去重的唯一可靠身份（_doc_key 首选此字段）。
+                # 不能用 chunk_index 代替——它是章节内序号，跨章节会重复。
+                "_pk": getattr(hit, "id", None),
             }
-            # small-to-big：优先返回父窗口上下文（更完整），
-            # 旧实体无 parent_content 时回退到子片段 content
-            page_content = entity.get("parent_content") or entity.get("content", "")
+            # ===== 检索层出口契约（勿改，改前先读 BadCase #9 报告）=====
+            # page_content 必须**忠实返回命中的那一段**（子片段 content）。
+            # 曾经这里写成 `parent_content or content`（就地覆盖成整章父文本），
+            # 出发点是 small-to-big「父窗口回传 LLM」，但 page_content 并非只喂 LLM，
+            # 它同时是去重 key / reranker 输入 / 预算截断对象，一改全崩：
+            #   ① 去重坍缩：langgraph_rag_agent 用 page_content[:80] 做 key，
+            #      同章所有子片段共享同一份 parent_content → 前 80 字全同 → 同章只活 1 条
+            #   ② 精排失灵：cross-encoder 在 5000+ 字整章上打分，实测相关性分全线转负
+            #   ③ 截断错位：RANK_BUDGET 按子片段尺寸（~400 字）设计，对整章只截到前 1200 字
+            #   ④ 放大器：parent_content 入库时被 _trunc_bytes 按 8192 字节硬截断，
+            #      长章节的答案在写库那一刻就已丢失（P1 待修）
+            # 任何"上下文扩展"属于生成层职责，一律走 metadata["parent_content"] 旁路。
+            page_content = entity.get("content", "") or entity.get("parent_content", "") or ""
             out.append((
                 hit.id,
                 Document(page_content=page_content[:8192], metadata=meta),
@@ -1272,10 +1317,10 @@ class DocSearchSkill(BaseSkill):
         # 合并并去重
         seen_keys = set()
         for doc, _ in first_hop:
-            seen_keys.add(doc.page_content[:50])
+            seen_keys.add(_doc_key(doc))
 
         for doc, dist in extra_hop:
-            key = doc.page_content[:50]
+            key = _doc_key(doc)
             if key not in seen_keys:
                 seen_keys.add(key)
                 first_hop.append((doc, dist))
@@ -1299,8 +1344,8 @@ class DocSearchSkill(BaseSkill):
                     q, k=top_k, filter_role=self.user_role,
                     user_id=self.user, tenant_id=self.tenant_id)
                 for doc, distance in results:
-                    # 用内容前50字符作为去重键
-                    key = doc.page_content[:50]
+                    # 身份去重（来源+分片序号）；曾用内容前 50 字，模板化文档会误杀，见 _doc_key
+                    key = _doc_key(doc)
                     if key not in seen_contents:
                         seen_contents.add(key)
                         all_results.append((doc, distance))

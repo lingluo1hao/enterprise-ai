@@ -179,9 +179,16 @@ class IngestPipeline:
                 # 租户从文件相对 folder 的路径推断：首层子目录即租户名（knowledge/{tenant}/x.pdf），
                 # 平铺文件（knowledge/x.pdf）归 default。拥有者一律取 pipeline 构造时传入的 user_id。
                 tenant = self._derive_tenant(norm_source)
+                # 把最近章节标题作为语义锚点拼到 chunk content 开头喂给 bge-m3。
+                # 否则子 chunk 主体常是命令字符串/表格混杂（例 yh 协议 pdf 第 8 页"产品有4 种工作模式"答案
+                # 子 chunk 主体是 V4/S23 服务器命令 + 实际工作模式说明），bge-m3 平均池化后会把它判成
+                # "服务器指令文档"，与 query "工作模式" 语义距很远，dense ranking 把它拖到 30+，hybrid
+                # RRF 综合时即使 BM25 把答案排第 1 也救不回来。标题前缀使 dense 方向对齐 query。
+                section_title = " | ".join(c.section_path) if c.section_path else ""
+                content_text = ((section_title + "\n\n") + c.text) if section_title else c.text
                 entities.append({
                     "chunk_id": cid,
-                    "content": _trunc_bytes(c.text),
+                    "content": _trunc_bytes(content_text),
                     "dense": vec,
                     "file_path": norm_source,
                     "file_name": c.file_name,

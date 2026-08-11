@@ -322,7 +322,25 @@ def _load_pdf(path: str) -> Optional[list]:
                     txt = b[4].strip()
                     if not txt:
                         continue
-                    if any(bbox.intersects(t["bbox"]) for t in tables):
+                    # 文字块要不要跳过，**必须看文字本身**是不是这个表的 cell 内容。
+                    # 之前用 "bbox 相交且 md 非空就跳过" 在 yh 协议 PDF 第 8 页误伤：fitz find_tables()
+                    # 把"命令集 S23 服务器指令"识别成跨整页的大表 bbox(84.6,188.8 → 728.0,837.9)，
+                    # 表 md 还是有内容（1065 字符），但 bbox 越过表实际范围、把下面的「2.2 工作模式设置：
+                    # MODE / 产品有4 种工作模式…」整节正文也圈了进去，按旧逻辑会被当表内文字吞掉。
+                    # 这里改为：文字块 bbox 与某表相交 **且** 该文字确实出现在该表的 cell 文本/md 中，才跳过；
+                    # 否则一律保留正文（真表内 cell 文字几乎都出现在 md 里，绝不会误伤）。
+                    _skip_block = False
+                    for t in tables:
+                        if not bbox.intersects(t["bbox"]):
+                            continue
+                        md_text = t.get("md") or ""
+                        if not md_text.strip():
+                            continue
+                        # 短 cell 直接包含（如 "格式"）；长 cell 用首 16 字符前缀匹配（避免 memory hits）
+                        if txt in md_text:
+                            _skip_block = True
+                            break
+                    if _skip_block:
                         continue
                     max_font = 0.0
                     if bi < len(dict_blocks):

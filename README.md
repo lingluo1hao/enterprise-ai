@@ -410,7 +410,7 @@ cp .env.example .env
 # RAG 检索增强（默认已开启，reranker 两阶段精排）
 RERANK_ENABLED=true
 RERANK_URL=http://<RERANK_HOST>:11436/v1/rerank
-RERANK_TIMEOUT=180     # 精排超时（秒）：CPU 上 20 候选 × 3000 字偏重，给足余量
+RERANK_TIMEOUT=45      # 精排超时（秒）：不可超过 Gunicorn 超时/(RERANK_RETRIES+1)，否则重试还没跑完网关先断
 
 ### 5.9 启动 Web 服务
 

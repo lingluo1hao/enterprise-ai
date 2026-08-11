@@ -52,8 +52,13 @@ def _parse_hits(hits):
             "page": e.get("page", None), "chunk_type": e.get("chunk_type", "prose"),
             "figure_paths": list(e.get("figure_paths") or []),
             "section_path": e.get("section_path", "") or "",
+            "parent_content": e.get("parent_content", "") or "",
+            "_pk": getattr(hit, "id", None),
         }
-        page_content = e.get("parent_content") or e.get("content", "")
+        # 必须与 advanced_rag_agent._parse_hits 的出口契约保持一致：
+        # 返回命中的子片段本身，父窗口只走 metadata 旁路。
+        # 否则评测脚本会绕开线上真实行为，测出「假绿」（BadCase #9 教训）。
+        page_content = e.get("content", "") or e.get("parent_content", "") or ""
         out.append((hit.id, Document(page_content=page_content[:8192], metadata=meta),
                     float(getattr(hit, "distance", 0.0))))
     return out
