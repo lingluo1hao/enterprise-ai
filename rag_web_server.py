@@ -1196,6 +1196,12 @@ def api_feedback():
             diagnosis=f"用户点踩（tenant={user.get('tenant_id','default')}），待 triage。",
             status="open",
         )
+
+    # 静默失败防护：记忆层写入失败时明确报错，避免前端误判成功
+    if fb_id == -1:
+        return jsonify({"ok": False, "error": "反馈写入失败（记忆层不可用）"}), 503
+    if rating == -1 and bad_case_id == -1:
+        return jsonify({"ok": False, "error": "点踩已记录，但 Bad Case 写入失败（记忆层不可用）"}), 503
     return jsonify({"ok": True, "feedback_id": fb_id, "bad_case_id": bad_case_id})
 
 
@@ -3367,19 +3373,24 @@ async function fbVote(btn, rating){
   const bar=btn.parentElement; if(bar.getAttribute('data-voted')) return;
   const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
   try{
-    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:rating})});
+    const resp=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:rating})});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok || data.ok===false){ throw new Error('HTTP '+resp.status); }
     bar.setAttribute('data-voted','1');
-    if(rating>0){ bar.querySelector('.fb-up').classList.add('on'); }
+    if(rating>0){ bar.querySelector('.fb-up').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记录反馈'; }
     else { bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）'; }
-  }catch(e){ console.error(e); }
+  }catch(e){ console.error(e); bar.querySelector('.fb-tip').textContent='反馈失败，请重试'; }
 }
 async function fbText(btn){
   const bar=btn.parentElement; const txt=prompt('请描述问题（可选）：',''); if(txt===null) return;
   const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
+  if(bar.getAttribute('data-voted')) return;
   try{
-    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:-1,feedback_text:txt})});
+    const resp=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:-1,feedback_text:txt})});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok || data.ok===false){ throw new Error('HTTP '+resp.status); }
     bar.setAttribute('data-voted','1'); bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）';
-  }catch(e){ console.error(e); }
+  }catch(e){ console.error(e); bar.querySelector('.fb-tip').textContent='反馈失败，请重试'; }
 }
 
 async function askQA() {
@@ -5242,19 +5253,24 @@ async function fbVote(btn, rating){
   const bar=btn.parentElement; if(bar.getAttribute('data-voted')) return;
   const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
   try{
-    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:rating})});
+    const resp=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:rating})});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok || data.ok===false){ throw new Error('HTTP '+resp.status); }
     bar.setAttribute('data-voted','1');
-    if(rating>0){ bar.querySelector('.fb-up').classList.add('on'); }
+    if(rating>0){ bar.querySelector('.fb-up').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记录反馈'; }
     else { bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）'; }
-  }catch(e){ console.error(e); }
+  }catch(e){ console.error(e); bar.querySelector('.fb-tip').textContent='反馈失败，请重试'; }
 }
 async function fbText(btn){
   const bar=btn.parentElement; const txt=prompt('请描述问题（可选）：',''); if(txt===null) return;
   const query=bar.getAttribute('data-query')||''; const answer=bar.getAttribute('data-answer')||'';
+  if(bar.getAttribute('data-voted')) return;
   try{
-    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:-1,feedback_text:txt})});
+    const resp=await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+fbToken()},body:JSON.stringify({query:query,answer:answer,rating:-1,feedback_text:txt})});
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok || data.ok===false){ throw new Error('HTTP '+resp.status); }
     bar.setAttribute('data-voted','1'); bar.querySelector('.fb-down').classList.add('on'); bar.querySelector('.fb-tip').textContent='已记入 Bad Case（open）';
-  }catch(e){ console.error(e); }
+  }catch(e){ console.error(e); bar.querySelector('.fb-tip').textContent='反馈失败，请重试'; }
 }
 
 function addAssistantMessage(text, query) {
