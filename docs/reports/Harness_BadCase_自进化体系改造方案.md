@@ -180,7 +180,7 @@ root_cause, diagnosis, status, resolved_by, created_at, resolved_at
 |---|---|---|
 | GET | `/api/admin/bad_cases` | 列表，支持 `?status=open` / `?root_cause=R5` 筛选，仅管理员 |
 | PATCH | `/api/admin/bad_cases/<id>` | 更新 `status` / `diagnosis` / `expected`；`status=resolved` 自动写 `resolved_at` |
-| POST | `/api/feedback` | 点踩自动沉淀 bad case |
+| POST | `/api/feedback` | 点踩自动沉淀 bad case；记忆层异常时返回 `{ok:false}` + 503，前端提示重试 |
 
 ## 五、怎么用（闭环）
 
@@ -316,7 +316,7 @@ root_cause, diagnosis, status, resolved_by, created_at, resolved_at
 | reranker L2 看门狗 | 命令已给，待贴 VM（cron 探活重启） | 待 VM 在线执行 |
 | 答案层修复后实测 | 4 误判已单测验证；4 幻觉待答案层重跑确认 | 待 VM 在线重跑 |
 
-> 所有代码改动**仅留工作区，未 git 提交**（守用户规矩）。
+> 核心修复已提交：`afc2c4d`（#9 检索/生成闭环）、`aab4f58`（反馈接口静默失败防护）。
 
 ---
 
