@@ -1643,6 +1643,9 @@ def api_docs_upload():
         tenant = my_tenant  # 非超级管理员只能落到自己租户
     if not tenant:
         tenant = "default"
+    if len(tenant) > 64 or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for ch in tenant):
+        return jsonify({"error": "非法租户名"}), 400
+
 
     access_level = request.form.get("access_level", "public")
     if access_level not in ("public", "restricted"):
@@ -1655,7 +1658,11 @@ def api_docs_upload():
     if ext not in SUPPORTED_UPLOAD_EXT:
         return jsonify({"error": f"不支持的格式：{ext}"}), 400
 
-    dest_dir = os.path.join(DOC_FOLDER, tenant)
+    dest_dir = os.path.abspath(os.path.join(DOC_FOLDER, tenant))
+    doc_root = os.path.abspath(DOC_FOLDER)
+    if os.path.commonpath([doc_root, dest_dir]) != doc_root:
+        return jsonify({"error": "非法路径"}), 400
+
     os.makedirs(dest_dir, exist_ok=True)
     filename = _kb_safe_name(f.filename)
     save_path = os.path.join(dest_dir, filename)

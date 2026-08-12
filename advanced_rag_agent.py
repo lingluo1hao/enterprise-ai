@@ -236,6 +236,13 @@ _ctx_cache_role = contextvars.ContextVar("cache_current_role", default=DEFAULT_R
 _ctx_cache_tenant = contextvars.ContextVar("cache_current_tenant", default="global")
 
 
+# ---- legacy RAGOrchestrator 请求级上下文变量（P0-2）----
+# 与 LangGraph 入口同构：user / user_role 做成 ContextVar 属性，
+# gthread 每线程独立 Context，请求间不再互相覆盖（防普通用户拿到 admin 角色）。
+_ctx_orch_user = contextvars.ContextVar("rag_orch_user", default="anonymous")
+_ctx_orch_user_role = contextvars.ContextVar("rag_orch_user_role", default=DEFAULT_ROLE)
+
+
 class CacheManager:
     """
     Redis 智能缓存管理器
@@ -614,6 +621,43 @@ class VectorStoreManager:
     # ------------------------------------------------------------------ #
     # Milvus 后端
     # ------------------------------------------------------------------ #
+
+    def _probe_rebuild_needed(self, retries: int = 3, base_wait: float = 1.0) -> bool:
+        """describe_collection 重试探测（P0-1 数据保全）。
+
+        返回 True  = schema 确认不满足最新要求（需要重建）
+        返回 False = schema 已满足，无需重建
+        重试耗尽仍失败 → 抛 RuntimeError（fail-fast），绝不带着 schema 未知进入 drop。
+        """
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                desc = self.client.describe_collection(self.collection)
+                fields = desc.get("fields", [])
+                existing = [f.get("name") for f in fields]
+                dense_field = next((f for f in fields if f.get("name") == "dense"), None)
+                existing_dim = None
+                if dense_field:
+                    existing_dim = dense_field.get("params", {}).get("dim") or dense_field.get("dim")
+                dim = len(self._embed.embed_query("维度探测"))
+                if "sparse" in existing and existing_dim == dim and "tenant_id" in existing:
+                    return False
+                reason = ("维度不匹配" if existing_dim != dim
+                          else ("缺 tenant_id 字段" if "tenant_id" not in existing
+                                else "无 sparse 字段"))
+                print(f"[VectorStore] 检测到集合需重建({reason}: 现有 dim={existing_dim}, 新 dim={dim})")
+                return True
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt < retries:
+                    wait = base_wait * (2 ** (attempt - 1))
+                    print(f"[VectorStore] ⚠ describe 第 {attempt} 次失败，{wait:.0f}s 后重试: {e}")
+                    time.sleep(wait)
+        raise RuntimeError(
+            f"[VectorStore] describe_collection 重试 {retries} 次仍失败，"
+            f"集合 {self.collection} 状态未知，拒绝 drop 重建（数据保全）: {last_err}"
+        ) from last_err
+
     def _ensure_collection(self):
         """集合不存在则按 dense + sparse(BM25) 混合 schema 创建并建立索引。
 
@@ -640,9 +684,15 @@ class VectorStoreManager:
                           else ("缺 tenant_id 字段" if "tenant_id" not in existing
                                 else "无 sparse 字段"))
                 print(f"[VectorStore] 检测到集合需重建({reason}: 现有 dim={existing_dim}, 新 dim={dim})，重建以支持混合检索与多租户分区...")
-            except Exception:
-                pass
-            self.client.drop_collection(self.collection)
+            except Exception as describe_err:
+                # P0-1：describe 瞬时错误（网络抖动/服务重启）绝不能进入 drop 分支——
+                # gunicorn 4 进程并发初始化时，一个瞬时错误就可能把 rag_docs 误删重建。
+                # 改为重试探测：schema 已满足则跳过重建，重试耗尽则 fail-fast 启动失败。
+                print(f"[VectorStore] ⚠ describe_collection 异常，转入重试探测: {describe_err}")
+                if not self._probe_rebuild_needed():
+                    return
+            if self.client.has_collection(self.collection):
+                self.client.drop_collection(self.collection)
 
         fields = [
             # content 必须开启 analyzer（且中文分词），BM25 函数才能基于它生成 sparse 向量
@@ -1114,6 +1164,25 @@ class DocSearchSkill(BaseSkill):
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.tenant_id = tenant_id  # 当前用户所属租户，用于检索下推隔离
 
+    # ------------------------------------------------------------------
+    # 请求级上下文属性（P0-2）：读写语法不变，底层 ContextVar，并发不串
+    # ------------------------------------------------------------------
+    @property
+    def user_role(self) -> str:
+        return _ctx_orch_user_role.get()
+
+    @user_role.setter
+    def user_role(self, value: str):
+        _ctx_orch_user_role.set(value)
+
+    @property
+    def user(self) -> str:
+        return _ctx_orch_user.get()
+
+    @user.setter
+    def user(self, value: str):
+        _ctx_orch_user.set(value)
+
     def execute(self, query: str) -> str:
         """执行智能 RAG 检索流程"""
         # 参数安全校验
@@ -1542,6 +1611,15 @@ Final Answer: [你的回答]"""
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.max_steps = max_steps  # 防止无限循环（通常2步足够：搜索→回答）
 
+    # 请求级上下文属性（P0-2）：token 归因 user 走 ContextVar，并发不串
+    @property
+    def user(self) -> str:
+        return _ctx_orch_user.get()
+
+    @user.setter
+    def user(self, value: str):
+        _ctx_orch_user.set(value)
+
     def run(self, task: str) -> Tuple[str, List[ReActStep]]:
         """
         执行 ReAct 循环来完成子任务
@@ -1748,6 +1826,15 @@ class PlanningAgent:
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.react_agent = ReActAgent(llm, skill_registry, max_steps=max_steps)
 
+    # 请求级上下文属性（P0-2）：token 归因 user 走 ContextVar，并发不串
+    @property
+    def user(self) -> str:
+        return _ctx_orch_user.get()
+
+    @user.setter
+    def user(self, value: str):
+        _ctx_orch_user.set(value)
+
     def plan(self, user_query: str) -> List[SubTask]:
         """
         将用户问题拆解为子任务列表
@@ -1910,6 +1997,7 @@ class RAGOrchestrator:
         self.vector_db = vector_db
         self.fast_mode = fast_mode
         self.user_role = user_role
+        self._base_role = user_role     # P0-2：固定基准角色（不可变），供请求线程缺省回退
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.cache = cache or CacheManager()  # 默认自动连接 Redis，连不上则跳过
 
@@ -1936,6 +2024,25 @@ class RAGOrchestrator:
         print(f"[系统] 当前用户角色: {user_role}（{role_desc}）")
         print("[系统] 初始化完成\n")
 
+    # ------------------------------------------------------------------
+    # 请求级上下文属性（P0-2）：读写语法不变，底层 ContextVar，并发不串
+    # ------------------------------------------------------------------
+    @property
+    def user_role(self) -> str:
+        return _ctx_orch_user_role.get()
+
+    @user_role.setter
+    def user_role(self, value: str):
+        _ctx_orch_user_role.set(value)
+
+    @property
+    def user(self) -> str:
+        return _ctx_orch_user.get()
+
+    @user.setter
+    def user(self, value: str):
+        _ctx_orch_user.set(value)
+
     def query(self, user_question: str, user_role: str = None,
               user: str = None) -> str:
         """
@@ -1952,26 +2059,24 @@ class RAGOrchestrator:
         :param user: 可选，调用方标识，用于把本次问答的 token 用量归因给用户，
                      支撑「用户查自己的历史消耗」（默认 anonymous）
         """
-        # 把 user 透传到所有子 Agent，让每处 LLM 调用都带上归因
-        if user:
-            self.user = user
-            self.planning_agent.user = user
-            if getattr(self.planning_agent, "react_agent", None):
-                self.planning_agent.react_agent.user = user
-            doc_skill = self.skill_registry.get_skill("doc_search")
-            if doc_skill:
-                doc_skill.user = user
-
-        # 如果传入了 user_role，临时切换角色
-        if user_role and user_role != self.user_role:
-            self.user_role = user_role
-            self.cache.current_role = user_role
-            # 更新 DocSearchSkill 的角色
-            doc_skill = self.skill_registry.get_skill("doc_search")
-            if doc_skill:
-                doc_skill.user_role = user_role
-            role_desc = AccessControlFilter.get_role_description(user_role)
+        # P0-2：user / user_role 均为 ContextVar 属性，只写当前请求线程上下文，
+        # gthread 并发下不再互相覆盖（此前普通用户可能拿到 admin 角色）。
+        if not user_role:
+            user_role = getattr(self, "_base_role", DEFAULT_ROLE)
+        self.user_role = user_role
+        self.user = user or "anonymous"
+        for _agent in (self.planning_agent, getattr(self.planning_agent, "react_agent", None)):
+            if _agent is not None:
+                _agent.user = self.user
+        doc_skill = self.skill_registry.get_skill("doc_search")
+        if doc_skill:
+            doc_skill.user = self.user
+            doc_skill.user_role = user_role
+        self.cache.current_role = user_role
+        role_desc = AccessControlFilter.get_role_description(user_role)
+        if user_role != getattr(self, "_base_role", DEFAULT_ROLE):
             print(f"\n[系统] 已切换用户角色: {user_role}（{role_desc}）")
+
 
         total_start = time.time()
 

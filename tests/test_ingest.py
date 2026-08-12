@@ -21,9 +21,9 @@ from ingest.pipeline import IngestPipeline
 from ingest.store import MemoryStoreBackend
 from ingest.fingerprint import compute_fingerprint, ManifestStore, diff_fingerprints
 from ingest.loaders import load_file, get_access_level
-from ingest.chunk import chunk_documents, StructureAwareChunker
+from ingest.chunk import chunk_documents, StructureAwareChunker, _extract_figure_blocks
 from ingest.embed import BatchEmbedder
-from ingest.types import RawDoc
+from ingest.types import RawDoc, Chunk
 
 PASS = 0
 FAIL = 0

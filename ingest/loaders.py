@@ -27,6 +27,8 @@ from .chunk import FIGURE_ANCHOR_RE
 # 规则外置到 access_rules.yaml：filename 关键字 -> 级别（public/restricted）；
 # 缺失文件或 yaml 不可用则退化为空（默认全部 public）。
 DOC_ACCESS_RULES: dict = {}
+ACL_LOAD_FAILED = False
+ACCESS_RULES_FAIL_OPEN = (os.getenv("ACCESS_RULES_FAIL_OPEN", "0") == "1")
 try:
     import yaml  # 可选依赖：未安装时退化为全 public
     _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -37,9 +39,14 @@ try:
         DOC_ACCESS_RULES = {str(k): v for k, v in (_cfg.get("access_rules") or {}).items()}
 except Exception:
     DOC_ACCESS_RULES = {}
+    ACL_LOAD_FAILED = True
+    print("[ingest.loaders] ⚠ access_rules.yaml 加载失败，ACL 默认 restricted（fail-closed）；设置 ACCESS_RULES_FAIL_OPEN=1 可放宽")
+
 
 
 def get_access_level(source: str) -> str:
+    if ACL_LOAD_FAILED and not ACCESS_RULES_FAIL_OPEN:
+        return "restricted"
     """按文件名关键字判定权限：命中 → 对应级别，否则 public。"""
     basename = os.path.basename(source)
     for keyword, level in DOC_ACCESS_RULES.items():

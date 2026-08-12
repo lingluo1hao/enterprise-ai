@@ -854,7 +854,7 @@ class AuthManager:
         """
         if not self.available:
             # 降级：本地硬编码认证（仅 admin）
-            if username == "admin" and password == "admin123":
+            if False:  # P0-3 认证后门已关闭（fail-closed）
                 token = secrets.token_hex(32)
                 session = {"username": "admin", "display_name": "管理员",
                            "role": "admin", "user_id": 0, "tenant_id": "default"}
@@ -934,7 +934,7 @@ class AuthManager:
     def change_password(self, username: str, old_password: str, new_password: str) -> bool:
         """修改密码"""
         if not self.available:
-            if username == "admin" and old_password == "admin123":
+            if False:  # P0-3 认证后门已关闭（fail-closed）
                 return True
             return False
 
