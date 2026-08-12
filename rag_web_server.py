@@ -844,6 +844,109 @@ def api_figures(subpath):
                                max_age=3600)
 
 
+# ====================================================================== #
+# 图片水印（admin 专用：上传图片 + 斜铺水印，存 knowledge/pic）
+# ====================================================================== #
+PIC_DIR = os.path.join(DOC_FOLDER, "pic")
+
+
+@app.route("/api/admin/watermark", methods=["POST"])
+def api_admin_watermark():
+    """管理员上传图片并生成斜铺水印图，存到 knowledge/pic（不存在自动创建）。"""
+    denied = _require_admin()
+    if denied:
+        return denied
+    if "file" not in request.files:
+        return jsonify({"error": "缺少图片文件"}), 400
+    f = request.files["file"]
+    text = (request.form.get("text") or "").strip()
+    date = (request.form.get("date") or "").strip()
+    if not text:
+        return jsonify({"error": "水印文字不能为空"}), 400
+    if not f.filename:
+        return jsonify({"error": "无效文件"}), 400
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+        return jsonify({"error": "仅支持 png/jpg/jpeg/webp/bmp 图片"}), 400
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        img = Image.open(f.stream).convert("RGBA")
+        W, H = img.size
+        # 字体：优先微软雅黑（含中文），缺失则回退默认，保证中文不方块
+        try:
+            font = ImageFont.truetype(
+                "C:/Windows/Fonts/msyh.ttc",
+                max(13, int(min(W, H) * 0.028)),
+            )
+        except Exception:
+            font = ImageFont.load_default()
+        content = text
+        if date:
+            # 自定义模式：日期追加到最后一行（保留多行能力）
+            parts = content.split("\n")
+            parts[-1] = f"{parts[-1]} · {date}"
+            content = "\n".join(parts)
+        lines = content.split("\n")
+        # 透明水印层放大到 2 边距，旋转后仍能铺满整图
+        pad = max(W, H)
+        layer = Image.new("RGBA", (W + 2 * pad, H + 2 * pad), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        # 计算每行宽度与统一行高（支持多行水印）
+        bboxes = [d.textbbox((0, 0), ln, font=font) for ln in lines]
+        tw = max((b[2] - b[0]) for b in bboxes) if bboxes else 0
+        th = max((b[3] - b[1]) for b in bboxes) if bboxes else 0
+        line_gap = max(4, int(th * 0.3))
+        block_h = th * len(lines) + line_gap * (len(lines) - 1)
+        step_x = tw + max(15, int(W * 0.05))
+        step_y = block_h + max(15, int(H * 0.05))
+        # 网格双重绘制：深灰阴影 + 半透明白主色，任意背景可读
+        for yy in range(0, layer.size[1], step_y):
+            for xx in range(0, layer.size[0], step_x):
+                y_off = 0
+                for ln in lines:
+                    d.text((xx + 2, yy + 2 + y_off), ln, font=font, fill=(40, 40, 40, 110))
+                    d.text((xx, yy + y_off), ln, font=font, fill=(255, 255, 255, 90))
+                    y_off += th + line_gap
+        # 旋转 -30° 实现斜铺
+        layer = layer.rotate(-30, expand=True, resample=Image.BICUBIC)
+        lw, lh = layer.size
+        layer = layer.crop(((lw - W) // 2, (lh - H) // 2,
+                            (lw - W) // 2 + W, (lh - H) // 2 + H))
+        # 合成到原图
+        base = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        base.alpha_composite(img)
+        base.alpha_composite(layer)
+        os.makedirs(PIC_DIR, exist_ok=True)
+        out_name = f"{os.path.splitext(f.filename)[0]}_watermark.png"
+        base.convert("RGB").save(os.path.join(PIC_DIR, out_name), "PNG")
+        rel = f"pic/{out_name}"
+        try:
+            get_audit_logger().log(action="watermark", target=rel,
+                                   result="success", detail=f"生成水印图 {rel}")
+        except Exception:
+            pass
+        return jsonify({"success": True, "url": f"/api/pic/{out_name}", "file": rel})
+    except Exception as e:
+        return jsonify({"error": f"生成失败：{e}"}), 500
+
+
+@app.route("/api/pic/<path:filename>", methods=["GET"])
+def api_pic(filename):
+    """安全返回 knowledge/pic 下的水印图（仅 png，防路径穿越）。"""
+    if not filename.lower().endswith(".png"):
+        return jsonify({"error": "only png allowed"}), 404
+    safe = safe_join(PIC_DIR, filename.replace("\\", "/"))
+    if not safe or not os.path.isfile(safe):
+        return jsonify({"error": "not found"}), 404
+    safe_abs = os.path.abspath(safe)
+    if not safe_abs.startswith(os.path.abspath(PIC_DIR)):
+        return jsonify({"error": "forbidden"}), 403
+    return send_from_directory(os.path.dirname(safe_abs),
+                               os.path.basename(safe_abs),
+                               mimetype="image/png",
+                               max_age=3600)
+
+
 @app.route("/api/me", methods=["GET"])
 def api_me():
     """返回当前登录用户信息（任意已登录角色）。前端据此恢复会话、判断特权。"""
@@ -2688,6 +2791,7 @@ _ADMIN_PAGE = r"""
     <div class="tab" data-tab="usage" onclick="switchTab('usage')">📊 Token 用量</div>
     <div class="tab" data-tab="kb" onclick="switchTab('kb')">📚 知识库</div>
     <div class="tab" data-tab="users" id="tabUsersBtn" style="display:none" onclick="switchTab('users')">👥 用户管理</div>
+    <div class="tab" data-tab="watermark" onclick="switchTab('watermark')">🖼️ 图片水印</div>
   </div>
   <div class="app-content">
     <!-- Prompt Management Tab -->
@@ -2812,6 +2916,50 @@ _ADMIN_PAGE = r"""
       </div>
       <div id="usersMsg" class="kb-msg"></div>
       <div id="usersErr" class="kb-err"></div>
+    </div>
+
+    <!-- ===== 图片水印面板 ===== -->
+    <div id="tabWatermark" class="tab-panel">
+      <div class="toolbar">
+        <div>
+          <h2>🖼️ 图片加水印</h2>
+          <p class="sub">上传图片并填写水印文字/日期，生成斜铺整图的水印图，自动存入 knowledge/pic 目录。</p>
+        </div>
+      </div>
+      <div style="display:flex;gap:24px;flex-wrap:wrap;flex:1;overflow:auto">
+        <div style="flex:1;min-width:300px;max-width:420px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px">
+          <div class="form-group">
+            <label>① 选择图片</label>
+            <input type="file" id="wmFile" accept="image/*">
+          </div>
+          <div class="form-group">
+            <label>② 水印模板</label>
+            <select id="wmPreset" onchange="applyPreset()">
+              <option value="preset" selected>🛡️ 证件/身份证专用（推荐）</option>
+              <option value="outsource">🏢 外包公司入职专用</option>
+              <option value="custom">✏️ 自定义输入</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>③ 水印文字</label>
+            <textarea id="wmText" rows="3" placeholder="如：企业机密 · 请勿外传" style="width:100%;font:inherit;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-2);color:var(--text-1);box-sizing:border-box;resize:vertical"></textarea>
+            <small style="color:var(--text-3);font-size:11px">预设模板请替换【公司全称】为实际公司工商全称，可自由增删文字。</small>
+          </div>
+          <div class="form-group">
+            <label>④ 水印日期</label>
+            <input type="date" id="wmDate">
+            <small id="wmDateHint" style="color:var(--text-3);font-size:11px"></small>
+          </div>
+          <button class="btn btn-primary" id="wmBtn" onclick="generateWatermark()">🔆 生成水印图片</button>
+          <div id="wmMsg" class="kb-msg" style="margin-top:10px"></div>
+          <div id="wmErr" class="kb-err" style="margin-top:6px"></div>
+        </div>
+        <div style="flex:1;min-width:300px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;display:flex;flex-direction:column;align-items:center;justify-content:center">
+          <div id="wmPreviewWrap" style="color:var(--text-3);font-size:13px">预览区（生成后显示）</div>
+          <img id="wmPreview" style="display:none;max-width:100%;max-height:420px;border:1px solid var(--border);border-radius:var(--radius-sm);margin-top:12px">
+          <a id="wmDownload" class="btn btn-outline" style="display:none;margin-top:14px" download>⬇️ 下载水印图</a>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -3010,6 +3158,73 @@ function switchTab(name) {
   if (name === 'usage') loadAdminUsage();
   if (name === 'kb') loadKb();
   if (name === 'users') loadUsers();
+  if (name === 'watermark') applyPreset();
+}
+
+function applyPreset() {
+  const sel = document.getElementById('wmPreset');
+  const textEl = document.getElementById('wmText');
+  const dateEl = document.getElementById('wmDate');
+  const hint = document.getElementById('wmDateHint');
+  const mode = sel ? sel.value : 'preset';
+  const pad = n => String(n).padStart(2, '0');
+  const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const fmtCn = d => `${d.getFullYear()} 年 ${pad(d.getMonth()+1)} 月 ${pad(d.getDate())} 日`;
+  if (mode === 'preset') {
+    const exp = new Date(); exp.setDate(exp.getDate() + 15);
+    textEl.value = `仅限【公司全称】入职身份核验使用\n不作其他任何用途・再次复印无效\n有效期至：${fmtCn(exp)}`;
+    dateEl.value = '';
+    dateEl.disabled = true;
+    if (hint) hint.textContent = '预设模板已内嵌有效期（提交日+15天）；如需调整请直接改上方文字。';
+  } else if (mode === 'outsource') {
+    const exp = new Date(); exp.setDate(exp.getDate() + 15);
+    textEl.value = `仅限【公司名词】入职身份核验使用\n不作其他任何用途・再次复印无效\n有效期至：${fmtCn(exp)}`;
+    dateEl.value = '';
+    dateEl.disabled = true;
+    if (hint) hint.textContent = '外包公司模板已填示例「公司名词」，请替换为实际签约公司工商全称。';
+  } else {
+    textEl.value = '';
+    dateEl.value = fmt(new Date());
+    dateEl.disabled = false;
+    if (hint) hint.textContent = '自定义模式：日期将作为「 · 日期」追加到水印文字之后。';
+  }
+}
+
+async function generateWatermark() {
+  const fileEl = document.getElementById('wmFile');
+  const textEl = document.getElementById('wmText');
+  const dateEl = document.getElementById('wmDate');
+  const msg = document.getElementById('wmMsg');
+  const err = document.getElementById('wmErr');
+  const btn = document.getElementById('wmBtn');
+  const preview = document.getElementById('wmPreview');
+  const wrap = document.getElementById('wmPreviewWrap');
+  const dl = document.getElementById('wmDownload');
+  msg.textContent = ''; err.textContent = '';
+  if (!fileEl.files || !fileEl.files[0]) { err.textContent = '请先选择图片'; return; }
+  if (!textEl.value.trim()) { err.textContent = '请填写水印文字'; return; }
+  btn.disabled = true; btn.textContent = '⏳ 生成中…';
+  try {
+    const fd = new FormData();
+    fd.append('file', fileEl.files[0]);
+    fd.append('text', textEl.value.trim());
+    fd.append('date', dateEl.value || '');
+    const r = await fetch('/api/admin/watermark', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + (localStorage.getItem('admin_token') || '') }, body: fd
+    });
+    const data = await r.json();
+    if (!r.ok || !data.success) throw new Error(data.error || ('HTTP ' + r.status));
+    preview.src = data.url + '?t=' + Date.now();
+    preview.style.display = 'block';
+    wrap.style.display = 'none';
+    dl.href = data.url;
+    dl.style.display = 'inline-flex';
+    msg.textContent = '✅ 已生成：' + data.file + '（已存入 knowledge/pic）';
+  } catch (e) {
+    err.textContent = '生成失败：' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = '🔆 生成水印图片';
+  }
 }
 
 // ===== Token 用量看板 =====

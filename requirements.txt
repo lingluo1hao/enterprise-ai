@@ -1,0 +1,40 @@
+# ============================================================
+# Enterprise-AI · Python 依赖清单 (requirements.txt)
+# 运行环境：Python 3.10+（生产 VM：anaconda py310；本地开发：Python 3.13）
+# 设计原则：所有第三方依赖均为「懒加载 / 可降级」。
+#           缺失某个可选依赖时，对应功能（特定文档格式、MCP、物料脚本）
+#           自动跳过，不拖垮核心检索 / 问答链路。
+# 版本锁定：本文件只列「直接依赖」与最小版本下限。生产部署请在已验证环境执行
+#          `pip freeze > requirements.lock.txt` 锁定完整可复现版本。
+# ============================================================
+
+# ---------- Web 服务 & 网关 ----------
+Flask>=3.0
+gunicorn>=21.0
+Werkzeug>=3.0          # Flask 已间接依赖，显式列出便于安全审计（safe_join 等接口）
+
+# ---------- 向量库 & 缓存 ----------
+pymilvus>=2.5          # 2.5+ 才提供 BM25 稀疏检索 / Function(FunctionType) 接口
+redis>=5.0
+
+# ---------- LLM / Agent 编排 ----------
+langgraph              # 主 Agent 状态图（StateGraph / START / END）
+langchain-community    # 文档 loader：PyPDFLoader / Docx2txtLoader / BSHTMLLoader / TextLoader
+fastmcp                # MCP Server 模块（mcp_server.py），按需启动
+
+# ---------- 记忆 & 计量存储 ----------
+pymysql>=1.1           # MySQL 记忆存储 / 用量计量（懒加载，缺失则降级本地）
+
+# ---------- 文档接入（ingest 引擎）----------
+PyYAML>=6.0
+numpy>=1.24
+Pillow>=10.0
+scipy>=1.10
+openpyxl>=3.1          # .xlsx 逐 Sheet 读取
+python-pptx>=0.6       # .pptx 逐页读文本 + 表格
+pymupdf>=1.23          # PDF 文本/表格/真图抽取（fitz）
+beautifulsoup4>=4.12   # HTML 文档加载（BSHTMLLoader）
+requests>=2.31         # Agent 调用外部 HTTP 接口
+
+# ---------- 资源 / 物料生成脚本（scripts/，可选）----------
+matplotlib>=3.7        # 架构图 / 封面 / 视频帧生成
