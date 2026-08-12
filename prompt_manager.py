@@ -853,7 +853,8 @@ class AuthManager:
         返回: {"username", "display_name", "role", "token"} 或 None
         """
         if not self.available:
-            # 降级：本地硬编码认证（仅 admin）
+            print("  [AuthManager] ⚠ MySQL 不可达，拒绝登录（fail-closed，P0-3）")
+            # 降级：本地硬编码认证（仅 admin）——P0-3 已关闭该后门
             if False:  # P0-3 认证后门已关闭（fail-closed）
                 token = secrets.token_hex(32)
                 session = {"username": "admin", "display_name": "管理员",
