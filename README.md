@@ -12,7 +12,7 @@
 ![MCP](https://img.shields.io/badge/MCP-FastMCP-9A7BFF?labelColor=555555&style=flat-square&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue?labelColor=555555&style=flat-square)
 
-**企业级智能知识库问答系统**：基于 LangGraph StateGraph 的私有文档 RAG Agent，支持多轮检索反馈、多智能体协作、三重记忆与断点重续，对外通过 MCP 协议暴露工具，并通过企业级 LLM Gateway 统一多模型路由 / 限流 / 熔断 / Token 计费。
+**企业级自进化 RAG Agent 平台**：基于 LangGraph StateGraph 的多轮检索 + 多智能体引擎 + 企业级 LLM Gateway（评测与高难度生成路由接 DeepSeek）+ 评测 Harness / Bad Case / 自进化闭环；通过 MCP 协议把工具暴露给 Claude Desktop / Cursor / 自研 Agent。
 
 > GitHub: <https://github.com/lingluo1hao/enterprise-ai>
 
@@ -37,6 +37,7 @@
   - [3. RAG 架构](#3-rag-架构)
   - [4. Memory 三重记忆力机制](#4-memory-三重记忆力机制)
   - [5. LangGraph 在本项目的架构](#5-langgraph-在本项目的架构)
+  - [6. Harness / Bad Case / 自进化体系](#6-harness--bad-case--自进化体系)
 - [七、常见问题](#七常见问题)
 - [八、生产部署](#八生产部署)
 - [九、文档索引](#九文档索引)
@@ -45,11 +46,18 @@
 
 ## 一、项目介绍
 
-Enterprise-AI 是一套面向企业内部文档的智能问答系统，已经从最初的「LLM + 向量库」脚本进化为一套完整的企业级 Agent 平台。核心特征：
+Enterprise-AI 是一套面向企业内部文档的智能知识库 Agent 平台，**核心能力是让系统越用越准**：用评测 Harness 跑出门禁数字、用 Bad Case 库沉淀失败、用自进化闭环把成功经验反向强化回检索，三件套互相闭环把失败样本变成下一次变强的养分。围绕这条主线，平台在引擎、网关、数据面、记忆、安全沙箱、MCP 等维度都做了完整的企业级工程落地。
+
+**系统的两条核心主轴**：
+
+- **自进化主轴**：`evalkit` 评测 Harness（DeepSeek 强 Judge）→ 失败案例沉淀到 `bad_cases` 库 → 后台 triage 写诊断 → `evolution.py` 把成功经验 `patch_success` 到 `skill_playbooks`（Milvus 集合）→ 下次同意图提问直接命中强化后的检索改写经验。
+- **难度路由主轴**：生成前 `_select_gen_task(query, tenant)` 按难度分流——硬租户（默认 `jm,yh`，协议类库，幻觉高发）或技术类 query（协议号 `0x..` / 字段 / 组成 / 优先级…）自动切到 `generate-hard`（DeepSeek 优先），普通 query 留本地 qwen2:7b 控成本。
+
+围绕这两条主轴，平台已具备的核心特征：
 
 - **真实环境，无 Mock**：直连 Milvus / Ollama / MySQL / Redis，不依赖任何 mock。
-- **LangGraph StateGraph 引擎**：13 节点 + 3 分支 + 条件边 + 反馈循环，显式状态机替代手写 ReAct。
-- **多模型统一网关**：所有 LLM 调用经 `LLM Gateway`（多模型路由 / 限流 / 熔断 / 连接池 / 热重载），业务代码 16 个调用点零改动接入。
+- **LangGraph StateGraph 引擎**：14 节点（13 业务节点 + 内部 START）+ 3 分支路由（simple / complex / chitchat）+ 条件边 + 反馈循环；显式状态机替代手写 ReAct。
+- **多模型统一网关**：所有 LLM 调用经 `LLM Gateway`（多模型路由 / 限流 / 熔断 / 连接池 / 热重载 / 真实 Token 计费），业务代码 16 个调用点零改动接入。
 - **三重记忆 + 断点重续**：内存加速层 + MySQL 持久化层 + Redis 缓存层，服务重启后对话历史与未完成任务可恢复。
 - **百万级数据面**：指纹增量 ingestion 引擎、结构感知分块（章节递归 + small-to-big 父子）、通用 PDF 图抽取。
 - **6 层安全沙箱**：凭据外部化、输入防护、API 限流、审计日志、工具 AST 沙箱、管理员认证。
@@ -75,7 +83,15 @@ Enterprise-AI 是一套面向企业内部文档的智能问答系统，已经从
 
 ![总体架构](docs/readme_images/arch_overall.png)
 
-入口层（Web/CLI）经 `rag_web_server.py` 路由到 `LangGraphRAGApp` 引擎，引擎调度四大支撑模块（Cache / AccessControl / Memory / PromptManager），所有 LLM 调用经 `LLM Gateway` 出口，按任务类型路由到本地/云端模型，最终落到 Ollama / Milvus / Redis / MySQL 四个基础设施。
+系统按 **7 层**组织：① 用户入口 → ② 接入层 → ③ 引擎层（LangGraph 14 节点）→ ④ 支撑模块 → ⑤ LLM 网关层 → ⑥ 基础设施，外加 **⑦ 自进化闭环侧栏**。读者沿主列自上而下追一条请求路径，再横向看右侧闭环是怎样把"答案 → 失败 → 经验"反向灌回引擎的。
+
+- **入口层**：浏览器（Web SSE 流式聊天）/ 管理后台 `/admin`（提示词管理 + 在线问答 + Bad Case triage）/ 命令行（`langgraph_rag_agent.py` CLI）/ MCP Client（Claude Desktop / Cursor / 自研 Agent）。
+- **接入层**：`rag_web_server.py`（Flask + 6 层安全中间件）+ `LangGraphEngine` 适配器 + `mcp_server.py`（FastMCP 把 Skill 暴露为 Tools/Prompt）。
+- **引擎层**：`LangGraphRAGApp` StateGraph 状态机，14 节点（13 业务 + 内部 START），3 分支路由（simple / complex / chitchat），每节点执行后自动写 MySQL 断点快照。
+- **支撑模块**：CacheManager（Redis 两级智能缓存）/ AccessControlFilter（Milvus 标量下推）/ MySQLMemoryStore（三层记忆 + 断点）/ PromptManager（MySQL 提示词 + 在线编辑）。
+- **LLM 网关层**：所有 LLM 调用必穿 `LLM Gateway`（多模型路由 / 限流 / 熔断 / 连接池 / 10s 热重载 / 真实 Token 计费）。**评测与高难度生成的 DeepSeek 优先链**——`evalgrade`（DeepSeek 强 Judge）与 `generate-hard`（高难度生成）把 DeepSeek 放在链首，这是质量门禁与压幻觉的关键。
+- **基础设施**：Ollama（embedding + LLM）/ Milvus（唯一向量库）/ Redis（缓存 + 限流）/ MySQL（持久化）/ SQLite（用量看板）。
+- **自进化闭环（核心，详见「6. Harness / Bad Case / 自进化体系」）**：`evalkit` 评测 Harness（DeepSeek 强 Judge）发现失败 → 沉淀进 `bad_cases` 库（MySQL）→ 后台 triage 写诊断 → `evolution.py` 把成功经验 `patch_success` 到 `skill_playbooks`（Milvus 集合）→ 下次同意图提问直接命中强化后的检索改写经验，回灌检索/生成。
 
 ### 3.2 系统调用链路（请求流转）
 
@@ -84,66 +100,80 @@ Enterprise-AI 是一套面向企业内部文档的智能问答系统，已经从
 下图按「从上到下」展示一次用户提问经过的全部节点；每层完成一件事后再下沉。
 
 ```
-用户（浏览器 / 命令行）
+用户（浏览器 / CLI / /admin / MCP Client）
     │
     ▼
-rag_web_server.py ──Flask──► Web 聊天界面 (SSE 流式)
-    │               ──Flask──► 管理后台 /admin（提示词管理 + admin 问答）
-    │                        langgraph_rag_agent.py (CLI)
-    ├─ LangGraphEngine 适配器
+rag_web_server.py ──Flask + 安全中间件──► 通用流程
     │
     ▼
-langgraph_rag_agent.py — StateGraph 状态图引擎
+LangGraphRAGApp · StateGraph（14 节点）
     │
-    ├─ load_history ──► classify ──► [条件边]
-    │      │                │
-    │      │      ┌─────────┼──────────┐
-    │      │      ▼         ▼          ▼
-    │      │   simple    complex    chitchat
-    │      │      │         │          │
-    │      │      ▼         ▼          ▼
-    │      │  query_rewrite planner  direct_llm
-    │      │      │         │          │
-    │      │      ▼         ▼          │
-    │      │  retrieve ↑  reviewer ←───┘
-    │      │      │    │    │
-    │      │      ▼    │    ▼
-    │      │  grade_docs│  writer
-    │      │      │    │    │
-    │      │  不够相关且 │    │
-    │      │  <3轮则循环 │    │
-    │      │      ▼    │    │
-    │      │  rerank_mmr│   │
-    │      │      │    │    │
-    │      │      ▼    │    │
-    │      │ generate_simple │
-    │      │      │         │
-    │      └──────┼─────────┘
-    │             ▼
-    │          respond ──► save_history ──► END
-    │                          │
-    │             每个节点执行后自动保存 state 快照
+    ├─ load_history ──► classify ──► 分支决策
+    │                         │
+    │       ┌─────────────────┼──────────────────┐
+    │       ▼                 ▼                  ▼
+    │   chitchat           simple             complex
+    │       │                 │                  │
+    │       ▼                 ▼                  ▼
+    │   direct_llm    query_rewrite         planner
+    │       │             │                   │
+    │       │             ▼                   ▼
+    │       │          retrieve           reviewer
+    │       │             │                   │
+    │       │             ▼                   ▼
+    │       │        grade_docs            writer
+    │       │             │
+    │       │             ▼
+    │       │      rerank_mmr
+    │       │             │
+    │       └────────┐    ▼
+    │                ▼  generate_simple
+    │       ┌────────┘     │
+    │       ▼              ▼
+    │       └─► 难度路由 _select_gen_task ◄───┘
+    │              │  根据 tenant 与 query 关键词分流
+    │              ├── 普通 query → generate       (本地 qwen2:7b)
+    │              └── 硬租户/技术词 → generate-hard (DeepSeek 优先 ★)
+    │                     │
+    │                     ▼
+    │                  respond ──► save_history ──► END
+    │                     │
+    │                     └── 答案质量信号 ┐
+    │                                      ▼
+    │              ┌──── 自进化闭环（右栏）────┐
+    │              │  点踩 / 评测失败            │
+    │              │       ↓                    │
+    │              │  Bad Case 库（triage）     │
+    │              │       ↓                    │
+    │              │  evolution.patch_success   │
+    │              │       ↓                    │
+    │              │  skill_playbooks (Milvus)  │
+    │              │       ↓                    │
+    │              │  回灌检索改写经验 ──────────┘
+    │              └──────────────────────────┘
     │
     ├─ CacheManager（Redis 两级智能缓存）
-    ├─ AccessControlFilter（文档级权限过滤）
-    ├─ MySQLMemoryStore（三层记忆 + 断点重续）
-    ├─ PromptManager（提示词动态加载，MySQL 存储，在线编辑即时生效）
+    ├─ AccessControlFilter（Milvus 标量下推）
+    ├─ MySQLMemoryStore（三层记忆 + 断点）
+    ├─ PromptManager（MySQL 提示词 + 在线编辑）
     │
     ▼
-LLM Gateway（llm_gateway.yaml：多模型路由 / 限流 / 熔断 / 连接池 / 热重载）
+LLM Gateway（llm_gateway.yaml 路由）
     │
-    ├─ local-small  (qwen2.5:1.5b)  ← 分类/打分/改写/压缩等高频小任务（确定性 temp=0）
-    ├─ local-qwen   (qwen2:7b)      ← classify/plan/review/react 等路由决策（确定性 temp=0）
-    ├─ local-qwen-gen (qwen2:7b)    ← generate/write/synthesize/direct 答案生成（temp=0.3，更自然）
-    └─ deepseek-chat / qwen-plus    ← 云端备选，主模型挂了顶上
+    ├─ local-small     (qwen2.5:1.5b)  ← grade / rewrite / compress
+    ├─ local-qwen      (qwen2:7b)      ← classify / plan / review / react
+    ├─ local-qwen-gen  (qwen2:7b)      ← generate / write / synthesize / direct
+    ├─ deepseek-chat   ★ 优先          ← evalgrade（强 Judge）+ generate-hard（高难度）
+    └─ qwen-plus / gpt-4o-mini         ← 兜底
     ▼
 Ollama（192.168.200.128:11434 / qwen2:7b 等）
 Milvus（192.168.200.128:19530，唯一向量库）
 Redis（192.168.200.128:6379）
 MySQL（192.168.200.128:3306 / rag_agent）
+SQLite（llm_usage.db，用量看板）
 ```
 
-**怎么读这张图**：沿「自顶向下」的箭头追一条请求路径——浏览器提问 → rag_web_server 校验 → LangGraph 引擎按 `classify` 结果分支 → 命中 simple 走 `query_rewrite → retrieve → grade_docs`（最多 3 轮） → `rerank_mmr → generate_simple`；命中 complex 走 `planner → reviewer → writer`，reviewer 不通过则回退 planner；命中 chitchat 直接 LLM 答。最终都汇聚到 `respond → save_history → END`，每节点后写 MySQL 断点快照。所有 LLM 调用必须穿过 LLM Gateway，按 task 路由到合适的模型。
+**怎么读这张图**：沿主列自上而下追一条请求路径——浏览器提问 → rag_web_server 校验 → LangGraph 引擎按 `classify` 结果分支 → 命中 **simple** 走 `query_rewrite → retrieve → grade_docs`（最多 3 轮）→ `rerank_mmr → generate_simple` → 难度路由判定；命中 **complex** 走 `planner → reviewer → writer`；命中 **chitchat** 直接 LLM 答 → 全部汇聚到 `respond → save_history → END`，每节点后写 MySQL 断点快照。所有 LLM 调用必穿 LLM Gateway，按 task 路由到合适模型——**生成难度路由** 是关键：硬租户（`jm/yh`）或技术类 query 命中 `generate-hard`（DeepSeek 优先），普通 query 走 `generate`（本地 7b）。**横向看右栏自进化闭环**：答出来的答案经点踩 / 评测失败流入 Bad Case 库 → triage 后 `evolution.py` 强化 playbook → `skill_playbooks` 回灌检索改写经验，闭环生效。
 
 ### 3.3 主要文件说明
 
@@ -151,20 +181,28 @@ MySQL（192.168.200.128:3306 / rag_agent）
 
 | 文件 | 作用 |
 |------|------|
-| `langgraph_rag_agent.py` | **核心引擎**，含 `LangGraphRAGApp` 类、`AgentState` 状态定义、14 个图节点、3 条条件分支、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。**本次改造点**：reranker 两阶段精排改为 `.env` 驱动（`RERANK_ENABLED` / `RERANK_URL` / `RERANK_TIMEOUT` 去除硬编码）；RRF 融合候选池放大到 `RETRIEVE_CANDIDATE_K=20` 避免 gold 在精排前被 top-k 截断；`_rerank` 增加超长文本防御性截断规避 cross-encoder 长 chunk 500；多租户修复——CLI 新增 `--tenant` 且 `query()` 调用点透传 `tenant_id`（原被 `or "default"` 覆盖）；图查询意图识别拆分为 `figure/table/any`，`generate` 阶段真图（`fig_p*`）优先于表格图（`table_p*`）。 |
+| `langgraph_rag_agent.py` | **核心引擎**，含 `LangGraphRAGApp` 类、`AgentState` 状态定义、14 个图节点（13 业务节点 + 内部 START）、3 条条件分支（simple/complex/chitchat）、断点保存与恢复。复用 `advanced_rag_agent.py` 的 LLM / 向量库 / 缓存 / 权限过滤等基础组件。**生成难度路由**：`_select_gen_task(query, tenant)` 在生成前按难度切流——硬租户（默认 `jm/yh` 协议库）+ 技术关键词（协议号 `0x..`/字段/组成/优先级…）→ `generate-hard`（DeepSeek 优先），普通 query 留 `generate`（本地 qwen2:7b）；三个环境变量 `GEN_ROUTING_ENABLED` / `GEN_HARD_TENANTS` / `GEN_HARD_PATTERN` 可覆盖。**本次改造点**：reranker 两阶段精排改为 `.env` 驱动（`RERANK_ENABLED` / `RERANK_URL` / `RERANK_TIMEOUT` 去除硬编码）；RRF 融合候选池放大到 `RETRIEVE_CANDIDATE_K=20` 避免 gold 在精排前被 top-k 截断；`_rerank` 增加超长文本防御性截断规避 cross-encoder 长 chunk 500；多租户修复——CLI 新增 `--tenant` 且 `query()` 调用点透传 `tenant_id`（原被 `or "default"` 覆盖）；图查询意图识别拆分为 `figure/table/any`，`generate` 阶段真图（`fig_p*`）优先于表格图（`table_p*`）；`_parse_hits` 出口契约修复（`page_content` 忠实返回子片段，父窗口进 `metadata`，避免同章去重坍缩 / 精排全负 / 命中点被截）。 |
 | `advanced_rag_agent.py` | 基础组件库，提供 `OllamaLLM`、`VectorStoreManager`、`CacheManager`、`AccessControlFilter`、`DocSearchSkill` 等可复用类。**`AccessControlFilter` / `search()` / `search_figure_pages()` 的权限下推已扩展为 `tenant_id` + `user_id` + `access_level` 三级标量过滤**（`super_admin` 无 expr、`admin` 仅 `tenant_id`、`user` 加 `access_level/user_id` 约束），所有 LLM 调用统一带 `user=self.username` 以支撑 Token 用量归因。同时保留原 LangChain 版 `RAGOrchestrator` 实现（兼容旧模式）。 |
 | `memory_store.py` | **MySQL 持久化记忆模块**，含 `MySQLMemoryStore` 类，管理 4 张表：`chat_messages`（对话历史，按 `user_id` 外键→`admin_users.id` + `session_id` 隔离，列 `speaker_role`=消息说话方 user/assistant/system）、`task_checkpoints`（断点快照）、`task_queue`（任务队列）、`chat_summaries`（对话摘要落库，进程重启不丢）。`save_message` / `save_checkpoint` 使用单条 SQL 原子取号（修复并发撞号）。支持连接池、线程安全、自动降级。 |
 | `prompt_manager.py` | **提示词工程管理模块**，含 `PromptManager`（11 个提示词模板的 CRUD + 动态加载）和 `AuthManager`（管理员 `salt:sha256` 密码认证 + `create_user()` 按租户创建用户）。支持从 Web 管理后台在线编辑提示词，修改后即时生效无需重启服务；启动时自动比对 `DEFAULT_PROMPTS` 与 DB 版本，代码更高则同步 MySQL。`generate_answer` / `writer_compose` 系统提示词已加入「保持 Markdown 表格输出 / 原样保留 `[[FIG:...]]` 占位符」要求，配合摄取层的表格与图片抽取。 |
 | `audit_logger.py` | **审计日志模块**，JSON Lines 结构化日志。覆盖 `login/logout/query/query_stream/save_prompt/delete_prompt/import_defaults` 7 类操作，字段含 `timestamp/ip/username/action/target/result/detail`。自动轮转（500KB/3 备份）。 |
 | `rag_web_server.py` | Web 入口。导入基础组件 + `LangGraphRAGApp`，通过 `LangGraphEngine` 适配器兼容不同引擎。`--langgraph` 开关选择引擎。提供聊天页面（`/`）和管理后台（`/admin`）。内置安全中间件：输入校验、IP 令牌桶限流、审计日志注入。**多租户能力集中在此**：`/api/docs` 按角色+租户过滤知识库列表（admin 直接按租户过滤、user 走 Milvus 标量下推）；`/api/admin/users` 支持按租户创建/管理用户；`/api/docs/upload` 增加实时进度日志（`[docs/upload]`）+ 上传耗时统计；`/api/token-usage` 按 `user_id` 过滤。**`[docs/list]` 日志已收敛**：全盘扫描阶段会标注 `[跨租户-将过滤]`，避免误判越权。**`app.run(threaded=True)` 仅为 Windows 本地开发 fallback**，生产请走下方「生产部署（高并发 · gunicorn）」章节。 |
+| `mcp_server.py` | **MCP 协议入口**（FastMCP）。把 `skill_framework.py` 注册的 Skill 重新暴露为 MCP 标准原语：Tools（可调用工具，Claude Desktop / Cursor / 自研 Agent 直接调）、Resources（结构化资源）、Prompts（提示词模板）。外部 Agent 通过 MCP 客户端配置 `mcpServers` 段指向 `mcp_server.py` 即可零改造接入。详见 [MCP_README.md](docs/guides/MCP_README.md)。 |
+| `skill_framework.py` | **Skill 内核**：所有可执行能力（计算器 / 文档检索 / 角色权限查询 / 提示词查询 等）的抽象基类 `BaseSkill` + `CalculatorSkill` / `DocSearchSkill` 等。`CalculatorSkill` 弃用 `eval()`，改 AST 白名单安全求值（仅放行数字 + 6 种运算符）；所有 Skill 经 `validate_params()` 参数白名单。这层是工具沙箱的落地点，也是 MCP 暴露的源头。 |
 | `gunicorn_config.py` | **高并发生产部署入口**。gunicorn 配置：默认 4 workers × 8 threads（gthread 模式，兼容 SSE 长连接 + 同步 LLM 调用），`post_worker_init` 钩子在**每个 worker 内**调 `init_system()` 完成向量库/编排器初始化——因为 gunicorn 不执行 `__main__`，否则各进程不会初始化、且顶层 `RAG_LANGGRAPH` 已正确默认开启 LangGraph。workers / threads / timeout / worker_class 均可经 `GUNICORN_*` 环境变量覆盖。Linux/VM 上用 `gunicorn -c gunicorn_config.py rag_web_server:app` 启动。注：gunicorn 仅支持 Linux/macOS（依赖 `fcntl`），Windows 本地请用 `waitress-serve` 调试。 |
 | `llm_gateway.py` | **企业级 LLM 网关**，统一所有 LLM 调用的出口。内含多模型路由、令牌桶限流（全局+单模型两级 RPM/TPM）、三态熔断降级、HTTP 连接池复用、真实 Token 计数与成本统计、配置热重载。纯标准库实现，零第三方依赖。 |
 | `ingest/` | **百万级 RAG 数据面引擎**（改造点落地）。`pipeline.IngestPipeline` 编排「扫 `knowledge/`（递归 `os.walk`，含子目录）→ 指纹增量(`mtime+size+md5`) → 多格式 loader(`txt/md/pdf/html/docx/xlsx/pptx`) → 结构切分 → 批量 embedding(并发池+重试) → 幂等 upsert」；`store.MilvusStoreBackend` 复用现有 Milvus 客户端；`cli` 提供 `ingest/status/delete/rebuild` 子命令。支持增量（仅处理变更文件）、`--force` 全量、`--dry-run` 预检。**单文件上传不再误删其他文件**（显式传入 `files` 时 `removed=[]`）。`loaders._load_pdf` 用 PyMuPDF 抽取表格→Markdown `[TABLE]...[/TABLE]`、抽取插图并在 `chunk.py` 插入 `[[FIG:...]]` 占位符；缺 PyMuPDF 时优雅降级为纯文本。测试见 `tests/test_ingest.py`（零外部依赖，`python tests/test_ingest.py` 直接跑）。 |
-| `config/llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。 |
-| `scripts/eval_retrieval_bury.py` | **检索召回量化验证脚本**（可复跑）：对比 CURRENT（原 top-k 截断）/ FIXED-A（放大候选池）/ RRF（融合）三列召回排名，定位 gold 被精排前截断的根因，输出结果可直接对照 `docs/reports/rag_retrieval_upgrade/images/` 可视化。 |
-| `config/init_db.sql` | MySQL 建库建表脚本。`admin_users` 表含 `role`（`admin/user/super_admin`）与 `tenant_id`（多租户隔离）字段；已预置 `admin`(default)、`reader`/`viewer`(user,default)、`jm_admin`(admin,jm)、`yh_admin`(admin,yh)、`superadmin`(super_admin,default) 五类演示账号。 |
+| `config/llm_gateway.yaml` | 网关配置文件：模型注册表（本地/云端）、路由表（任务→模型链）、全局流控、连接池、重试与降级参数。改这里不重启进程，10 秒内自动热重载。**关键路由**：`evalgrade: [deepseek-chat, local-small, local-qwen]`（评测强 Judge，DeepSeek 优先）、`generate-hard: [deepseek-chat, local-qwen-gen, qwen-plus]`（高难度生成，DeepSeek 优先）；普通 `generate*/write*` 走本地 7b，DeepSeek 仅兜底。 |
+| `config/init_db.sql` | MySQL 建库建表脚本。`admin_users` 表含 `role`（`admin/user/super_admin`）与 `tenant_id`（多租户隔离）字段；已预置 `admin`(default)、`reader`/`viewer`(user,default)、`jm_admin`(admin,jm)、`yh_admin`(admin,yh)、`superadmin`(super_admin,default) 五类演示账号。**8 张业务表**：`chat_messages` / `task_checkpoints` / `task_queue` / `chat_summaries`（记忆）/ `feedback`（用户反馈）/ `bad_cases`（失败样本库，根因 R1~R8）/ `access_rules`（权限规则）/ `tenants`（租户）。 |
+| `config/access_rules.yaml` | 文档级权限规则。`JM-S509` 等受限文档名匹配此规则，标 `restricted`，普通用户检索时被 Milvus 标量下推过滤掉。 |
+| `config/tenants.yaml` | 多租户注册表。`tenant_id` 与 `admin_users.tenant_id` 一一对应，决定该租户下用户能看哪些文档。 |
+| `deploy/` | 部署相关编排。`docker-compose-milvus.yaml`（etcd + MinIO + milvus 单节点三容器 compose，验证过的生产编排）。 |
 | `knowledge/` | 存放企业知识库 PDF 文档（ingestion 数据源），首次运行 / `ingest` 时自动构建向量索引（写入 Milvus）。 |
-| `docs/` | 文档中心：`guides/`（MCP / LLM 网关使用说明）+ `reports/`（RAG 数据面改造、P0 修复、记忆系统升级等方案与分析报告）。 |
+| `scripts/` | 运维 / 验证 / 数据生成脚本集。**核心脚本**：`eval_retrieval_bury.py`（检索召回归一化验证：CURRENT / FIXED-A / RRF 三列对比）、`seed_bad_cases.py`（注入 6 条 Bad Case demo 覆盖 R1~R6 + 三状态）、`mine_golden.py`（从 `task_checkpoints` 在线挖黄金集，待 VM 在线下发）、`gen_pptx.py` / `gen_diagrams.py` / `gen_vertical_video.py` / `gen_youtube_video.py` 等营销物料生成器（基于 matplotlib + edge-tts + ffmpeg，零积分出 PPT/视频）。 |
+| `tests/` | 单测集。**逐文件零外部依赖可跑**：`test_ingest.py`（ingestion 链路）、`test_harness_grading.py`（硬化的判分逻辑、16/16 用例验证 4 条历史误判消失）、`test_gen_routing.py`（难度路由决策 7/7）、`test_llm_gateway_models.py`（网关模型注册）。`test_llm_gateway.py` / `test_ingest_integration.py` 需 live Ollama / Milvus，外部依赖不可用时自动跳过。 |
+| `evolution.py` | **自进化闭环模块**：`Extractor.evaluate_success`（L1 检索级 / L2 答案级 / L3 反馈级三级成功信号判定）、`patch_success`（Milvus delete+insert 计数回写）、`save_or_merge`（相似去重复用）、`reinforce_feedback`（点赞/踩反馈级强化）、`extract_failure`（失败样本沉淀到 `bad_cases`）。与 Bad Case 库、evalkit 评测 Harness 互哺，详见「6. Harness / Bad Case / 自进化体系」。 |
+| `evalkit/` | **评测 Harness 工程**：`runner.py`（CLI 入口，`--suite retrieval\|answer\|both`，落盘 run json + HTML 报表 + 门禁退出码）、`judge.py`（LLM-as-judge，走 `evalgrade` 链 DeepSeek 强 Judge）、`harness_answer.py`（复用真实 `LangGraphRAGApp.query` 跑完整链路）、`triage.py`（R1~R8 自动根因分类）、`schema.py`（聚合 pass_rate / faithfulness / refuse_accuracy）。黄金集 `evalkit/golden/*.jsonl`。 |
+| `docs/` | 文档中心：`guides/`（MCP / LLM 网关使用说明）+ `reports/`（RAG 数据面改造、P0 修复、记忆系统升级、Harness/Bad Case/自进化体系等方案与分析报告）。 |
 
 ---
 
@@ -452,7 +490,7 @@ python rag_web_server.py
 
 | 能力 | 说明 |
 |------|------|
-| **多模型路由** | 按 `task` 分发：`classify/plan/review` 死守 7b；`grade/rewrite/compress` 下放 1.5b；`generate/write/synthesize/direct` 走 7b（temp=0.3）；主模型挂了走 deepseek-chat → qwen-plus fallback |
+| **多模型路由** | 按 `task` 分发：`classify/plan/review/react` 死守 7b；`grade/rewrite/compress` 下放 1.5b；`generate/write/synthesize/direct` 走本地 qwen2:7b（temp=0.3），主模型挂了回落 deepseek-chat → qwen-plus。**两条链 DeepSeek 优先（主模型）**：`evalgrade`（评测强 Judge，faithfulness/relevancy 打分）与 `generate-hard`（高难度/硬租户生成，压幻觉）——详见下方路由表与「6. Harness / Bad Case / 自进化体系」。 |
 | **令牌桶限流** | 全局 + 单模型两级 RPM/TPM 限流；多实例部署时升级为 `RedisTokenBucket`（Lua 原子）共享配额 |
 | **三态熔断降级** | 连续失败自动打开熔断器；半开探活；全链路挂了返回兜底文案 |
 | **HTTP 连接池** | 按 host 复用 keep-alive，避免每次请求新建连接 |
@@ -465,14 +503,21 @@ python rag_web_server.py
 routing:
   classify:   [local-qwen]                       # 路由决策（temp=0）
   grade:      [local-small, local-qwen]          # 文档打分（temp=0）
+  evalgrade:  [deepseek-chat, local-small, local-qwen]  # 评测强 Judge：DeepSeek 优先（faithfulness/relevancy 精准），未配 key 回落本地零成本
   rewrite:    [local-small, local-qwen]          # 查询改写（temp=0）
   compress:   [local-small, local-qwen]          # 历史压缩（temp=0）
-  generate:   [local-qwen-gen, deepseek-chat, qwen-plus]  # 答案生成（temp=0.3）
-  generate-hard: [deepseek-chat, local-qwen-gen, qwen-plus]  # 难题/硬 tenant(jm,yh)/技术关键词 → DeepSeek 生成（难度路由，详见 RAG质量加固方案文档）
+  generate:   [local-qwen-gen, deepseek-chat, qwen-plus]  # 答案生成（temp=0.3），本地优先、云端兜底
+  generate-hard: [deepseek-chat, local-qwen-gen, qwen-plus]  # 高难度/硬 tenant(jm,yh)/技术关键词 → DeepSeek 优先生成（压幻觉）
+  write:      [local-qwen-gen, deepseek-chat, qwen-plus]
+  synthesize: [local-qwen-gen, deepseek-chat, qwen-plus]
+  direct:     [local-qwen-gen, deepseek-chat, qwen-plus]
   plan:       [local-qwen, deepseek-chat]
   review:     [local-qwen, deepseek-chat]
   react:      [local-qwen, deepseek-chat]
+default_chain: [local-qwen, deepseek-chat, qwen-plus]      # 未命中上表 task 时的兜底链
 ```
+
+> **为什么 DeepSeek 是「主」而不是「备」**：普通生成（`generate/write/...`）本地 7b 优先、DeepSeek 仅兜底；但 **`evalgrade`（质量门禁的裁判）与 `generate-hard`（高难度生成）把 DeepSeek 放在链首**——评测裁判若用本地 1.5B 会把幻觉判成"相关"（faithfulness 虚高），高难度协议类 query 用本地 CPU 模型易幻觉。两条链的具体触发逻辑见「6. Harness / Bad Case / 自进化体系」。
 
 #### 三个真实修复
 
@@ -649,6 +694,95 @@ python -m ingest.cli rebuild <path>          # 单文件强制重建
 
 ---
 
+### 6. Harness / Bad Case / 自进化体系
+
+把「评测 Harness 工程 + Bad Case 失败样本库 + 模型自进化闭环」三件事做成互相打通的完整体系。**主线**：Harness 跑评测发现失败 → 沉淀进 Bad Case 库 → triage 后喂给自进化闭环强化 playbook → 强化结果回灌提升质量。其中 **DeepSeek 被放在两条核心链路的首位**——评测裁判（`evalgrade`）与高难度生成（`generate-hard`），详见各小节。
+
+#### 6.1 评测 Harness 工程（`evalkit/`）
+
+可重复跑的**评测工程**：用一批标注好的黄金问答对（`evalkit/golden/{retrieval,answer}.jsonl`）驱动真实 `LangGraphRAGApp.query` 链路，自动打分，把"靠人眼盯答案"变成"门禁数字"。
+
+```bash
+python -m evalkit.runner --suite retrieval|answer|both [--judge-task evalgrade]
+```
+
+- `retrieval`：纯检索召回（秒级、零 LLM），输出 MRR / Recall@K / nDCG。
+- `answer`：答案层，需 LLM + DeepSeek Judge 打 `faithfulness / relevancy / refuse_accuracy`。
+- 落盘 `evalkit/runs/*.json` + `evalkit/reports/*.html`；CI 门禁退出码 `2` 表示有 case 失败。
+
+**关键能力 1 · DeepSeek 强 Judge**（`evalgrade: [deepseek-chat, local-small, local-qwen]`）。原 judge 用本地 1.5B 会把明显幻觉判成"相关"（faithfulness=0.9 虚高）；换 DeepSeek 后同 case 打 0.4 并精准指出"某字段在 context 无出处"。**强 Judge 是"测得准"的基石**——后续 4 条测试框架误判正是 DeepSeek 帮我们识别出来的。
+
+**关键能力 2 · 测试判分硬化**（`evalkit/` 修复）。首跑答案层通过率 11.1%，逐条核对发现 8 条失败 = 4 真问题（幻觉）+ 4 测试框架误判（false positive：否定句子串误杀、拒答关键词表漏匹配等）。判分逻辑已硬化（否定感知禁词 + 语义正则双路拒答判定 + 禁词支持 `regex:` 前缀），4 条误判在冻结答案上由单测 `tests/test_harness_grading.py`（16/16）确认消失。
+
+#### 6.2 生成难度路由（高难度 → DeepSeek）
+
+`langgraph_rag_agent.py` 的 `_select_gen_task(query, tenant)` 在生成前按难度切流：
+
+| 触发条件 | 路由 task | 主模型 |
+|---|---|---|
+| 命中硬租户（默认 `jm,yh`，幻觉高发的协议库）/ query 命中技术关键词（协议号 `0x..`、字段、组成、优先级、格式、结构…） | `generate-hard` | **DeepSeek 优先** |
+| 其它普通 query | `generate` | 本地 qwen2:7b（免费、快） |
+
+三个环境变量可覆盖：`GEN_ROUTING_ENABLED`（总开关）、`GEN_HARD_TENANTS`（硬租户名单）、`GEN_HARD_PATTERN`（技术关键词正则）。DeepSeek 未启用时 `generate-hard` 自动回落本地 qwen，**不崩**。4 条已知真幻觉（jm/yh tenant 的协议类 query）经此路由转 DeepSeek 生成，幻觉预期缓解（非根治，根治需更强本地模型）。
+
+#### 6.3 Bad Case 失败样本库
+
+把失败样本沉淀为可 triage 的资产，闭环入口有三：
+
+| 入口 | 触发 | 落点 |
+|---|---|---|
+| 用户点踩 | 聊天答案下方「踩 / 反馈」 | `POST /api/feedback` → `memory_store.add_bad_case()`（rating=-1 自动建 `open` 状态） |
+| 评测失败 | Harness 跑出失败 case | `pipeline` 来源 |
+| pipeline 异常 | 检索未命中 / 负信号 | `pipeline` 来源 |
+
+- **库表** `bad_cases`（`config/init_db.sql` 表 8）：`query/answer/expected/root_cause/diagnosis/status/...`；根因自动分 **R1~R8**（检索缺失 / 噪声 / 改写失败 / 生成偏离 / 答案不符 / 引用错误 / 超时 / 其他）。
+- **管理后台** `/admin/bad_cases`：左列表状态分段 + 根因下拉 + 搜索；右抽屉看问题 / 用户答案 / 标准答案 / 自动根因 / 处理记录，可标记 已解决 / 处理中 / 退回重测；统计卡显示待处理 / 处理中 / 已解决率。
+- **API**：`GET /api/admin/bad_cases`（筛选）、`PATCH /api/admin/bad_cases/<id>`（更新状态/诊断，`resolved` 自动写 `resolved_at`）、`POST /api/feedback`（点踩沉淀）。
+- 想立刻看效果：`python scripts/seed_bad_cases.py` 注入 6 条 demo（覆盖 R1~R6 + 三状态）。
+
+#### 6.4 自进化闭环（`evolution.py`）
+
+用失败样本反向强化 playbook：某条问答被判定"成功"（检索命中 + 答案可信 + 用户点赞），经验 `patch_success` 回写到 `skill_playbooks` 集合，让同意图的后续提问直接命中强化后的经验。
+
+`Extractor.evaluate_success` 返回 `(success, level)`，三级成功信号：
+
+| 级别 | 信号 | 来源 | 状态 |
+|---|---|---|---|
+| L1 | 检索级 | `doc_grades` 相关文档数达标 | ✅ 已生效 |
+| L2 | 答案级 | faithfulness（DeepSeek judge）达标 | 🔧 设计就绪，待接线（管线尚未回写 `faithfulness_score`） |
+| L3 | 反馈级 | 用户 rating=+1 赞 / -1 踩归零 | 🔧 设计就绪，待接线（反馈接口尚未把 rating 透传给 `evaluate_success`） |
+
+命中即 `patch_success(pk)`：Milvus 无原地 update，实现为真实 `delete(old) + insert(updated)`，`success_count+1`。`save_or_merge` 做相似去重（命中则合并计数不重复插）。
+
+**Milvus 距离失真坑（已修）**：standalone 的 `AUTOINDEX+COSINE` 距离失真——相同向量 search 返回 `distance=1.0`、top3 非升序。playbook 用纯 dense COSINE，**不能信距离**。`query_similar` 加 `_is_match` 文本相似度兜底（`intent_text` 完全相同 / `difflib≥0.92` 即判命中）+ `consistency_level="Strong"`（刚插入立即可搜）+ `_ensure` 维度漂移自修复。经验：任何基于 Milvus 余弦距离做阈值判定的逻辑都要加文本兜底。
+
+**与 Bad Case 互哺**：Bad Case 的 `open` 案例 → triage 后喂给自进化（失败样本反向指导 playbook 修复）；自进化强化后的 playbook → 提升生成质量 → 减少新 Bad Case。
+
+> **诚实边界**：当前"自进化"沉淀的是**检索改写经验 `rewrite_text`**（让类似问题走已知好的首轮改写），**不是预写答案**——答案仍由 LLM 实时生成。L2/L3 强化通路代码已写好但尚未接线，属可验证的诚实状态，非"已全自动进化"。
+
+#### 6.5 怎么跑这套体系
+
+```bash
+# 注入 .env（含 DEEPSEEK_API_KEY，否则 evalgrade 回落本地、generate-hard 回落 qwen，功能降级但不崩）
+set -a && source .env && set +a
+
+# 检索层门禁（秒级）
+python -m evalkit.runner --suite retrieval --mode pipeline
+
+# 答案层门禁（需 LLM + DeepSeek Judge）
+python -m evalkit.runner --suite answer --judge-task evalgrade
+
+# 全量
+python -m evalkit.runner --suite both --judge-task evalgrade
+
+# 注入 Bad Case demo 数据
+python scripts/seed_bad_cases.py
+```
+
+> 完整设计、验收数字与遗留项见 [Harness_BadCase_自进化体系改造方案.md](docs/reports/Harness_BadCase_自进化体系改造方案.md)。
+
+---
+
 ## 七、常见问题
 
 ### 安装与启动
@@ -785,6 +919,7 @@ waitress-serve --threads=8 --port=8080 rag_web_server:app
 | [docs/reports/RAG自进化与修复方案.md](docs/reports/RAG自进化与修复方案.md) | RAG 自进化方案 + 回答不准根因修复：num_ctx 截断 / PyMuPDF 伪表格 / 整章图透传 / 上下文暴涨 |
 | [docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md](docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md) | RAG 检索召回链路优化：reranker 两阶段精排 .env 化 + RRF 候选池放大 + 多租户 tenant 透传修复 + 图查询真图意图优先；含 CURRENT/FIXED-A/RRF 三列量化验证（配图见同目录 `images/`） |
 | [docs/reports/Harness_BadCase_自进化体系改造方案.md](docs/reports/Harness_BadCase_自进化体系改造方案.md) | Harness / Bad Case / 自进化 体系改造方案：以「评测 Harness 工程 + Bad Case 失败样本库 + 模型自进化闭环」三件事为主线，含 DeepSeek 强 Judge、生成难度路由、测试判分硬化、reranker 三层防御、evalkit 框架修复，及第七部分环境/部署/外部依赖坑记录 |
+| [docs/reports/BadCase9_答非所问_根因诊断报告.md](docs/reports/BadCase9_答非所问_根因诊断报告.md) | Bad Case #9 根因复盘：`_parse_hits` 出口契约错位（`page_content` 被偷换为整章父文本 + 入库字节截断导致答案在写库时被物理删除）导致答非所问；含 A/B 对照验证与修复，是「检索层铁律」的实证来源 |
 
 ---
 
