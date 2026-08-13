@@ -869,14 +869,14 @@ def api_admin_watermark():
     if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
         return jsonify({"error": "仅支持 png/jpg/jpeg/webp/bmp 图片"}), 400
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
         img = Image.open(f.stream).convert("RGBA")
         W, H = img.size
         # 字体：优先微软雅黑（含中文），缺失则回退默认，保证中文不方块
         try:
             font = ImageFont.truetype(
                 "C:/Windows/Fonts/msyh.ttc",
-                max(13, int(min(W, H) * 0.028)),
+                max(12, min(18, int(min(W, H) * 0.015))),
             )
         except Exception:
             font = ImageFont.load_default()
@@ -912,7 +912,7 @@ def api_admin_watermark():
         lw, lh = layer.size
         layer = layer.crop(((lw - W) // 2, (lh - H) // 2,
                             (lw - W) // 2 + W, (lh - H) // 2 + H))
-        # 合成到原图
+                # 合成到原图
         base = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         base.alpha_composite(img)
         base.alpha_composite(layer)
