@@ -373,6 +373,11 @@ class AgentState(TypedDict, total=False):
     # generate_simple / writer / direct_llm 三个节点各产生一种答案。
     answer: str
 
+    # P1-R1：本次作答是否实际失败（检索不到内容 / 全部子任务无法回答 / 兜底文案）。
+    # 替代旧写法在 query() 里用字符串启发式判失败（LLM 合法答案中含该句会误判）。
+    # 供 L1 patch_success 只在"真正成功作答"后 +1，失败虚增归零。
+    answer_failed: bool
+
     # 用户角色，取值 "admin"（特权）或 "user"（普通）。
     # 用于 AccessControlFilter 做文档级权限过滤。
     role: str
@@ -983,11 +988,8 @@ class LangGraphRAGApp:
                 if hit and hit.get("rewrite_text"):
                     prefill = json.loads(hit["rewrite_text"])
                     used_playbook_pk = hit.get("pk")
-                    # 命中即复用：success_count +1（越用越快，强化自进化 #168）
-                    try:
-                        store.patch_success(used_playbook_pk)
-                    except Exception as _e:
-                        print(f"  [classify] patch_success 异常(忽略): {_e}")
+                    # P1-8：不再在此 patch_success（否则与 query() 顶层命中双计）。
+                    # success_count 统一在 query() 里 graph.invoke 成功作答后才 +1。
                     print(f"  [classify] ♻ 命中经验 playbook(相似度={hit['score']:.2f})，预填 rewrite: {prefill}")
         except Exception as e:
             print(f"  [classify] 经验查询异常(忽略): {e}")
@@ -1100,6 +1102,9 @@ class LangGraphRAGApp:
             {"answer": "..."} — 确保非空的最终答案
         """
         answer = state.get("answer", "抱歉，我无法回答这个问题。")
+        # P1-R1：此前无任何节点产出 answer（异常/漏写）→ 兜底文案，显式标失败
+        if "answer" not in state or not state.get("answer"):
+            return {"answer": answer, "answer_failed": True}
         return {"answer": answer}
 
     # ========================================================================
@@ -1185,28 +1190,36 @@ class LangGraphRAGApp:
             store = getattr(self, "playbook_store", None)
             ext = getattr(self, "_Extractor", None)
             if store is not None and ext is not None:
-                # 三级成功信号评估：是否值得作为正向经验沉淀
-                ok, _level = ext.evaluate_success(state)
-                if ok:
-                    pb = ext.extract(state, self.tenant_id, self.username)
-                    if pb is not None:
-                        # save_or_merge：同问题去重合并，避免重复插（越用越快）
-                        store.save_or_merge(pb)
+                # P1-6 守卫：chitchat 本就无检索动作；或顶层 doc_grades 为空且无法聚合时，
+                # 一律跳过自进化沉淀，避免把「无检索」误判为「检索失败」灌假 Bad Case。
+                _qtype = state.get("query_type")
+                _grades = state.get("doc_grades", []) or []
+                if _qtype == "chitchat" or not _grades:
+                    print("  [evolution] 跳过自进化沉淀"
+                          "（chitchat 无检索，或 doc_grades 为空无法评估）")
                 else:
-                    # 检索未走通 / 答案级或反馈级为负 -> 沉淀为负样本到 bad_cases，
-                    # 形成「失败样本 -> triage 诊断 -> 修复 -> 回归验证」自进化闭环
-                    fail = ext.extract_failure(state, self.tenant_id, self.username)
-                    if fail is not None:
-                        ms = getattr(self, "memory_store", None)
-                        if ms is not None and getattr(ms, "available", False):
-                            ms.add_bad_case(
-                                query=fail["query"], source=fail["source"],
-                                suite=fail["suite"], expected=fail["expected"],
-                                root_cause=fail["root_cause"],
-                                diagnosis=fail["diagnosis"], status="open",
-                            )
-                            print(f"  [evolution] ⚠ 本次未走通，已沉淀负样本到 bad_cases: "
-                                  f"{fail['query'][:40]}")
+                    # 三级成功信号评估：是否值得作为正向经验沉淀
+                    ok, _level = ext.evaluate_success(state)
+                    if ok:
+                        pb = ext.extract(state, self.tenant_id, self.username)
+                        if pb is not None:
+                            # save_or_merge：同问题去重合并，避免重复插（越用越快）
+                            store.save_or_merge(pb)
+                    else:
+                        # 检索未走通 / 答案级或反馈级为负 -> 沉淀为负样本到 bad_cases，
+                        # 形成「失败样本 -> triage 诊断 -> 修复 -> 回归验证」自进化闭环
+                        fail = ext.extract_failure(state, self.tenant_id, self.username)
+                        if fail is not None:
+                            ms = getattr(self, "memory_store", None)
+                            if ms is not None and getattr(ms, "available", False):
+                                ms.add_bad_case(
+                                    query=fail["query"], source=fail["source"],
+                                    suite=fail["suite"], expected=fail["expected"],
+                                    root_cause=fail["root_cause"],
+                                    diagnosis=fail["diagnosis"], status="open",
+                                )
+                                print(f"  [evolution] ⚠ 本次未走通，已沉淀负样本到 bad_cases: "
+                                      f"{fail['query'][:40]}")
         except Exception as e:
             print(f"  [evolution] 沉淀异常(忽略): {e}")
 
@@ -1458,6 +1471,10 @@ class LangGraphRAGApp:
 
         answer = self._do_generate(query, docs, role=role)
         print(f"  [generate_simple] 生成答案 ({len(answer)} 字)")
+        # P1-R1：_do_generate 检索无果时返回固定失败文案，显式标记失败，
+        # 替代 query() 里的字符串启发式（LLM 合法答案含该句会误判成功）。
+        if answer.startswith("未检索到"):
+            return {"answer": answer, "answer_failed": True}
         return {"answer": answer}
 
     # ========================================================================
@@ -1532,10 +1549,20 @@ class LangGraphRAGApp:
             result = self._research_subtask(st, role)
             results.append(result)
 
+        # P1-6：聚合子任务 doc_grades 写入顶层，使 complex 检索成败反映到自进化信号。
+        # 补充拆解轮次保留已有研究结果的 grades（避免被本轮结果覆盖丢信号）。
+        prior_results = state.get("research_results", []) if review_rounds > 0 else []
+        all_sub_grades = [
+            g
+            for r in list(prior_results) + results
+            for g in (r.get("grades") or [])
+        ]
+
         return {
             "subtasks": subtasks,
             "research_results": results,
             "review_rounds": review_rounds + 1,
+            "doc_grades": all_sub_grades,
         }
 
     def node_reviewer(self, state: AgentState) -> dict:
@@ -1634,14 +1661,16 @@ class LangGraphRAGApp:
 
         # 如果没有任何子任务结果，直接返回“未检索到相关内容”
         if not results:
-            return {"answer": "未检索到与问题相关的文档内容，无法回答。"}
+            return {"answer": "未检索到与问题相关的文档内容，无法回答。",
+                    "answer_failed": True}
 
         # 如果所有子任务都返回“未检索到相关内容”，则无需调用 LLM，直接兜底
         all_unknown = all(
             "未检索到" in str(r.get("answer", "")) for r in results
         )
         if all_unknown:
-            return {"answer": "未检索到与问题相关的文档内容，无法回答。"}
+            return {"answer": "未检索到与问题相关的文档内容，无法回答。",
+                    "answer_failed": True}
 
         # 格式化所有子任务结果为统一格式
         results_text = "\n\n".join(
@@ -2115,6 +2144,9 @@ class LangGraphRAGApp:
             "subtask": query,
             "answer": answer,
             "doc_count": len(reranked),
+            # P1-6：把子任务级 doc_grades 上抛，供 node_planner 聚合写入顶层
+            # state["doc_grades"]，避免 complex 的检索成败反映不到自进化信号里。
+            "grades": grades,
         }
 
     # ========================================================================
@@ -2583,11 +2615,9 @@ class LangGraphRAGApp:
                     except Exception:
                         prefill_rewrites = []
                     used_playbook_pk = hit.get("pk")
-                    # 命中即复用：success_count +1（越用越快）
-                    try:
-                        store.patch_success(used_playbook_pk)
-                    except Exception as _e:
-                        print(f"[evolution] patch_success 异常(忽略): {_e}")
+                    # P1-8：只记录 pk，不再在此 patch_success——否则命中在 graph.invoke
+                    # 之前就已计数，LLM 全挂/熔断降级时这次失败回答也会 +1（虚增）。
+                    # 计数统一在下方「成功作答」后才回写。
                     print(f"[evolution] ♻ 顶层命中 playbook (score={hit.get('score')}, "
                           f"success_count={hit.get('success_count')})")
         except Exception as e:
@@ -2598,7 +2628,10 @@ class LangGraphRAGApp:
         # 如果后续执行中断，这条记录的 status 会保持 running，
         # 下次用户登录时可以通过 check_unfinished_tasks() 检测到。
         self.current_task_id = self.memory_store.create_task(
-            session_id=session_id, query=question, role=role, user_id=self.user
+            session_id=session_id, query=question, role=role, user_id=self.user,
+            # P1-7 L3：把本次命中的 playbook pk 随任务落库，供 /api/feedback
+            # 通过 task_id 反查后回灌 reinforce_feedback（关联键=last_task_id）
+            used_playbook_pk=used_playbook_pk,
         )
         print(f"  [任务] 已创建任务 {self.current_task_id}（status=running）")
 
@@ -2640,6 +2673,24 @@ class LangGraphRAGApp:
 
         answer = final_state.get("answer", "抱歉，无法回答这个问题。")
         elapsed = time.time() - total_start
+
+        # ---- 第三步·5（P1-8）：成功作答后回写 playbook 成功计数 ----
+        # 只在 graph.invoke 跑通且拿到非空 answer 时才 +1：
+        # 失败回答（LLM 全挂/熔断降级/超时）绝不虚增 success_count。
+        # 复用本次命中（可能来自 classify 或顶层）的 playbook pk。
+        _used_pk = final_state.get("used_playbook_pk") or used_playbook_pk
+        # P1-R1：改用图内显式 answer_failed 标志判定"本次作答是否成功"，
+        # 替代旧字符串启发式（"抱歉，无法回答这个问题。" not in answer）——
+        # LLM 答案中合法包含该句会漏计 success_count。仅真正成功作答才 +1。
+        answer_failed = bool(final_state.get("answer_failed"))
+        if _used_pk and answer and not answer_failed:
+            try:
+                store = getattr(self, "playbook_store", None)
+                if store is not None:
+                    store.patch_success(_used_pk)
+                    print(f"[evolution] ♻ 成功作答，patch_success(pk={_used_pk})")
+            except Exception as _e:
+                print(f"[evolution] patch_success 异常(忽略): {_e}")
 
         # ---- 第四步：更新任务状态 + 写入缓存 ----
         # 任务标记为已完成

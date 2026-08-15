@@ -256,6 +256,7 @@ pip install langchain langchain-community langgraph \
 |------|----------|------|--------|
 | Ollama | `http://192.168.200.128:11434` | LLM 推理 + bge-m3 嵌入 | 必需 |
 | Milvus | `http://192.168.200.128:19530` | 唯一向量后端 | 必需 |
+| Reranker | `http://192.168.200.128:11436` | `bge-reranker-v2-m3` 两阶段精排（llama.cpp 托管，非 Ollama） | 必需（否则静默回退 RRF，精排不生效） |
 | Redis | `192.168.200.128:6379` | 两级缓存 + 限流 + Token | 可选（降级内存） |
 | MySQL | `192.168.200.128:3306` | 记忆持久化 + 断点 | 可选（降级内存） |
 
@@ -300,7 +301,47 @@ ollama list                     # 应输出三条
 
 > 本项目默认 Ollama 跑在 VM `192.168.200.128:11434`。如果 Ollama 在本机，把 `.env` 里的 `OLLAMA_URL` 改为 `http://127.0.0.1:11434`。轻量模型 `qwen2.5:1.5b` 拉取慢可走 ModelScope 镜像 `ollama create` 导入，或不拉（自动回落 7b）。
 
-### 5.4 启动 Milvus（向量库，必需）
+### 5.4 启动 Reranker 精排服务（必需，两阶段精排）
+
+本项目默认 `RERANK_ENABLED=true`，检索链路会用 cross-encoder **`bge-reranker-v2-m3`** 对候选文档做两阶段精排（见 [六、架构详解](#六架构详解) 的「两阶段精排」）。
+
+> **注意：该模型不是 Ollama 模型。** Ollama 0.32.x 不提供 `/api/rerank` 路由，因此 reranker 由 **llama.cpp** 独立托管（OpenAI 兼容的 `/v1/rerank` 接口，监听端口 `11436`）。不要尝试 `ollama pull bge-reranker-v2-m3`——那样拉到的不是本项目调用的服务。
+
+**1) 取模型权重（GGUF 量化版）**
+
+从 HuggingFace `BAAI/bge-reranker-v2-m3` 或 ModelScope 下载量化后的 GGUF（如 `bge-reranker-v2-m3.Q4_K_M.gguf`，体积为数百 MB），放到部署机任意目录，例如 `/data/models/`。
+
+**2) 起 llama.cpp reranking 服务**
+
+用**带 reranking 支持**的 llama.cpp 服务端（`llama-server`，需编译时开启 `LLAMA_RERANKING`）：
+
+```bash
+# 在部署机（与 Ollama 同一台 VM，或独立机均可）
+llama-server \
+  -m /data/models/bge-reranker-v2-m3.Q4_K_M.gguf \
+  --reranking \
+  --port 11436 \
+  -c 2048 -b 2048 -ub 2048
+
+# 健康检查：返回 documents 的相关性得分数组即正常
+curl http://127.0.0.1:11436/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{"model":"bge-reranker-v2-m3","query":"什么是定位精度","documents":["精度指测量结果与真值的接近程度","一段无关内容"]}'
+```
+
+**3) 配置 `.env`**
+
+```bash
+RERANK_ENABLED=true
+RERANK_URL=http://<RERANK_HOST>:11436/v1/rerank   # 与上面服务的监听地址一致
+RERANK_TIMEOUT=45        # 不可超过 Gunicorn 超时/(RERANK_RETRIES+1)，否则重试还没跑完网关先断
+```
+
+> **漏掉这一步的真实后果**：`.env` 里 `RERANK_ENABLED=true` 但 reranker 服务不存在时，每次问答会先重试、再**静默回退到 RRF 排序**（代码见 `langgraph_rag_agent.py` 的 `_rerank`：重试耗尽后 `return docs[:top_n]`）。检索仍可用、服务不崩，但**精排带来的精度提升完全没生效**——这正是本文件此前遗漏安装说明、按默认配置部署会踩的坑。建议把它和 Ollama、Milvus 一起列为必装项。
+>
+> 生产环境用 systemd 单元 + 看门狗保活 reranker 进程（进程退出后同样会静默降级），避免长期无人察觉。
+
+### 5.5 启动 Milvus（向量库，必需）
 
 Milvus 是本项目的**唯一向量后端**（`VectorStoreManager` 已移除本地兜底），不可达时服务启动直接报错。生产采用 **standalone 单节点**（etcd + MinIO + milvus 三个容器，官方 compose 一把起），比分布式省资源，比嵌入式稳定。
 
@@ -407,14 +448,14 @@ print("Milvus OK, version:", c.get_server_version())
 PY
 ```
 
-### 5.5 启动 Redis（可选）
+### 5.6 启动 Redis（可选）
 
 ```bash
 docker run -d --name redis -p 6379:6379 \
   redis --requirepass dev0619
 ```
 
-### 5.6 启动 MySQL（断点重续依赖，可选）
+### 5.7 启动 MySQL（断点重续依赖，可选）
 
 ```bash
 docker run -d --name mysql8 \
@@ -434,11 +475,11 @@ mysql -h 192.168.200.128 -P 3306 -uroot -pRoot@2026 < config/init_db.sql
 
 > 未初始化直接启动 → `memory_store` 提示「缺失表」并降级内存模式，不会崩溃。Redis/MySQL 不可用都不影响核心问答。
 
-### 5.7 准备文档
+### 5.8 准备文档
 
 将企业 PDF 文档放入 `knowledge/` 目录，首次运行 / 执行 `python -m ingest.cli ingest` 自动构建向量索引。
 
-### 5.8 修改配置
+### 5.9 修改配置
 
 ```bash
 cp .env.example .env
@@ -450,7 +491,7 @@ RERANK_ENABLED=true
 RERANK_URL=http://<RERANK_HOST>:11436/v1/rerank
 RERANK_TIMEOUT=45      # 精排超时（秒）：不可超过 Gunicorn 超时/(RERANK_RETRIES+1)，否则重试还没跑完网关先断
 
-### 5.9 启动 Web 服务
+### 5.10 启动 Web 服务
 
 ```bash
 python rag_web_server.py
@@ -749,8 +790,8 @@ python -m evalkit.runner --suite retrieval|answer|both [--judge-task evalgrade]
 | 级别 | 信号 | 来源 | 状态 |
 |---|---|---|---|
 | L1 | 检索级 | `doc_grades` 相关文档数达标 | ✅ 已生效 |
-| L2 | 答案级 | faithfulness（DeepSeek judge）达标 | 🔧 设计就绪，待接线（管线尚未回写 `faithfulness_score`） |
-| L3 | 反馈级 | 用户 rating=+1 赞 / -1 踩归零 | 🔧 设计就绪，待接线（反馈接口尚未把 rating 透传给 `evaluate_success`） |
+| L2 | 答案级 | faithfulness（judge）达标 | 🔧 采样/异步接线（默认关 `FAITHFULNESS_GRADE_ENABLED=false`，避免进答题热路径；开启且有强 judge 才打分） |
+| L3 | 反馈级 | 用户 rating=+1 赞 / -1 踩归零 | ✅ 已接线（`/api/feedback` 经 `task_id` 反查命中 playbook → `reinforce_feedback`） |
 
 命中即 `patch_success(pk)`：Milvus 无原地 update，实现为真实 `delete(old) + insert(updated)`，`success_count+1`。`save_or_merge` 做相似去重（命中则合并计数不重复插）。
 
@@ -758,7 +799,7 @@ python -m evalkit.runner --suite retrieval|answer|both [--judge-task evalgrade]
 
 **与 Bad Case 互哺**：Bad Case 的 `open` 案例 → triage 后喂给自进化（失败样本反向指导 playbook 修复）；自进化强化后的 playbook → 提升生成质量 → 减少新 Bad Case。
 
-> **诚实边界**：当前"自进化"沉淀的是**检索改写经验 `rewrite_text`**（让类似问题走已知好的首轮改写），**不是预写答案**——答案仍由 LLM 实时生成。L2/L3 强化通路代码已写好但尚未接线，属可验证的诚实状态，非"已全自动进化"。
+> **诚实边界**：当前"自进化"沉淀的是**检索改写经验 `rewrite_text`**（让类似问题走已知好的首轮改写），**不是预写答案**——答案仍由 LLM 实时生成。L1 检索级、L3 反馈级已接线走通；L2 答案级默认关（`FAITHFULNESS_GRADE_ENABLED=false`，避免 judge 进答题热路径拖慢响应，开启且有强评委时才参与）。属可验证的诚实状态，非"已全自动进化"。
 
 #### 6.5 怎么跑这套体系
 

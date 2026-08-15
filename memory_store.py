@@ -226,6 +226,8 @@ class MySQLMemoryStore:
             if self._verify_schema():
                 self.available = True
                 print(f"  [MySQLMemoryStore] 连接成功: {host}:{port}/{database}")
+                # P1-7 L3：老库迁移——缺 used_playbook_pk 列则补齐（不丢数据）
+                self._migrate_task_used_playbook_pk()
 
         except Exception as e:
             print(f"  [MySQLMemoryStore] 连接失败，降级为内存模式: {e}")
@@ -278,6 +280,83 @@ class MySQLMemoryStore:
             print("  [MySQLMemoryStore] 请先执行 init_db.sql 初始化数据库后再启动服务。")
             return False
         return True
+
+    def _migrate_task_used_playbook_pk(self):
+        """P1-7 L3：老库迁移——task_queue 缺 used_playbook_pk 列则补齐。
+
+        不丢数据（ADD COLUMN），失败仅打印告警、不影响主流程。
+        P1-R1：原裸 except 会把连接类异常也当成"缺列"触发 ALTER；
+        现在只用捕获了 pymysql 的 unknown column（errno=1054）才补列，
+        其他异常（连接断开等）原样抛给外层统一告警，避免误操作。
+        """
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT used_playbook_pk FROM task_queue LIMIT 1")
+                cursor.close()
+                conn.close()
+                return  # 列已存在，无需迁移
+            except Exception as e:
+                import pymysql
+                is_unknown_column = (
+                    isinstance(e, pymysql.err.OperationalError)
+                    and getattr(e, "args", None) and e.args and e.args[0] == 1054
+                )
+                if not is_unknown_column:
+                    raise  # 非缺列异常，抛给外层统一告警
+                cursor.execute(
+                    "ALTER TABLE task_queue ADD COLUMN used_playbook_pk "
+                    "VARCHAR(64) NULL COMMENT 'P1-7 L3: 命中 playbook pk, 供反馈回灌'"
+                )
+                conn.commit()
+                cursor.close()
+                conn.close()
+        except Exception as e:
+            print(f"  [MySQLMemoryStore] 迁移 used_playbook_pk 列失败(忽略): {e}")
+
+    def get_task_playbook_pk(self, task_id: str, user_id: Optional[int] = None) -> Optional[str]:
+        """P1-7 L3：按 task_id 反查本次问答命中的 playbook pk（供反馈回灌）。
+
+        P1-R1（越权修复）：必须带 user_id 校验归属——task_queue 是
+        "谁发起、谁可回溯"的数据，无归属过滤则任意登录用户可传他人
+        task_id 触发 reinforce_feedback，越权清/抬共享 playbook 计数。
+
+        MySQL 不可用或查无记录（或归属不符）时返回 None。
+        """
+        if not task_id:
+            return None
+        if not self.available:
+            t = self._fallback_tasks.get(task_id)
+            if not t:
+                return None
+            # 内存 fallback 同样校验归属（create_task 已存发起用户）
+            if user_id is not None and t.get("user_id") is not None:
+                if int(t.get("user_id")) != int(user_id):
+                    return None
+            return t.get("used_playbook_pk")
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            if user_id is not None:
+                cursor.execute(
+                    "SELECT used_playbook_pk FROM task_queue "
+                    "WHERE task_id = %s AND user_id = %s LIMIT 1",
+                    (task_id, user_id),
+                )
+            else:
+                cursor.execute(
+                    "SELECT used_playbook_pk FROM task_queue "
+                    "WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            return row[0] if row else None
+        except Exception as e:
+            print(f"  [MySQLMemoryStore] get_task_playbook_pk 失败(忽略): {e}")
+            return None
 
     # ========================================================================
     # 对话历史 CRUD
@@ -522,7 +601,7 @@ class MySQLMemoryStore:
 
     def create_task(
         self, session_id: str, query: str, role: str = "user",
-        user_id: int = 0,
+        user_id: int = 0, used_playbook_pk: str = None,
     ) -> str:
         """
         创建一个新任务，返回 task_id。
@@ -536,6 +615,8 @@ class MySQLMemoryStore:
             query: 用户问题
             role: 用户角色
             user_id: 登录账号的 ID（admin_users.id），防止 A 用户恢复 B 用户的任务
+            used_playbook_pk: P1-7 L3——本次问答命中的 playbook pk，供 /api/feedback
+                              通过 task_id 反查后回灌 reinforce_feedback
         返回：
             task_id（UUID 格式，全局唯一）
         """
@@ -549,6 +630,8 @@ class MySQLMemoryStore:
                 "role": role,
                 "status": "running",
                 "answer": None,
+                "user_id": user_id,  # P1-R1：内存 fallback 也存归属，供回灌越权校验
+                "used_playbook_pk": used_playbook_pk,
             }
             return task_id
 
@@ -557,9 +640,9 @@ class MySQLMemoryStore:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO task_queue "
-                "(user_id, task_id, session_id, query, role, status) "
-                "VALUES (%s, %s, %s, %s, %s, 'running')",
-                (user_id, task_id, session_id, query, role),
+                "(user_id, task_id, session_id, query, role, status, used_playbook_pk) "
+                "VALUES (%s, %s, %s, %s, %s, 'running', %s)",
+                (user_id, task_id, session_id, query, role, used_playbook_pk),
             )
             cursor.close()
             conn.close()

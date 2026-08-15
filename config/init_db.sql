@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS `task_queue` (
   `status`      VARCHAR(20)  NOT NULL DEFAULT 'pending'                COMMENT '任务状态：pending→running→completed/failed/interrupted',
   `answer`      TEXT                                                   COMMENT '任务最终答案（completed 时写入）',
   `error_msg`   TEXT                                                   COMMENT '错误信息（failed / interrupted 时记录）',
+  `used_playbook_pk` VARCHAR(64) NULL                                  COMMENT 'P1-7 L3：本次问答命中的 playbook pk，供 /api/feedback 回灌 reinforce_feedback',
   `created_at`  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP       COMMENT '创建时间',
   `updated_at`  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   INDEX `idx_user_status` (`user_id`, `status`, `created_at`),

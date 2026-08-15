@@ -981,6 +981,20 @@ def _get_memory_store():
     return ms
 
 
+def _get_playbook_store():
+    """P1-7 L3：取到 PlaybookStore（进化经验库），用于反馈级信号回灌。
+
+    仅 LangGraph 引擎持有 playbook_store；旧版 RAGOrchestrator 没有 → 返回 None。
+    """
+    o = orchestrator
+    if o is None:
+        return None
+    store = getattr(o, "playbook_store", None)
+    if store is None and getattr(o, "app", None) is not None:
+        store = getattr(o.app, "playbook_store", None)
+    return store
+
+
 @app.route("/api/history", methods=["GET"])
 def get_history():
     """
@@ -1288,6 +1302,25 @@ def api_feedback():
         tenant_id=user.get("tenant_id", "default"),
         session_id=data.get("session_id"),
     )
+
+    # P1-7 L3：用户反馈级信号回灌——若本次问答命中了 playbook，赞/踩都同步到经验。
+    # 关联键 = task_id（= last_task_id，前端已在反馈里带上）：
+    #   1. 按 task_id 反查本次问答命中的 used_playbook_pk
+    #   2. 赞(1) → reinforce_feedback(pk, positive=True) 计数 +2 强确认
+    #      踩(-1) → reinforce_feedback(pk, positive=False) 计数清零标存疑
+    # 全程 try/except 降级，绝不因经验回灌失败影响反馈主流程。
+    task_id = data.get("task_id")
+    if rating in (1, -1) and task_id:
+        try:
+            # P1-R1：回灌反查必须校验 task 归属（user_id），防越权清/抬他人经验计数
+            pk = ms.get_task_playbook_pk(task_id, user_id=user["user_id"])
+            pb_store = _get_playbook_store()
+            if pk and pb_store is not None:
+                pb_store.reinforce_feedback(pk, positive=(rating == 1))
+                print(f"  [L3反馈级] task={task_id} pk={pk} "
+                      f"reinforce_feedback(positive={rating == 1})")
+        except Exception as e:
+            print(f"  [L3反馈级] 回灌异常(忽略): {e}")
 
     # 点踩 = 真实失败样本，沉淀到 bad_cases 驱动自进化
     bad_case_id = None

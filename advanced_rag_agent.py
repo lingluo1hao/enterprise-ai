@@ -385,6 +385,8 @@ class CacheManager:
         # 方案乙：缓存键嵌入知识库版本号，文档 ingest/rebuild 成功后 bump，
         # 旧版本 key 全体瞬间失效（无需 SCAN/DELETE）。
         ver = get_kb_version(self.current_tenant)
+        if ver is None:
+            ver = 0  # P1-R1：读失败降级为版本 0（缓存 key 仍为合法整数，靠 TTL 兜底）
         return f"{CACHE_PREFIX}v{ver}:{hash_hex}"
 
     def _save_entry(self, query: str, answer: str, emb: List[float]):

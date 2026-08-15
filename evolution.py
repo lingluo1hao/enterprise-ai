@@ -23,8 +23,11 @@
 """
 
 import json
+import os
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -45,6 +48,12 @@ HIT_DIST = 0.22
 # 三级成功信号阈值（强化自进化 #168）
 # L2 答案级：若管线产出了 faithfulness_score（0~1），需 >= 该阈值才视为答案可信
 ANSWER_FAITH_THRESHOLD = 0.5
+# P1-7 L2 接线开关：默认关闭（不参与答题热路径）。
+# 开启 FAITHFULNESS_GRADE_ENABLED=true 且有强 judge（DeepSeek key）时才打分；
+# 未开启时 evaluate_success 的 L2 一律中性（不拦正向、不落负样本）。
+FAITHFULNESS_GRADE_ENABLED = os.getenv("FAITHFULNESS_GRADE_ENABLED", "false").lower() in (
+    "1", "true", "yes", "on"
+)
 # L3 用户反馈级：qa_feedback.rating 取值 -1=踩 / 0=无 / 1=赞
 FEEDBACK_POSITIVE = 1      # 赞 -> 正向强化（确认经验有效）
 FEEDBACK_NEGATIVE = -1     # 踩 -> 负样本（该经验应被否定，沉淀到 bad_cases）
@@ -69,6 +78,49 @@ class RetrievalPlaybook:
     success_level: int = 1
     updated_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
     pb_id: Optional[str] = None
+    # P1-10：沉淀时的知识库版本号（全局粒度）。KB 重 ingest 后与当前版本不一致
+    # 的经验被视为过期（stale），复用路径会跳过，避免旧经验把答案带偏。
+    kb_version: Optional[int] = None
+
+
+# P1-9：进程内 per-pk 锁，串行化同一 pk 的 read-modify-write（消除并发自增丢失）。
+# 跨进程仍靠 Milvus upsert 幂等兜底，计数偶发少 +1 可接受（经验类缓存）。
+# P1-R1：_pk_locks 加 LRU 上限，防止经验库大 + 长驻进程下锁字典无界增长泄漏。
+_pk_locks_guard = threading.Lock()
+_pk_locks: "OrderedDict[str, threading.Lock]" = OrderedDict()
+_PK_LOCKS_MAX = 4096  # 经验 pk 缓存锁上限，超出淘汰最久未用的
+
+
+def _get_pk_lock(pk: str) -> threading.Lock:
+    """按 pk 取锁（不存在则创建），LRU 上限内缓存。guard 保护 dict 写入。"""
+    with _pk_locks_guard:
+        lock = _pk_locks.get(pk)
+        if lock is None:
+            if len(_pk_locks) >= _PK_LOCKS_MAX:
+                # 淘汰最久未访问的 pk（OrderedDict 首项）——经验类缓存，锁被淘汰
+                # 只是下次需重建，不影响正确性（Milvus upsert 幂等兜底）。
+                _pk_locks.popitem(last=False)
+            lock = threading.Lock()
+            _pk_locks[pk] = lock
+        else:
+            _pk_locks.move_to_end(pk)
+        return lock
+
+
+def _get_current_kb_version() -> Optional[int]:
+    """读取当前全局 KB 版本号（懒加载 kb_version 模块）。
+
+    返回 Optional[int]：
+      - int  >= 0：读成功（0 = 全新部署 Redis 尚未 bump 的合法初始版本）
+      - None     ：读失败（Redis 不可用等）——调用方应 fail-open，
+                   跳过时效校验（无法判断就不误杀经验，宁可用旧经验也别全灭）
+    kb_version.py 是零依赖独立模块，懒加载避免 import 环。
+    """
+    try:
+        from kb_version import get_kb_version
+        return get_kb_version()
+    except Exception:
+        return None
 
 
 class PlaybookStore:
@@ -104,9 +156,25 @@ class PlaybookStore:
                 # 维度漂移防护：若集合是旧 embedder 建的（维度不一致），整集合重建。
                 # 旧 playbook 维度与当前 embedder 不兼容，无法复用，重建是唯一正确路径。
                 old_dim = self._collection_dim()
-                if old_dim and old_dim != dim:
-                    print(f"[Evolution] ⚠ 检测到 skill_playbooks 维度漂移 "
-                          f"(旧={old_dim}, 新={dim})，重建集合以自修复自进化能力")
+                has_kb_ver = False
+                try:
+                    fs = self.client.describe_collection(self.collection).get("fields", [])
+                    has_kb_ver = any(
+                        f.get("name") == "kb_version" for f in fs
+                    )
+                except Exception:
+                    has_kb_ver = False
+                if (old_dim and old_dim != dim) or not has_kb_ver:
+                    # P1-R1：drop 前统计存量行数，便于评估重建损失
+                    row_count = "?"
+                    try:
+                        stats = self.client.get_collection_stats(self.collection)
+                        row_count = stats.get("row_count", "?")
+                    except Exception as _e:
+                        print(f"[Evolution] ⚠ 读取存量行数失败(忽略): {_e}")
+                    print(f"[Evolution] ⚠ 检测到 skill_playbooks schema 需重建 "
+                          f"(旧维度={old_dim}, 新维度={dim}, 含kb_version={has_kb_ver})，"
+                          f"存量经验行数={row_count}，重建集合以自修复自进化能力")
                     try:
                         self.client.drop_collection(self.collection)
                     except Exception as _e:
@@ -129,6 +197,8 @@ class PlaybookStore:
                 FieldSchema("tenant_id", DataType.VARCHAR, max_length=64),
                 FieldSchema("user_id", DataType.VARCHAR, max_length=64),
                 FieldSchema("updated_at", DataType.VARCHAR, max_length=32),
+                # P1-10：经验沉淀时的知识库版本号（全局粒度），用于失效判断
+                FieldSchema("kb_version", DataType.INT64),
             ]
             schema = CollectionSchema(fields, enable_dynamic_field=True)
             self.client.create_collection(collection_name=self.collection, schema=schema)
@@ -159,6 +229,8 @@ class PlaybookStore:
                 "tenant_id": pb.tenant_id,
                 "user_id": pb.user_id,
                 "updated_at": pb.updated_at,
+                # P1-10：沉淀时打上当前全局 KB 版本，供 query_similar 失效判断
+                "kb_version": pb.kb_version if pb.kb_version is not None else _get_current_kb_version(),
             }]
             self.client.insert(self.collection, data)
             self.client.flush(self.collection)
@@ -210,23 +282,29 @@ class PlaybookStore:
         return False
 
     def query_similar(self, intent_text: str, tenant_id: str, top_k: int = 3,
-                      dist_thresh: float = HIT_DIST):
+                      dist_thresh: float = HIT_DIST, allowed_stale: bool = False):
         """返回最相似的命中 playbook（含已知好 rewrite），无命中返回 None。
 
         dist_thresh 可覆盖（去重合并时用更紧的 MERGE_DIST）。命中判定结合
         Milvus 距离 + intent_text 文本相似度兜底（见 _is_match）。
+
+        P1-10：默认做「经验时效校验」——命中 playbook 的 kb_version 与当前全局
+        版本不一致（KB 重 ingest 过）即视为过期经验，跳过复用（返回 None，
+        fall through 到实时检索），避免旧经验把答案带偏。
+        allowed_stale=True 时跳过该校验（save_or_merge 去重合并场景用）。
         """
         if self.client is None:
             return None
         self._load_if_needed()
         try:
+            cur_version = _get_current_kb_version()
             vec = self.vdb._embed.embed_query(intent_text)
             expr = f'(tenant_id == "{tenant_id}")'
             hits = self.client.search(
                 self.collection, data=[vec], anns_field="intent_vector",
                 limit=top_k, filter=expr, consistency_level="Strong",
                 output_fields=["intent_text", "query_type", "rewrite_text",
-                               "node_path", "success_count"],
+                               "node_path", "success_count", "kb_version"],
             )[0]
             best = None
             for h in hits:
@@ -234,6 +312,22 @@ class PlaybookStore:
                 ent = h.get("entity", h.get("fields", {})) or {}
                 hit_text = ent.get("intent_text") or h.get("intent_text") or ""
                 if self._is_match(intent_text, hit_text, dist, dist_thresh):
+                    # P1-10：经验时效校验——kb_version 与当前版本不一致
+                    # （KB 重 ingest 过）视为过期，跳过复用走实时检索。
+                    # P1-R1：修复两个误杀：
+                    #   a) 合法 kb_version=0（全新部署 Redis 未 bump）不能当"缺失"——
+                    #      旧写法 int(hit_ver or -1) 把 0 变 -1，导致所有新经验存下即过期；
+                    #   b) 版本读取失败（cur_version=None）时 fail-open 跳过校验，
+                    #      避免 Redis 抖动把全部存量经验静默判死。
+                    hit_ver = ent.get("kb_version")
+                    if not allowed_stale and cur_version is not None:
+                        # P1-R1：注意括号——(hit_ver if ... else -1) 整体参与 != 比较，
+                        # 若写 int(hit_ver) if ... else -1 != cur_version，
+                        # 三元优先于 !=，条件恒为 int(hit_ver) 真值，永远判过期。
+                        if (int(hit_ver) if hit_ver is not None else -1) != cur_version:
+                            print(f"[Evolution] ⏳ 命中经验已过期(kb_version={hit_ver} vs "
+                                  f"当前 {cur_version})，跳过复用走实时检索")
+                            continue
                     best = {
                         "pk": h.get("id"),
                         "score": round(1.0 - dist, 4) if dist is not None else 1.0,
@@ -241,6 +335,7 @@ class PlaybookStore:
                         "rewrite_text": ent.get("rewrite_text"),
                         "node_path": ent.get("node_path"),
                         "success_count": ent.get("success_count", 0),
+                        "kb_version": hit_ver,
                     }
                     break
             return best
@@ -249,65 +344,80 @@ class PlaybookStore:
             return None
 
     # ---------------------------------------------------------------- 进化（强化自进化 #168）
+    # P1-9：所有按 pk 的 read-modify-write 统一走 upsert（原子覆盖，无 delete 窗口），
+    # 且显式 output_fields 回读（避免部分 pymilvus 版本下 "*" 不含 FloatVector 字段）。
+    # output_fields 必须点名 intent_vector（否则 upsert 会把向量弄丢，经验检索退化）。
+    _PK_FIELDS = [
+        "pk", "intent_vector", "intent_text", "query_type", "rewrite_text",
+        "node_path", "relevant_sources", "success_count", "tenant_id",
+        "user_id", "updated_at", "kb_version",
+    ]
+
+    def _read_pk_row(self, pk: str):
+        """按 pk 回读完整行（含向量字段）。未命中返回 None。"""
+        self._load_if_needed()
+        res = self.client.query(
+            self.collection, filter=f'pk == "{pk}"',
+            output_fields=list(self._PK_FIELDS),
+        )
+        if not res:
+            return None
+        row = dict(res[0])
+        for _k in ("distance", "score", "id"):
+            row.pop(_k, None)
+        return row
+
+    def _write_pk_row(self, pk: str, row: dict):
+        """按 pk 原子 upsert（pk 为主键 → 覆盖式写入，无 delete 窗口）。"""
+        self.client.upsert(self.collection, [row])
+        self.client.flush(self.collection)
+
     def patch_success(self, pk: str):
         """命中并复用后回调：success_count +1。
 
-        Milvus 不支持原地 update，用 delete(old) + insert(updated) 实现计数回写。
+        P1-9：原 delete+insert 非原子（delete 后崩溃丢行、并发互相覆盖），
+        改为 per-pk 锁 + upsert 原子覆盖，消除丢行窗口。
         全程 try/except 降级，绝不抛异常影响主链路。
         """
         if self.client is None or not pk:
             return
-        try:
-            self._load_if_needed()
-            res = self.client.query(
-                self.collection, filter=f'pk == "{pk}"', output_fields=["*"]
-            )
-            if not res:
-                return
-            row = dict(res[0])
-            # 清理 Milvus query 可能夹带的元字段
-            for _k in ("distance", "score", "id"):
-                row.pop(_k, None)
-            row["success_count"] = int(row.get("success_count", 0)) + 1
-            row["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            self.client.delete(self.collection, filter=f'pk == "{pk}"')
-            self.client.insert(self.collection, [row])
-            self.client.flush(self.collection)
-            print(f"[Evolution] ✔ pk={pk} success_count -> {row['success_count']}")
-        except Exception as e:
-            print(f"[Evolution] ⚠ patch_success 失败(忽略): {e}")
+        with _get_pk_lock(pk):
+            try:
+                row = self._read_pk_row(pk)
+                if row is None:
+                    return
+                row["success_count"] = int(row.get("success_count", 0)) + 1
+                row["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                self._write_pk_row(pk, row)
+                print(f"[Evolution] ✔ pk={pk} success_count -> {row['success_count']}")
+            except Exception as e:
+                print(f"[Evolution] ⚠ patch_success 失败(忽略): {e}")
 
     def reinforce_feedback(self, pk: str, positive: bool):
         """用户反馈级信号回调：赞 -> success_count +2（强确认）；踩 -> 标记降权。
 
         踩的负反馈不直接删经验（避免误杀），而是把 success_count 压到 0 并在
         updated_at 打上反馈时间戳，供 triage/治理识别为"存疑经验"。
+        P1-9：与 patch_success 一致，改 per-pk 锁 + upsert 原子覆盖。
         """
         if self.client is None or not pk:
             return
-        try:
-            self._load_if_needed()
-            res = self.client.query(
-                self.collection, filter=f'pk == "{pk}"', output_fields=["*"]
-            )
-            if not res:
-                return
-            row = dict(res[0])
-            for _k in ("distance", "score", "id"):
-                row.pop(_k, None)
-            cur = int(row.get("success_count", 0))
-            if positive:
-                row["success_count"] = cur + 2
-            else:
-                row["success_count"] = 0
-            row["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            self.client.delete(self.collection, filter=f'pk == "{pk}"')
-            self.client.insert(self.collection, [row])
-            self.client.flush(self.collection)
-            print(f"[Evolution] ✔ pk={pk} 反馈强化(positive={positive}) -> "
-                  f"success_count={row['success_count']}")
-        except Exception as e:
-            print(f"[Evolution] ⚠ reinforce_feedback 失败(忽略): {e}")
+        with _get_pk_lock(pk):
+            try:
+                row = self._read_pk_row(pk)
+                if row is None:
+                    return
+                cur = int(row.get("success_count", 0))
+                if positive:
+                    row["success_count"] = cur + 2
+                else:
+                    row["success_count"] = 0
+                row["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                self._write_pk_row(pk, row)
+                print(f"[Evolution] ✔ pk={pk} 反馈强化(positive={positive}) -> "
+                      f"success_count={row['success_count']}")
+            except Exception as e:
+                print(f"[Evolution] ⚠ reinforce_feedback 失败(忽略): {e}")
 
     def save_or_merge(self, pb: "RetrievalPlaybook"):
         """沉淀经验：若已存在高度相似（dist <= MERGE_DIST）的 playbook，则去重
@@ -319,9 +429,12 @@ class PlaybookStore:
             return None
         try:
             hit = self.query_similar(pb.intent_text, pb.tenant_id,
-                                     top_k=1, dist_thresh=MERGE_DIST)
+                                     top_k=1, dist_thresh=MERGE_DIST,
+                                     allowed_stale=True)
             if hit and hit.get("pk"):
-                # 已存在同一问题经验，去重：复用计数 +1（越用越快）
+                # 已存在同一问题经验，去重：复用计数 +1（越用越快）。
+                # allowed_stale=True：去重合并不受 KB 版本约束（同一问题去重，
+                # 而不是按版本丢弃），避免旧经验反复重建堆积。
                 self.patch_success(hit["pk"])
                 return hit["pk"]
             pb.pb_id = pb.pb_id or str(uuid.uuid4())
@@ -353,10 +466,11 @@ class Extractor:
         relevant = sum(1 for g in grades if g)
         retrieval_ok = relevant >= GRADE_THRESHOLD
 
-        # L2 答案级（可选信号，无则中性）
+        # L2 答案级（可选信号，无则中性；P1-7：开关关闭时一律中性，
+        # 不引入热路径叠加 judge 调用，也不因弱评委误判落负）
         fs = state.get("faithfulness_score")
         answer_ok = None
-        if fs is not None:
+        if FAITHFULNESS_GRADE_ENABLED and fs is not None:
             try:
                 answer_ok = float(fs) >= ANSWER_FAITH_THRESHOLD
             except (TypeError, ValueError):
@@ -424,6 +538,8 @@ class Extractor:
             tenant_id=tenant_id,
             user_id=user_id,
             success_level=level,
+            # P1-10：沉淀时快照当前全局 KB 版本，供 query_similar 失效判断
+            kb_version=_get_current_kb_version(),
         )
 
     @staticmethod
