@@ -232,6 +232,7 @@ RATE_LIMIT_DEFAULT = 60          # 通用接口
 RATE_LIMIT_QUERY = 30            # 查询接口（较重）
 RATE_LIMIT_STREAM = 10           # 流式查询（最重）
 RATE_LIMIT_ADMIN = 30            # 管理接口
+RATE_LIMIT_DIAGNOSE = 6          # bad case 自动诊断（最重：单次 3~6 个 LLM 调用，串行分钟级）
 
 _RATE_WINDOW = 60                # 时间窗口（秒）
 
@@ -282,6 +283,8 @@ def _get_rate_limit_for_route() -> int:
     path = request.path
     if path == "/api/query":
         return RATE_LIMIT_QUERY
+    if path.startswith("/api/admin/bad_cases/") and path.endswith("/diagnose"):
+        return RATE_LIMIT_DIAGNOSE
     if path == "/api/query/stream":
         return RATE_LIMIT_STREAM
     if path.startswith("/api/admin/"):
@@ -1107,13 +1110,14 @@ _BADCASE_PAGE = r"""
       </div>
       <select id="fRoot" onchange="applyFilter()">
         <option value="">根因: 全部</option>
-        <option value="R1">R1 检索缺失</option>
-        <option value="R2">R2 检索噪声</option>
-        <option value="R3">R3 改写失败</option>
-        <option value="R4">R4 生成偏离</option>
-        <option value="R5">R5 答案不符</option>
-        <option value="R6">R6 引用错误</option>
-        <option value="R7">R7 超时/异常</option>
+        <option value="R1">R1 召回丢失</option>
+        <option value="R2">R2 排序埋没</option>
+        <option value="R3">R3 改写/精排负优化</option>
+        <option value="R4">R4 权限误杀</option>
+        <option value="R5">R5 生成幻觉</option>
+        <option value="R6">R6 答非所问</option>
+        <option value="R7">R7 拒答错误</option>
+        <option value="R8">R8 跨租户泄漏</option>
         <option value="OK">OK 隔离负例</option>
       </select>
       <input id="fQ" placeholder="搜索问题 / case id" oninput="applyFilter()" style="min-width:200px">
@@ -1224,21 +1228,63 @@ function openDetail(id){
     '<div class="row"><div class="k">处理人</div><div class="v muted">'+esc(c.resolved_by||'—')+(c.resolved_at?(' · '+fmtTime(c.resolved_at)):'')+'</div></div>'+
     '<div class="row"><div class="k">处理记录</div><textarea id="detDiag" rows="3" placeholder="补充根因分析 / 修复说明...">'+esc(c.diagnosis||'')+'</textarea></div>'+
     '<div class="row"><div class="k">标准答案（可选，用于回归验证）</div><textarea id="detExp" rows="2" placeholder="填写标准答案...">'+esc(c.expected||'')+'</textarea></div>'+
+    '<div class="row"><div class="k">根因改判（R1~R8，可与自动诊断不同）</div><select id="detRc" style="width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:13px">'+
+      '<option value="">（不改判）</option>'+rcOptions(c.root_cause)+'</select></div>'+
     '<div class="actions">'+
+      '<button class="btn btn-ghost" id="btnDiag" onclick="autoDiagnose()">⚡ 自动诊断</button>'+
       '<button class="btn btn-primary" onclick="updateCase(\'resolved\')">✓ 标记为已解决</button>'+
       '<button class="btn btn-blue" onclick="updateCase(\'in_progress\')">处理中</button>'+
       '<button class="btn btn-danger" onclick="updateCase(\'open\')">退回重测</button>'+
-    '</div>';
+    '</div>'+
+    '<div id="diagOut" style="display:none;margin-top:12px;border:1px dashed var(--border);border-radius:8px;padding:12px;background:#fafbfc"></div>';
+}
+
+const RC_LABELS = {R1:'R1 召回丢失',R2:'R2 排序埋没',R3:'R3 改写/精排负优化',R4:'R4 权限误杀',R5:'R5 生成幻觉',R6:'R6 答非所问',R7:'R7 拒答错误',R8:'R8 跨租户泄漏'};
+function rcOptions(cur){
+  return Object.entries(RC_LABELS).map(([k,v])=>
+    '<option value="'+k+'"'+(cur===k?' selected':'')+'>'+v+'</option>').join('');
+}
+
+async function autoDiagnose(){
+  if(!curId) return;
+  const btn = document.getElementById('btnDiag');
+  const out = document.getElementById('diagOut');
+  btn.disabled = true; btn.textContent = '⏳ 诊断中（约 0.5~2 分钟）…';
+  out.style.display = 'block';
+  out.innerHTML = '<span class="muted">复跑检索 → judge 复判 → 根因归因中，请勿关闭页面…</span>';
+  try{
+    const r = await fetch('/api/admin/bad_cases/'+curId+'/diagnose', {
+      method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body: JSON.stringify({})
+    });
+    const d = await r.json();
+    if(!d.ok){ out.innerHTML = '<span style="color:var(--danger)">✗ 诊断失败：'+esc(d.error||'未知')+'</span>'; return; }
+    const rc = d.root_cause ? ('<span class="rc">'+esc(d.root_cause)+'</span> '+esc(d.title||'')) : '<span class="muted">未能归因（转人工）</span>';
+    out.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'+
+        '<strong style="font-size:13px">⚡ 自动诊断结果</strong>'+
+        '<span class="muted">引擎: '+esc(d.engine||'workflow')+' · 置信度: '+esc(d.confidence||'-')+
+        (d.written?' · 已回写':' · 未回写')+'</span></div>'+
+      '<div style="margin-bottom:6px">'+rc+'</div>'+
+      '<div class="v" style="font-size:12px;white-space:pre-wrap">'+esc(d.diagnosis||'')+'</div>'+
+      '<div class="muted" style="margin-top:8px">机器建议仅供参考；确认无误请人工流转状态 / 改判根因。</div>';
+    await loadCases(); openDetail(curId);  // 刷新后详情卡直接展示落库的诊断与根因
+  }catch(e){
+    out.innerHTML = '<span style="color:var(--danger)">✗ 请求失败：'+esc(e.message)+'</span>';
+  }finally{
+    btn.disabled = false; btn.textContent = '⚡ 自动诊断';
+  }
 }
 
 async function updateCase(status){
   if(!curId) return;
   const diag = document.getElementById('detDiag').value;
   const exp = document.getElementById('detExp').value;
+  const rc = document.getElementById('detRc') ? document.getElementById('detRc').value : '';
   try{
     const r = await fetch('/api/admin/bad_cases/'+curId, {
       method:'PATCH', headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
-      body: JSON.stringify({status:status, diagnosis:diag, expected:exp})
+      body: JSON.stringify({status:status, diagnosis:diag, expected:exp, root_cause:rc||null})
     });
     const d = await r.json();
     if(d.ok){ await loadCases(); openDetail(curId); }
@@ -1365,8 +1411,9 @@ def api_admin_bad_cases():
 def api_admin_bad_case_update(bc_id):
     """管理后台：更新某条 bad case 的状态 / 处理记录（bad case 闭环「修复→验证」落点）。
 
-    请求体：{status?(open|in_progress|resolved), diagnosis?, expected?}
+    请求体：{status?(open|in_progress|resolved), diagnosis?, expected?, root_cause?(R1~R8)}
     仅管理员可访问；resolved_by 自动取当前登录用户。
+    root_cause 支持人工改判（与 agentworkflow 自动诊断写的是同一字段）。
     """
     auth_result = _require_auth()
     if auth_result:
@@ -1378,10 +1425,67 @@ def api_admin_bad_case_update(bc_id):
         return jsonify({"ok": False, "error": "记忆层不可用"}), 503
     data = request.get_json(silent=True) or {}
     resolved_by = g.current_user.get("username") or g.current_user.get("user_id")
+    root_cause = (data.get("root_cause") or "").strip() or None
     ok = ms.update_bad_case_status(
         bc_id, status=data.get("status"), resolved_by=resolved_by,
-        diagnosis=data.get("diagnosis"), expected=data.get("expected"))
+        diagnosis=data.get("diagnosis"), expected=data.get("expected"),
+        root_cause=root_cause)
     return jsonify({"ok": bool(ok)})
+
+
+@app.route("/api/admin/bad_cases/<int:bc_id>/diagnose", methods=["POST"])
+def api_admin_bad_case_diagnose(bc_id):
+    """Bad Case 自动诊断（AgentWorkflow：Workflow 流水线 + ReAct 探查）。
+
+    复跑检索（双租户视角）→ LLM 探查文档相关性（evalgrade 链）→ judge 复判
+    故障答案 → 规则归因（R1~R8）→ 回写 root_cause/diagnosis（open→in_progress）。
+    低置信 case 自动升级 ReAct 探查。方案见
+    docs/reports/AgentWorkflow_BadCase自动诊断方案.md。
+
+    请求体：{"dry_run": true?}（dry_run 只出结论不落库）
+    注意：同步接口，CPU 模型下单次 30s~2min，前端需 loading 态；
+    限流 RATE_LIMIT_DIAGNOSE=6/min（IP 令牌桶，见 _get_rate_limit_for_route）。
+    仅管理员可访问；Token 用量按触发者归因；审计 action=bad_case_diagnose。
+    """
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    if g.current_user.get("role") not in ("admin", "super_admin"):
+        return jsonify({"ok": False, "error": "需要管理员权限"}), 403
+    if orchestrator is None:
+        return jsonify({"ok": False, "error": "引擎未初始化"}), 503
+    ms = _get_memory_store()
+    if ms is None:
+        return jsonify({"ok": False, "error": "记忆层不可用"}), 503
+
+    # 注入生产组件（复用全局 orchestrator 的 llm / vector_db，不重复建连接）：
+    # LangGraph 模式组件在 orchestrator.app 上；legacy RAGOrchestrator 直接持有。
+    from types import SimpleNamespace
+    base = getattr(orchestrator, "app", orchestrator)
+    llm_c = getattr(base, "llm", None)
+    db_c = getattr(base, "vector_db", None)
+    if llm_c is None or db_c is None:
+        return jsonify({"ok": False, "error": "诊断组件不可用（llm/vector_db 缺失）"}), 503
+    comp = SimpleNamespace(llm=llm_c, vector_db=db_c, memory_store=ms)
+
+    data = request.get_json(silent=True) or {}
+    dry_run = bool(data.get("dry_run"))
+    username = g.current_user.get("username") or "admin"
+    try:
+        from agentworkflow.diagnose import diagnose_bad_case
+        result = diagnose_bad_case(bc_id, components=comp,
+                                   dry_run=dry_run, actor=username)
+    except Exception as e:
+        _audit_log("bad_case_diagnose", target=str(bc_id), result="failure",
+                   detail=f"{type(e).__name__}: {e}", username=username)
+        return jsonify({"ok": False, "error": f"诊断执行失败: {e}"}), 500
+
+    _audit_log("bad_case_diagnose", target=str(bc_id),
+               result="success" if result.get("ok") else "failure",
+               detail=f"root_cause={result.get('root_cause')} "
+                      f"engine={result.get('engine')} dry_run={dry_run}",
+               username=username)
+    return jsonify(result)
 
 
 @app.route("/api/change-password", methods=["POST"])

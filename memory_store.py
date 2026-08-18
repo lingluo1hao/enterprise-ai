@@ -844,13 +844,43 @@ class MySQLMemoryStore:
             rows = [r for r in rows if r.get("root_cause") == root_cause]
         return rows[:limit]
 
+    def get_bad_case(self, bc_id) -> Optional[Dict]:
+        """按主键取单条 bad case（agentworkflow 自动诊断入口用）。不存在返回 None。"""
+        if not self.available:
+            for bc in self._fallback_bad_cases:
+                if bc.get("id") == bc_id:
+                    return dict(bc)
+            return None
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, source, suite, case_id, query, answer, expected, "
+                "root_cause, diagnosis, status, resolved_by, created_at, resolved_at "
+                "FROM bad_cases WHERE id = %s", (bc_id,))
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            if row is None:
+                return None
+            cols = ["id", "source", "suite", "case_id", "query", "answer", "expected",
+                    "root_cause", "diagnosis", "status", "resolved_by",
+                    "created_at", "resolved_at"]
+            return dict(zip(cols, row))
+        except Exception as e:
+            print(f"  [MySQLMemoryStore] get_bad_case 失败: {e}")
+            return None
+
     def update_bad_case_status(self, bc_id, status: str = None,
                                resolved_by: str = None, diagnosis: str = None,
-                               expected: str = None) -> bool:
+                               expected: str = None,
+                               root_cause: str = None) -> bool:
         """更新 bad case 状态 / 处理记录（bad case 闭环的「修复→验证」落点）。
 
         返回是否成功。status 仅允许 open/in_progress/resolved；
         status=resolved 时自动写 resolved_at。
+        root_cause：R1~R8 根因码（agentworkflow 自动诊断与人工 PATCH 共用此参数；
+        此前该字段只能建库时写入，人工与自动都无法更新——本参数补上该缺口）。
         """
         if status not in (None, "open", "in_progress", "resolved"):
             status = None
@@ -866,6 +896,8 @@ class MySQLMemoryStore:
                         bc["diagnosis"] = diagnosis
                     if expected is not None:
                         bc["expected"] = expected
+                    if root_cause is not None:
+                        bc["root_cause"] = root_cause
                     if status == "resolved":
                         bc["resolved_at"] = time.time()
                     return True
@@ -886,6 +918,9 @@ class MySQLMemoryStore:
             if expected is not None:
                 sets.append("expected = %s")
                 params.append(expected)
+            if root_cause is not None:
+                sets.append("root_cause = %s")
+                params.append(root_cause)
             if status == "resolved":
                 sets.append("resolved_at = NOW()")
             if not sets:
