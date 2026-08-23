@@ -961,6 +961,7 @@ waitress-serve --threads=8 --port=8080 rag_web_server:app
 | [docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md](docs/reports/rag_retrieval_upgrade/RAG检索大厂化改造方案.md) | RAG 检索召回链路优化：reranker 两阶段精排 .env 化 + RRF 候选池放大 + 多租户 tenant 透传修复 + 图查询真图意图优先；含 CURRENT/FIXED-A/RRF 三列量化验证（配图见同目录 `images/`） |
 | [docs/reports/Harness_BadCase_自进化体系改造方案.md](docs/reports/Harness_BadCase_自进化体系改造方案.md) | Harness / Bad Case / 自进化 体系改造方案：以「评测 Harness 工程 + Bad Case 失败样本库 + 模型自进化闭环」三件事为主线，含 DeepSeek 强 Judge、生成难度路由、测试判分硬化、reranker 三层防御、evalkit 框架修复，及第七部分环境/部署/外部依赖坑记录 |
 | [docs/reports/BadCase9_答非所问_根因诊断报告.md](docs/reports/BadCase9_答非所问_根因诊断报告.md) | Bad Case #9 根因复盘：`_parse_hits` 出口契约错位（`page_content` 被偷换为整章父文本 + 入库字节截断导致答案在写库时被物理删除）导致答非所问；含 A/B 对照验证与修复，是「检索层铁律」的实证来源 |
+| [docs/reports/AgentWorkflow_BadCase自动诊断方案.md](docs/reports/AgentWorkflow_BadCase自动诊断方案.md) | AgentWorkflow 生产落地：Bad Case 自动诊断——`agentworkflow/` 包以「Workflow 诊断流水线 + ReAct 低置信探查」双形态把点踩/异常样本从人工 triage 变为自动归因回写（root_cause R1~R8 + 诊断 + 置信度），`/admin/bad_cases` 一键触发，人工只确认 |
 
 ---
 

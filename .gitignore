@@ -37,3 +37,6 @@ assets/proposal_images/*.png
 
 # 自动生成的配图产物（程序运行时自动创建，可重建，不提交）
 assets/figures/
+
+# agentworkflow 诊断运行产物（证据链 json，可重建）
+agentworkflow/runs/
