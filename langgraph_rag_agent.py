@@ -69,6 +69,7 @@ import json
 import re
 import traceback
 import contextvars
+import threading
 from typing import TypedDict, List, Dict, Any, Optional
 
 import warnings
@@ -320,6 +321,21 @@ class AgentState(TypedDict, total=False):
     # 这个字段是条件边 route_after_classify 的决策依据。
     query_type: str
 
+    # classify 判定来源快照（bad case 归因用——case #17 的教训：只存结果不存来源，
+    # 出问题分不清是语义路由判的还是规则兜底判的）。v2 实际取值：
+    #   "semantic"                — L1 语义路由（bge-m3 余弦）高置信判定
+    #   "semantic:ambiguous->llm" — L1 歧义，L2 LLM JSON 兜底判定
+    #   "lexical"                 — embedder 离线/未就绪，降级 _quick_classify
+    #   "lexical:fallback"        — 组件缺失，降级 _quick_classify
+    #   "rule:multi_question"     — 多问句强制 complex（节点级确定性规则）
+    #   "cache"                   — 命中意图缓存
+    classify_source: str
+
+    # L1 余弦置信度（0-1）；lexical/fallback 路径为 0 或兜底值
+    classify_confidence: float
+    # top3 候选 [(intent, score), ...] 按分数降序（bad case 归因用）
+    classify_candidates: list
+
     # ===== 多轮检索（simple 分支使用） =====
 
     # 当前轮次的改写查询词列表。
@@ -537,6 +553,8 @@ _ctx_task_id = contextvars.ContextVar("rag_task_id", default=None)
 # 所以额外留一个「最近一次任务 ID」，query() 返回后调用方仍可读到。
 _ctx_last_task_id = contextvars.ContextVar("rag_last_task_id", default=None)
 
+from intent_classifier import IntentClassifier, IntentResult
+
 
 class LangGraphRAGApp:
     """
@@ -659,6 +677,19 @@ class LangGraphRAGApp:
         # 首次运行：将默认提示词导入 MySQL
         if self.pm.available:
             self.pm.import_defaults()
+
+        # 4.6 意图识别组件（v2 语义路由，线上线下统一，解耦 fast_mode）
+        # centroid 懒加载，Ollama 不可达时自动降级 lexical，不影响主流程。
+        try:
+            self.intent_classifier = IntentClassifier()
+            print("  [4.6] 意图识别组件 IntentClassifier 已挂载（centroid 懒加载）")
+            # 启动期后台预热 centroid：冷构建约 10-40s（30 个示例串行 embed），
+            # 若留给首个用户请求承担，流式对话框会静默无输出、被当成"卡死"。
+            threading.Thread(target=self._warmup_intent_classifier,
+                             daemon=True, name="intent-warmup").start()
+        except Exception as e:
+            self.intent_classifier = None
+            print(f"  [4.6] ⚠ IntentClassifier 挂载失败(降级): {e}")
 
         # 4.5 自进化层（方案 A：嫁接 Hermes 式自进化 —— 越用越快）
         # 复用 self.vector_db（Milvus 客户端 + Ollama embedding），独立集合 skill_playbooks。
@@ -966,8 +997,11 @@ class LangGraphRAGApp:
         - complex → 多智能体协作（耗时长、回答全）
         - chitchat → 直接 LLM 回答（不触发检索）
 
-        快速模式（fast_mode=True）或无历史上下文时，跳过 LLM 调用，
-        用规则快速分类（_quick_classify），不消耗 LLM tokens。
+        v2 改造：意图判定委托给独立 IntentClassifier（语义路由为主），
+        线上线下统一，不再受 fast_mode 决定是否走 LLM 的规则网关约束：
+        主路径 L1 语义路由（bge-m3 余弦，零 LLM 成本），仅低置信/歧义才 L2
+        LLM 兜底；embedder 离线降级 _quick_classify。上下文消解保持原行为
+        （仅非 fast_mode 且有历史时做）。
 
         输入：
             state["query"] — 用户原始问题
@@ -995,38 +1029,127 @@ class LangGraphRAGApp:
             print(f"  [classify] 经验查询异常(忽略): {e}")
 
         # —— 确定性修复：多问句问题强制走 complex 且跳过历史消解 ——
-        # 同一问题在「有/无历史」两种状态下会被 LLM 消解出不同 query，
-        # 导致两次检索结果不一致。多问号问题几乎都是自包含复杂问题，
-        # 直接判定 complex 并用原始 query，消除历史依赖带来的随机性。
         if query.count("？") >= 2 or query.count("?") >= 2:
             print(f"  [classify] 类型=complex（多问句强制，跳过 LLM 消解）")
             return {"query_type": "complex", "resolved_query": query,
+                    "classify_source": "rule:multi_question", "classify_confidence": 1.0,
                     "prefill_rewrites": prefill, "used_playbook_pk": used_playbook_pk}
 
-        # 构建最近 4 轮对话历史的文本摘要
         history_text = self._format_history(messages, max_turns=4)
 
-        if self.fast_mode or not history_text:
-            # 快速模式或无历史：跳过 LLM，用规则快速分类
+        # —— v2 主路径：统一意图识别组件（线上/CLI 共用，解耦 fast_mode）——
+        clf = getattr(self, "intent_classifier", None)
+        if clf is not None:
+            try:
+                res = clf.classify(query,
+                                   lexical_fn=self._quick_classify,
+                                   llm_fn=self._llm_classify_json)
+            except Exception as e:  # noqa: BLE001
+                # 意图识别是主链路上的网络依赖组件，任何异常都必须降级而非拖死问答
+                print(f"  [classify] ⚠ 意图组件异常(降级规则): {e}")
+                res = IntentResult(self._quick_classify(query), 0.0,
+                                   "lexical:fallback")
+            qtype = res.intent
+            cands = res.candidates
+            print(f"  [classify] 语义路由 类型={qtype} 置信={res.confidence:.2f} 来源={res.source}")
+            if cands:
+                print(f"  [classify] 候选: {cands}")
+            # —— P3b：低置信进 bad case（仅语义路由在线但没把握时；
+            #     embedder 离线降级 lexical / 组件兜底 不刷屏）——
+            if res.confidence < 0.5 and res.source not in (
+                    "lexical", "lexical:fallback", "fallback:default"):
+                try:
+                    ms = getattr(self, "memory_store", None)
+                    if ms is not None:
+                        cands_txt = "; ".join(f"{it}={s}" for it, s in cands)
+                        ms.add_bad_case(
+                            query, source="intent_lowconf", suite="intent",
+                            expected=res.intent, root_cause=res.source,
+                            diagnosis=f"candidates: {cands_txt}",
+                        )
+                        print(f"  [classify] ⚠ 低置信({res.confidence})意图进 bad case: {query}")
+                except Exception as e:
+                    print(f"  [classify] bad case 入库异常(忽略): {e}")
+        else:
             qtype = self._quick_classify(query)
-            print(f"  [classify] 类型={qtype}（快速分类）")
-            return {"query_type": qtype, "resolved_query": query,
-                    "prefill_rewrites": prefill, "used_playbook_pk": used_playbook_pk}
+            res = IntentResult(qtype, 0.0, "lexical:fallback")
+            cands = []
+            print(f"  [classify] 类型={qtype}（组件缺失，降级规则）")
 
-        # 从提示词管理器获取 classify 模板
-        prompt = self.pm.get_prompt("classify")
-        system = prompt["system"]
-        user = self.pm.format_user_message(
-            prompt["user_template"],
-            history=history_text, query=query
-        )
-        result = self.llm.chat(system, user, task="classify", user=self.username)
+        # —— 上下文消解：仅非 fast_mode 且有历史，且为检索类意图 ——
+        # 归因一致性铁律：classify_source 必须反映真实决策者。
+        #   - semantic 高置信判定不被消解 LLM 翻盘（语义路由是权威，防 case #17 复发）
+        #   - lexical 降级路径保留旧行为（允许消解 LLM 纠偏——此时它是最高裁决者），
+        #     但 source 追加 |resolve_override 标记
+        resolved = query
+        resolve_overridden = False
+        if not self.fast_mode and history_text and qtype in ("simple", "complex", "comparison"):
+            prompt = self.pm.get_prompt("classify")
+            system = prompt["system"]
+            user = self.pm.format_user_message(
+                prompt["user_template"],
+                history=history_text, query=query
+            )
+            llm_out = self.llm.chat(system, user, task="classify", user=self.username)
+            qtype2, resolved = self._parse_classify(llm_out, query)
+            if qtype2 and qtype2 != qtype:
+                if res.source.startswith("lexical"):
+                    qtype = qtype2
+                    resolve_overridden = True
+                    print(f"  [classify] 消解 LLM 纠偏(lexical 降级路径)：类型改判 {qtype2}")
+                else:
+                    print(f"  [classify] ⚠ 消解 LLM 判 {qtype2} 与语义路由 {qtype} 不一致，"
+                          f"保留语义判定")
+            print(f"  [classify] 类型={qtype}, 消解问题={resolved[:40]}")
 
-        # 解析 LLM 输出的 JSON（含容错兜底）
-        qtype, resolved = self._parse_classify(result, query)
-        print(f"  [classify] 类型={qtype}, 消解问题={resolved[:40]}")
         return {"query_type": qtype, "resolved_query": resolved,
+                "classify_source": res.source + ("|resolve_override" if resolve_overridden else ""),
+                "classify_confidence": getattr(res, "confidence", 0.0),
+                "classify_candidates": getattr(res, "candidates", []),
                 "prefill_rewrites": prefill, "used_playbook_pk": used_playbook_pk}
+
+    # ========================================================================
+    # L2 兜底：LLM 结构化意图判定（仅 L1 歧义/低置信时由 IntentClassifier 调用）
+    # ========================================================================
+    def _llm_classify_json(self, query: str, intent_list: List[str]) -> Optional[str]:
+        """
+        【L2 兜底】用 LLM 做意图判定，返回原始文本（IntentClassifier 负责解析）。
+
+        gateway 当前无 chat_with_tools，故用 JSON 结构化输出（把意图当候选列表），
+        而非 function-calling。仅在 L1 语义路由拿不准时才被调用，频率低。
+        """
+        intents_str = "、".join(intent_list)
+        system = (
+            "你是意图分类器。只输出一个 JSON 对象，不要任何解释或 Markdown。\n"
+            f"可选意图：{intents_str}。\n"
+            "字段：intent（必须是上述之一）、confidence（0-1 浮点数）。"
+        )
+        user = f"用户问题：{query}\n请判断意图并输出 JSON。"
+        try:
+            return self.llm.chat(system, user, task="classify", user=self.username)
+        except Exception as e:
+            print(f"  [classify] L2 LLM 兜底失败(忽略): {e}")
+            return None
+
+    def _warmup_intent_classifier(self):
+        """
+        【后台预热】启动期构建意图路由 centroid，用户首条消息不再承担冷构建。
+
+        失败完全静默（打印告警）——运行时 classify 自带失败冷却与 lexical 降级。
+        """
+        try:
+            clf = getattr(self, "intent_classifier", None)
+            if clf is not None:
+                t0 = time.time()
+                ready = clf.warmup()
+                if ready:
+                    print(f"  [4.6] 意图路由预热完成({time.time() - t0:.1f}s)，"
+                          f"首个请求零冷启动")
+                else:
+                    print(f"  [4.6] ⚠ 意图路由预热未就绪({time.time() - t0:.1f}s)，"
+                          f"运行时将降级 lexical 并自动重试")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [4.6] ⚠ 意图路由预热异常(运行时降级): {e}")
 
     # ========================================================================
     # 条件边路由函数
@@ -1048,7 +1171,14 @@ class LangGraphRAGApp:
         返回：
             "simple" | "complex" | "chitchat"
         """
-        return state.get("query_type", "simple")
+        qtype = state.get("query_type", "simple")
+        # v2 新意图收敛到图的三个合法键（comparison→complex，其余→chitchat；
+        # 专属处理留待 P3/P4）
+        if qtype == "complex" or qtype == "comparison":
+            return "complex"
+        if qtype in ("chitchat", "oos", "clarify", "feedback"):
+            return "chitchat"
+        return "simple"
 
     # ========================================================================
     # 闲聊分支：direct_llm

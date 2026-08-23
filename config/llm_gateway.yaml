@@ -45,7 +45,9 @@ models:
   # ---- 生成专用别名：与 local-qwen 同底座(qwen2:7b)，但温度放开到 0.3 ----
   # 只给最终答案生成(generate/write/synthesize/direct)用，句子更自然不死板；
   # Ollama 按模型名(qwen2:7b)缓存权重，不会重复占用显存。
-  # 路由/决策节点(classify/grade/rewrite/compress/plan/review/react)仍走 local-qwen/local-small，保持 temp=0 确定性。
+  # 路由/决策节点(grade/rewrite/compress/plan/review/react)仍走 local-qwen/local-small，保持 temp=0 确定性。
+  # 例外：classify 已切 deepseek 优先（见 routing.classify）——类型判定含闲聊/OOS
+  # 语义识别，本地小模型实测会误杀（case #17：开场闲聊被判 simple 走了检索）。
   local-qwen-gen:
     provider: ollama
     model: qwen2:7b
@@ -163,7 +165,9 @@ models:
 #   react     ReActAgent.run                         ReAct 推理
 #     ↑ 以上是"论述题"，直接上大模型
 routing:
-  classify:   [local-qwen]           # 决定是否要走 RAG，质量优先
+  classify:   [deepseek-chat, local-qwen]  # 决定是否要走 RAG：云端强模型判类型（含
+                                           # 闲聊/OOS 语义），本地 7b 兜底；规则词表
+                                           # 是 LLM 整链失败时的最后防线（node_classify）
   grade:      [local-small, local-qwen]
   # ---- 评测 judge：RAG 答案质量打分（faithfulness / relevancy）----
   # 优先级 deepseek-chat（云端强模型，需 DEEPSEEK_API_KEY + enabled=true）；

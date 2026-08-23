@@ -1,0 +1,86 @@
+# =============================================================================
+# 意图识别配置（v2 语义路由范式）
+# -----------------------------------------------------------------------------
+# 设计原则（参照大厂 LLM 时代做法，不再用「词典 + 分类 prompt」）：
+#   - 每个意图用 examples（示例话语）定义，离线用 bge-m3 embed 成 centroid；
+#   - 线上 query 实时 embed 后做余弦相似度，最近意图即判定 —— 无关键词、无分类 prompt，
+#     天然抗改写/同义（case #17「你今年多大了」与「心跳间隔是多少」字面都含「是多少」，
+#     但向量空间里相距甚远，一判即分）；
+#   - L2 仅当 L1 低置信/歧义时才调 LLM（JSON 结构化输出，gateway 暂无 tools）兜底；
+#   - embedder 离线则降级到 lexical 规则（原 _quick_classify）。
+# 加意图只改本文件，不动路由代码。
+# =============================================================================
+
+_meta:
+  embed_model: bge-m3
+  # 注意：embedding 服务地址不在此配置——IntentClassifier 复用 advanced_rag_agent.
+  # _make_embedder()，由环境变量 OLLAMA_BASE_URL / OLLAMA_EMBED_MODEL 统一驱动，
+  # 避免双处配置漂移。
+  threshold: 0.60            # L1 语义路由判定门槛（低于则触发 L2）
+  ambiguity_gap: 0.08        # 第一/第二意图相似度差，小于则视为歧义
+  llm_tiebreak: true         # L1 歧义时是否调 LLM 兜底
+  default_intent: simple     # 全失败时兜底
+  cache_size: 1024
+  centroid_fail_cooldown: 60  # centroid 构建失败后的重试冷却秒数（防离线风暴）
+
+intents:
+  chitchat:
+    description: 闲聊、问候、感谢、身份/年龄、情绪、寒暄，无知识库答案
+    examples:
+      - 你好
+      - 在吗
+      - 谢谢
+      - 你是谁
+      - 你今年多大了
+      - 你几岁
+      - 今天天气怎么样
+      - 最近怎么样
+
+  simple:
+    description: 单一事实查询，一次检索即可作答
+    examples:
+      - 心跳间隔是多少
+      - 心跳是多少
+      - 波特率是多少
+      - 定位精度是多少
+      - 设备的供电电压是多少
+      - 这个模块支持哪些通讯协议
+
+  complex:
+    description: 多维度复合问题，需多轮检索或任务拆解
+    examples:
+      - 定位方式有哪些，各自精度如何，续航怎样
+      - 它的定位精度、几种方式、续航如何
+      - 怎么配置设备，配置项有哪些，分别什么作用
+      - 这款产品和上一代比有什么升级
+
+  comparison:
+    description: 两对象对比类问题
+    examples:
+      - A 和 B 的定位方式有什么区别
+      - 对比一下两种通讯协议的优缺点
+      - 这两款设备参数上差在哪
+
+  oos:
+    description: 超出知识库范围（非闲聊但也答不了）
+    examples:
+      - 帮我写一首诗
+      - 明天股票会涨吗
+      - 你能帮我订外卖吗
+      - 用 Python 写个爬虫
+
+  clarify:
+    description: 意图不清、信息不足，需要反问澄清
+    examples:
+      - 这个怎么弄
+      - 那个参数是什么意思
+      - 它有什么用
+      - 怎么设置比较好
+
+  feedback:
+    description: 用户对答案的反馈（赞/踩/纠错）
+    examples:
+      - 这个答案不对
+      - 谢谢，回答得很好
+      - 你刚才说错了
+      - 这个回答不准确
