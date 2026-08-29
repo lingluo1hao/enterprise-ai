@@ -9,3 +9,99 @@ access_rules:
   "指令表": "restricted"
   "confidential": "restricted"
   "机密": "restricted"
+
+# ============================================================================
+# 业务角色种子（装 biz_roles 表用）—— 数字员工多用户隔离（v2.2 定稿）
+# ============================================================================
+# 两层角色模型：
+#   系统角色 admin_users.role（user/admin/super_admin）→ 登录与审批等级
+#   业务角色 biz_roles 表（租户级自建，工厂不限三类）→ 行级 ACL
+# 本文件是种子：RoleEngine.seed_builtin() 装库；装库后以 DB 为准，
+# 租户管理员可经 RoleEngine.create_role() 自建角色（车间主任/质检员/…）。
+#
+#   name      角色显示名
+#   level     审批等级 1/2/3（2 及以上才有审批权，金额分级审批依据）
+#   resources 可见资源（sales_order/repair_order/product/inventory/shipment/
+#             engineer/customer/supplier/purchase_order/equipment/warehouse/
+#             fault_code/pm_plan/stock）
+#   scope     可见范围——own=仅自己创建的 / tenant=本租户 / all=跨租户
+#   ops       可执行操作（create/query/update/request/approve）
+#
+# 原则：fail-closed——查不到的角色一律拒绝；本文件缺失时代码内置同构兜底。
+order_acl:
+  sales_user:
+    name: 销售跟单员
+    level: 1
+    resources: [sales_order, shipment, product, customer]
+    scope: own
+    ops: [create, query, update, request]   # update=确认/发货/退货等自身单据流转
+  repair_user:
+    name: 维修工程师
+    level: 1
+    resources: [repair_order, fault_code, product, equipment, stock]  # stock=自助领料出库单（own 仅自己的领料单）
+    scope: own
+    ops: [create, query, update, request]   # create=报修建单
+  warehouse_user:
+    name: 库管员
+    level: 1
+    resources: [stock, shipment, inventory, warehouse, purchase_order]  # 采购收货是仓储动作
+    scope: tenant
+    ops: [update, query]
+  purchase_user:
+    name: 采购员
+    level: 1
+    resources: [purchase_order, supplier, inventory]
+    scope: own
+    ops: [create, query, update, request]   # update=提交/收货回写等自身单据流转
+  dept_manager:
+    name: 部门经理
+    level: 2
+    resources: [sales_order, repair_order, product, inventory, shipment,
+                engineer, purchase_order, stock]
+    scope: tenant
+    ops: [create, query, update, request, approve]
+  gm:
+    name: 总经理
+    level: 2
+    resources: [sales_order, repair_order, product, inventory, shipment,
+                engineer, purchase_order, customer, supplier, equipment,
+                warehouse, fault_code, pm_plan, stock]
+    scope: tenant
+    ops: [create, query, update, request, approve]
+  super_admin:
+    name: 超级管理员
+    level: 3
+    resources: [sales_order, repair_order, product, inventory, shipment,
+                engineer, purchase_order, customer, supplier, equipment,
+                warehouse, fault_code, pm_plan, stock]
+    scope: all
+    ops: [create, query, update, request, approve]
+
+# ============================================================================
+# 分级审批规则 —— 高危操作审批门（approval.py）
+# ============================================================================
+# min_approver_level : 审批人最低审批等级（取 biz_roles.level：1/2/3）
+# amount_rules       : 金额分级——payload.amount 超过 above 值时，
+#                      改用更高的 min_approver_level（大额销售单/采购单管控）
+# 另有一条硬规则在代码里：发起人与审批人不得为同一人（禁自审自批）。
+approval_rules:
+  sales_order.complete:
+    min_approver_level: 2
+    amount_rules:
+      - above: 100000          # 金额 > 10 万的关单
+        min_approver_level: 3  # 须 level=3（超管级）审批
+  sales_order.cancel:
+    min_approver_level: 2
+  sales_delivery.release:
+    min_approver_level: 2
+  repair_order.resolve:
+    min_approver_level: 2
+  repair_order.cancel:
+    min_approver_level: 2
+  purchase_order.approve:
+    min_approver_level: 2
+    amount_rules:
+      - above: 100000          # 采购金额 > 10 万（与销售线一致，已定稿）
+        min_approver_level: 3
+  inventory.adjust:
+    min_approver_level: 2

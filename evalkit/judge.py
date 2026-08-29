@@ -10,8 +10,8 @@ evalkit.judge —— LLM-as-judge 打分器
 所以 judge 必须用**独立模型**，且 prompt 里只看「问题 + 检索到的上下文 + 最终答案」
 这三样客观材料，不让它知道"这是谁生成的"。本项目里：
   - 评分任务走网关的 `evalgrade` 路由（见 config/llm_gateway.yaml）
-  - `evalgrade = [deepseek-chat, local-small, local-qwen]`
-    → 配了 DEEPSEEK_API_KEY 且 deepseek-chat.enabled=true 时优先用云端强模型
+  - `evalgrade = [deepseek-v4-pro, local-small, local-qwen]`
+    → 配了 DEEPSEEK_API_KEY 且 deepseek-v4-pro.enabled=true 时优先用云端强模型
     → 否则自动回落到本地 1.5b 小模型（零成本、可离线）
   这样"启用强 judge"对代码零侵入，只改配置。
 
@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 既拖慢导入又让 CI 轻环境无辜报错。judge 真正用到网关时才建。
 
 
-# judge 路由任务名：config/llm_gateway.yaml 里已配 [deepseek-chat, local-small, local-qwen]
+# judge 路由任务名：config/llm_gateway.yaml 里已配 [deepseek-v4-pro, local-small, local-qwen]
 JUDGE_TASK = os.getenv("EVALKIT_JUDGE_TASK", "evalgrade")
 
 _SYSTEM = (

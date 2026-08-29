@@ -973,6 +973,96 @@ def api_tenants():
     return jsonify({"tenants": _load_tenants()})
 
 
+# ----------------------------------------------------------------------------
+# 数字员工（Digital Employee）—— Web 接入（2026-08-29）
+# 模型：emp 实例按 (tenant, fast) 池化复用；角色/身份/租户一律取登录态
+#（与 /api/query 同款防提权模型）；高危岗位能力门与验收门见 digital_employee.py
+# ----------------------------------------------------------------------------
+_employee_pool = {}
+_employee_lock = threading.Lock()
+
+
+def _get_employee(tenant_id: str, fast: bool):
+    """按 (租户, 快答模式) 池化数字员工实例（初始化重：LLM+Milvus+网关）。"""
+    key = (tenant_id, bool(fast))
+    with _employee_lock:
+        emp = _employee_pool.get(key)
+        if emp is None:
+            from digital_employee import DigitalEmployee
+            emp = DigitalEmployee(fast_mode=bool(fast), tenant_id=tenant_id)
+            _employee_pool[key] = emp
+        return emp
+
+
+@app.route("/api/employee/profiles")
+def api_employee_profiles():
+    """岗位档案清单（前端「数字员工」面板下拉用；任意登录用户）。"""
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+    try:
+        from digital_employee import PROFILE_PATH
+        import yaml
+        with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+            emps = (yaml.safe_load(f) or {}).get("employees", {}) or {}
+        profiles = [
+            {"key": k, "name": v.get("name", k),
+             "mission": (v.get("mission") or "")[:80]}
+            for k, v in emps.items()
+        ]
+        return jsonify({"profiles": profiles})
+    except Exception as e:
+        return jsonify({"profiles": [], "error": str(e)})
+
+
+@app.route("/api/employee/execute", methods=["POST"])
+def api_employee_execute():
+    """
+    数字员工执行目标（同步）：规划 → 检索 → 生成 → 验收门复核。
+
+    请求：{"goals": [目标1, 目标2...] 或 多行文本, "profile_role": 岗位key,
+           "fast": bool}
+    角色/用户/租户一律取登录态（客户端不可伪造）；执行约 30–120 秒/目标。
+    """
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return jsonify({"error": "请求体格式错误，需要 JSON"}), 400
+    auth_result = _require_auth()
+    if auth_result:
+        return auth_result
+
+    goals = data.get("goals") or []
+    if isinstance(goals, str):
+        goals = goals.splitlines()
+    goals = [g.strip() for g in goals if g and g.strip()][:5]   # 单次最多 5 目标
+    if not goals:
+        return jsonify({"error": "未提供目标（每行一个）"}), 400
+
+    profile_role = (data.get("profile_role") or "researcher").strip()
+    fast = bool(data.get("fast", False))
+    # 安全模型与 /api/query 一致：租户/角色取登录态，防跨租户/防提权
+    tenant_id = g.current_user.get("tenant_id", "default")
+    user_role = g.current_user["role"]
+    user = g.current_user["username"]
+
+    try:
+        emp = _get_employee(tenant_id, fast)
+    except Exception as e:
+        return jsonify({"error": f"数字员工初始化失败（{e}）"}), 500
+
+    try:
+        reports = emp.execute_goals(goals, user_role=user_role, user=user)
+    except Exception as e:
+        return jsonify({"error": f"执行失败：{e}"}), 500
+    _audit_log("employee", target=goals[0][:80], username=user)
+    return jsonify({
+        "tasks": reports,
+        "summary": emp.summary(reports),
+        "profile": emp.profile.name,
+        "tenant": tenant_id,
+    })
+
+
 def _get_memory_store():
     """兼容两种编排器，取到统一的 MySQLMemoryStore 实例。"""
     o = orchestrator
@@ -2933,6 +3023,7 @@ _ADMIN_PAGE = r"""
     <div class="tab active" data-tab="prompts" onclick="switchTab('prompts')">📝 提示词管理</div>
     <div class="tab" data-tab="qa" onclick="switchTab('qa')">💬 在线问答</div>
     <div class="tab" data-tab="usage" onclick="switchTab('usage')">📊 Token 用量</div>
+    <div class="tab" data-tab="employee" onclick="switchTab('employee')">🤖 数字员工</div>
     <div class="tab" data-tab="kb" onclick="switchTab('kb')">📚 知识库</div>
     <div class="tab" data-tab="users" id="tabUsersBtn" style="display:none" onclick="switchTab('users')">👥 用户管理</div>
     <div class="tab" data-tab="watermark" onclick="switchTab('watermark')">🖼️ 图片水印</div>
@@ -3038,6 +3129,92 @@ _ADMIN_PAGE = r"""
         <div id="kbErr" class="kb-err"></div>
       </div>
     </div>
+    <!-- Digital Employee Tab -->
+    <div id="tabEmployee" class="tab-panel">
+      <div class="toolbar">
+        <div>
+          <h2>🤖 数字员工</h2>
+          <p class="sub">岗位档案 → 目标执行（规划→检索→生成）→ 验收门复核；租户/密级取当前登录账号。单目标约 30–120 秒。</p>
+        </div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+        <label style="font-size:13px;">岗位：</label>
+        <select id="admEmpProfile" style="padding:6px 10px;border:1px solid #ccd;border-radius:8px;min-width:200px;"></select>
+        <label style="font-size:13px;display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="admEmpFast"> 快答模式</label>
+        <button class="btn" id="admEmpRunBtn" onclick="admEmpExecute()">执行目标</button>
+        <span id="admEmpStatus" style="font-size:13px;color:#889;"></span>
+      </div>
+      <textarea id="admEmpGoals" rows="3" placeholder="每行一个目标，例如：&#10;JM-S509 定位终端支持哪些定位方式？" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ccd;border-radius:10px;font-size:14px;resize:vertical;"></textarea>
+      <div id="admEmpResults" style="margin-top:16px;"></div>
+    </div>
+    <script>
+    // ---------- 数字员工面板（admin 页）----------
+    async function admEmpLoadProfiles(){
+      try{
+        const r = await fetch('/api/employee/profiles', {headers:{'Authorization':'Bearer '+(localStorage.getItem('admin_token')||localStorage.getItem('rag_token')||'')}});
+        const d = await r.json();
+        const sel = document.getElementById('admEmpProfile');
+        if(!sel) return;
+        sel.innerHTML = (d.profiles||[]).map(p =>
+          `<option value="${p.key}">${p.name}（${p.key}）</option>`).join('') ||
+          '<option value="researcher">资料研究员（researcher）</option>';
+      }catch(e){ console.warn('profiles 加载失败', e); }
+    }
+    const ADM_EMP_BADGE = {
+      done:     ['✓ 完成','background:#e7f7ec;color:#1a7f37;border:1px solid #b7e4c7'],
+      degraded: ['△ 质量存疑','background:#fff4e0;color:#b36b00;border:1px solid #f5d8a8'],
+      rejected: ['✗ 验收不通过','background:#fdeaea;color:#b42318;border:1px solid #f5c6c6'],
+      failed:   ['✗ 执行失败','background:#fdeaea;color:#b42318;border:1px solid #f5c6c6'],
+    };
+    function admEmpRender(data){
+      const box = document.getElementById('admEmpResults');
+      const s = data.summary || {};
+      const cards = (data.tasks||[]).map((t,i) => {
+        const b = ADM_EMP_BADGE[t.status] || ['? '+t.status,'background:#eee;color:#555'];
+        const sg = (t.review||{}).signals || {};
+        const sigRow = (k,v) => (v===undefined||v===null) ? '' :
+          `<div style="display:flex;gap:8px;font-size:12px;color:#667;"><span style="min-width:110px;">${k}</span><b>${v}</b></div>`;
+        return `<div style="border:1px solid #dde;border-radius:12px;padding:14px 16px;margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <span style="font-size:13px;color:#889;">目标 ${i+1}</span>
+            <span style="padding:2px 10px;border-radius:999px;font-size:12px;${b[1]}">${b[0]}</span>
+            <span style="font-size:12px;color:#889;">${t.elapsed_s}s</span>
+            <span style="font-size:14px;font-weight:600;">${(t.goal||'').slice(0,60)}</span>
+          </div>
+          ${t.result ? `<div style="margin-top:10px;padding:10px 12px;background:#f7f9fc;border-radius:8px;font-size:14px;line-height:1.7;white-space:pre-wrap;">${t.result}</div>` : `<div style="margin-top:8px;color:#b42318;font-size:13px;">${t.error||''}</div>`}
+          ${t.review && t.review.verdict ? `<details style="margin-top:8px;"><summary style="font-size:12px;color:#567;cursor:pointer;">验收信号（verdict: ${t.review.verdict}）</summary>
+            <div style="margin-top:6px;">${sigRow('检索命中数',sg.retrieval_hits)}${sigRow('余弦距离',sg.best_distance)}${sigRow('距离合法',sg.distance_valid)}${sigRow('问题↔片段相似度',sg.goal_doc_sim)}${sigRow('答案↔片段覆盖率',sg.answer_coverage)}${sigRow('答案字数',sg.answer_chars)}</div></details>` : ''}
+        </div>`;
+      }).join('');
+      box.innerHTML = `<div style="font-size:13px;color:#445;margin-bottom:10px;">
+        岗位「${data.profile||''}」· 租户「${data.tenant||''}」—— 验收通过 <b style="color:#1a7f37;">${s.done||0}</b> /
+        质量存疑 <b style="color:#b36b00;">${s.degraded||0}</b> / 不通过 <b style="color:#b42318;">${(s.rejected||0)+(s.failed||0)}</b> / 共 ${s.total||0}（${s.total_elapsed_s||0}s）</div>${cards}`;
+    }
+    async function admEmpExecute(){
+      const btn = document.getElementById('admEmpRunBtn');
+      const st  = document.getElementById('admEmpStatus');
+      const goals = (document.getElementById('admEmpGoals').value || '').split('\n').map(x=>x.trim()).filter(Boolean);
+      if(!goals.length){ st.textContent='⚠ 请先输入目标（每行一个）'; return; }
+      btn.disabled = true; btn.textContent = '执行中…';
+      st.textContent = '规划 → 检索 → 生成 → 验收（约 30–120 秒/目标）';
+      document.getElementById('admEmpResults').innerHTML =
+        '<div style="padding:20px;text-align:center;color:#889;">⏳ 数字员工执行中…</div>';
+      try{
+        const r = await fetch('/api/employee/execute', {
+          method:'POST',
+          headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('admin_token')||localStorage.getItem('rag_token')||'')},
+          body: JSON.stringify({goals, profile_role: document.getElementById('admEmpProfile').value || 'researcher',
+                                fast: document.getElementById('admEmpFast').checked}),
+        });
+        const d = await r.json();
+        if(d.error){ st.textContent='✗ '+d.error; return; }
+        st.textContent=''; admEmpRender(d);
+      }catch(e){ st.textContent='✗ 请求失败：'+e; }
+      finally{ btn.disabled=false; btn.textContent='执行目标'; }
+    }
+    admEmpLoadProfiles();
+    </script>
     <!-- User Management Tab (super_admin only) -->
     <div id="tabUsers" class="tab-panel">
       <div class="toolbar">
@@ -4739,6 +4916,7 @@ _HTML_PAGE = r"""
   <div class="tab active" data-tab="chat" onclick="switchTab('chat')">💬 知识问答</div>
   <div class="tab" data-tab="kb" onclick="switchTab('kb')">📚 知识库</div>
   <div class="tab" data-tab="usage" onclick="switchTab('usage')">📊 我的用量</div>
+  <div class="tab" data-tab="employee" onclick="switchTab('employee')">🤖 数字员工</div>
 </div>
 
 <!-- Token 用量弹窗 -->
@@ -4872,6 +5050,114 @@ _HTML_PAGE = r"""
     </div>
   </div>
 </div>
+
+<div id="tabEmployee" class="tab-panel">
+  <div style="max-width:960px;margin:0 auto;padding:18px 22px;">
+    <div style="background:#eef4ff;border:1px solid #c9dcff;border-radius:10px;padding:12px 16px;margin-bottom:14px;font-size:13px;color:#2c4a7c;">
+      🤖 <b>数字员工</b>：岗位档案（身份）→ 目标执行（规划→检索→生成）→ <b>验收门复核</b>（查空/答非所问/距离信号不达标不标完成）。
+      检索范围与你的账号一致（<b>租户/密级取登录态</b>）；单目标执行约 30–120 秒，请耐心等待。
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+      <label style="font-size:13px;color:#445;">岗位：</label>
+      <select id="empProfile" style="padding:6px 10px;border:1px solid #ccd;border-radius:8px;min-width:180px;"></select>
+      <label style="font-size:13px;color:#445;display:flex;align-items:center;gap:4px;">
+        <input type="checkbox" id="empFast"> 快答模式（跳过查询重写）
+      </label>
+      <button id="empRunBtn" onclick="empExecute()" style="padding:8px 22px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;">执行目标</button>
+      <span id="empStatus" style="font-size:13px;color:#889;"></span>
+    </div>
+    <textarea id="empGoals" rows="3" placeholder="每行一个目标，例如：&#10;JM-S509 定位终端支持哪些定位方式？&#10;WiFi 定位包和 GPS 定位包在协议号上有什么区别？" style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ccd;border-radius:10px;font-size:14px;resize:vertical;"></textarea>
+    <div id="empResults" style="margin-top:16px;"></div>
+  </div>
+</div>
+
+<script>
+// ---------- 数字员工面板 ----------
+async function empLoadProfiles(){
+  try{
+    const r = await fetch('/api/employee/profiles', {headers:{'Authorization':'Bearer '+(localStorage.getItem('rag_token')||'')}});
+    const d = await r.json();
+    const sel = document.getElementById('empProfile');
+    if(!sel) return;
+    sel.innerHTML = (d.profiles||[]).map(p =>
+      `<option value="${p.key}">${p.name}（${p.key}）</option>`).join('') ||
+      '<option value="researcher">资料研究员（researcher）</option>';
+  }catch(e){ console.warn('profiles 加载失败', e); }
+}
+const EMP_BADGE = {
+  done:      ['✓ 完成','background:#e7f7ec;color:#1a7f37;border:1px solid #b7e4c7'],
+  degraded:  ['△ 质量存疑','background:#fff4e0;color:#b36b00;border:1px solid #f5d8a8'],
+  rejected:  ['✗ 验收不通过','background:#fdeaea;color:#b42318;border:1px solid #f5c6c6'],
+  failed:    ['✗ 执行失败','background:#fdeaea;color:#b42318;border:1px solid #f5c6c6'],
+};
+function empRender(data){
+  const box = document.getElementById('empResults');
+  const s = data.summary || {};
+  const cards = (data.tasks||[]).map((t,i) => {
+    const b = EMP_BADGE[t.status] || ['? '+t.status,'background:#eee;color:#555'];
+    const rv = t.review || {};
+    const sg = rv.signals || {};
+    const sigRow = (k, v) => v===undefined||v===null ? '' :
+      `<div style="display:flex;gap:8px;font-size:12px;color:#667;"><span style="min-width:110px;">${k}</span><b>${v}</b></div>`;
+    return `<div style="border:1px solid #dde;border-radius:12px;padding:14px 16px;margin-bottom:12px;background:#fff;">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span style="font-size:13px;color:#889;">目标 ${i+1}</span>
+        <span style="padding:2px 10px;border-radius:999px;font-size:12px;${b[1]}">${b[0]}</span>
+        <span style="font-size:12px;color:#889;">${t.elapsed_s}s</span>
+        <span style="font-size:14px;font-weight:600;">${(t.goal||'').slice(0,60)}</span>
+      </div>
+      ${t.status==='failed' ? `<div style="margin-top:8px;color:#b42318;font-size:13px;">${t.error||''}</div>` : ''}
+      ${t.result ? `<div style="margin-top:10px;padding:10px 12px;background:#f7f9fc;border-radius:8px;font-size:14px;line-height:1.7;white-space:pre-wrap;">${t.result}</div>` : ''}
+      ${rv.verdict ? `<details style="margin-top:8px;"><summary style="font-size:12px;color:#567;cursor:pointer;">验收信号（verdict: ${rv.verdict}）</summary>
+        <div style="margin-top:6px;">
+        ${sigRow('检索命中数', sg.retrieval_hits)}${sigRow('余弦距离', sg.best_distance)}
+        ${sigRow('距离合法', sg.distance_valid)}${sigRow('问题↔片段相似度', sg.goal_doc_sim)}
+        ${sigRow('答案↔片段覆盖率', sg.answer_coverage)}${sigRow('答案字数', sg.answer_chars)}
+        ${sigRow('复核状态', sg.retrieval_check)}</div></details>` : ''}
+      ${!rv.verdict && t.error ? `<div style="font-size:12px;color:#b42318;margin-top:6px;">${t.error}</div>` : ''}
+    </div>`;
+  }).join('');
+  box.innerHTML = `
+    <div style="font-size:13px;color:#445;margin-bottom:10px;">
+      岗位「${data.profile||''}」· 租户「${data.tenant||''}」——
+      验收通过 <b style="color:#1a7f37;">${s.done||0}</b> /
+      质量存疑 <b style="color:#b36b00;">${s.degraded||0}</b> /
+      不通过 <b style="color:#b42318;">${(s.rejected||0)+(s.failed||0)}</b> / 共 ${s.total||0}
+      （总耗时 ${s.total_elapsed_s||0}s）
+    </div>${cards}`;
+}
+async function empExecute(){
+  const btn = document.getElementById('empRunBtn');
+  const st  = document.getElementById('empStatus');
+  const goals = (document.getElementById('empGoals').value || '')
+      .split('\n').map(x => x.trim()).filter(Boolean);
+  if(!goals.length){ st.textContent='⚠ 请先输入目标（每行一个）'; return; }
+  btn.disabled = true; btn.textContent = '执行中…';
+  st.textContent = '规划 → 检索 → 生成 → 验收（约 30–120 秒/目标，请勿重复点击）';
+  document.getElementById('empResults').innerHTML =
+    '<div style="padding:20px;text-align:center;color:#889;">⏳ 数字员工执行中…</div>';
+  try{
+    const r = await fetch('/api/employee/execute', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+(localStorage.getItem('rag_token')||'')},
+      body: JSON.stringify({
+        goals: goals,
+        profile_role: document.getElementById('empProfile').value || 'researcher',
+        fast: document.getElementById('empFast').checked,
+      }),
+    });
+    const d = await r.json();
+    if(d.error){ st.textContent = '✗ ' + d.error; return; }
+    st.textContent = '';
+    empRender(d);
+  }catch(e){
+    st.textContent = '✗ 请求失败：' + e + '（服务端超时？看后端日志）';
+  }finally{
+    btn.disabled = false; btn.textContent = '执行目标';
+  }
+}
+empLoadProfiles();
+</script>
 
 <script>
 // ============================================================

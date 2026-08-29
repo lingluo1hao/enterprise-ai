@@ -778,8 +778,23 @@ class VectorStoreManager:
         pipe.close()
         return rep
 
-    def _parse_hits(self, hits):
-        """把 Milvus 命中列表转成 (id, Document, distance) 三元组列表"""
+    def _parse_hits(self, hits, score_semantic="raw"):
+        """
+        把 Milvus 命中列表转成 (id, Document, distance) 三元组列表。
+
+        :param score_semantic: 出口距离语义统一为「越小越相似」——
+          - "cosine_sim"（dense 向量召回）：Milvus COSINE 返回的是**相似度**
+            （[-1,1]，越大越相似，相同向量=1.0 是正确值而非失真），
+            出口转余弦距离 dist = 1 - score ∈ [0,2]；
+          - "bm25"（sparse 召回）：BM25 无界正值越大越好，出口取负
+            dist = -score（与 RRF -fused 同手法，保序保语义）；
+          - "raw"：透传（默认，向后兼容）。
+        历史注记：验收门走 dense_search_with_distance 纯 dense 通道，出口
+        dist=1-sim——best_distance 为负 = Milvus COSINE 相似度>1 的 dense
+        失真（P0 终验实测 -0.0325=1-1.0325），根治后复跑稳定为合法正值；
+        RRF -fused 的 1/61 量级负值属混合检索显示层（见 DocSearchSkill
+        相关度注释），与 1-1.016 数值巧合重合，勿混谈。
+        """
         from langchain_core.documents import Document
         out = []
         for hit in hits:
@@ -816,10 +831,17 @@ class VectorStoreManager:
             #      长章节的答案在写库那一刻就已丢失（P1 待修）
             # 任何"上下文扩展"属于生成层职责，一律走 metadata["parent_content"] 旁路。
             page_content = entity.get("content", "") or entity.get("parent_content", "") or ""
+            raw_score = float(getattr(hit, "distance", 0.0))
+            if score_semantic == "cosine_sim":
+                dist = 1.0 - raw_score          # 余弦距离 ∈ [0,2]，越小越相似
+            elif score_semantic == "bm25":
+                dist = -raw_score               # BM25 取负，越小越相似
+            else:
+                dist = raw_score
             out.append((
                 hit.id,
                 Document(page_content=page_content[:8192], metadata=meta),
-                float(getattr(hit, "distance", 0.0)),
+                dist,
             ))
         return out
 
@@ -873,9 +895,10 @@ class VectorStoreManager:
             data=[qvec], anns_field="dense", limit=top,
             filter=expr, output_fields=fields,
         )[0]
-        dense_list = self._parse_hits(dense_hits)
+        dense_list = self._parse_hits(dense_hits, "cosine_sim")
 
         if not self.hybrid:
+            # 出口已是余弦距离（越小越相似），升序即最相关在前
             dense_list.sort(key=lambda x: x[2])
             return [(doc, dist) for (_, doc, dist) in dense_list[:k]]
 
@@ -886,7 +909,7 @@ class VectorStoreManager:
                 data=[query], anns_field="sparse", limit=top,
                 filter=expr, output_fields=fields,
             )[0]
-            sparse_list = self._parse_hits(sparse_hits)
+            sparse_list = self._parse_hits(sparse_hits, "bm25")
             return self._rrf_fuse(dense_list, sparse_list, k)
         except Exception as e:
             print(f"[VectorStore] ⚠ BM25 稀疏召回失败，回退纯 dense: {e}")
@@ -924,12 +947,47 @@ class VectorStoreManager:
                 data=[query], anns_field="sparse", limit=max(k, 2),
                 filter=expr, output_fields=fields,
             )[0]
-            parsed = self._parse_hits(hits)
+            parsed = self._parse_hits(hits, "bm25")
+            # 出口已是 -BM25（越小越相似），升序即最相关在前——
+            # 此前对 BM25 正分升序排序是反向的（潜伏 bug，本次修正）
             parsed.sort(key=lambda x: x[2])
             return [(doc, float(dist)) for (_, doc, dist) in parsed[:k]]
         except Exception as e:
             print(f"[VectorStore] ⚠ figure-page 召回失败: {e}")
             return []
+
+    def dense_search_with_distance(self, query: str, k: int = 4,
+                                   filter_role: str = None,
+                                   user_id: str = "anonymous",
+                                   tenant_id: str = "default"):
+        """
+        纯 dense 向量检索，出口为**真实余弦距离**（1 - similarity ∈ [0,2]，
+        越小越相似）——供验收门（ReviewGate）等需要**可解释、可与阈值比较**
+        的距离信号的调用方使用；混合检索的 RRF -fused 分数无量纲、不可比，
+        不适合做绝对阈值判定（验收门负距离 = Milvus dense 失真，非 RRF
+        ——详见 _parse_hits 历史注记）。
+        权限下推与 _milvus_search 同一套。
+        """
+        if filter_role == ROLE_SUPER_ADMIN or tenant_id == "__global__":
+            expr = "(is_parent == false)"
+        elif filter_role == ROLE_ADMIN:
+            expr = (f'(tenant_id == "{tenant_id}") and (is_parent == false)')
+        else:
+            expr = (f'(tenant_id == "{tenant_id}") and '
+                    f'((access_level == "public") or (user_id == "{user_id}")) '
+                    f'and (is_parent == false)')
+        fields = ["content", "file_name", "file_path", "access_level",
+                  "chunk_index", "chunk_type", "figure_paths", "page",
+                  "section_path", "parent_id", "parent_content", "is_parent"]
+        qvec = self._embed.embed_query(query)
+        hits = self.client.search(
+            collection_name=self.collection,
+            data=[qvec], anns_field="dense", limit=k,
+            filter=expr, output_fields=fields,
+        )[0]
+        parsed = self._parse_hits(hits, "cosine_sim")
+        parsed.sort(key=lambda x: x[2])
+        return [(doc, dist) for (_, doc, dist) in parsed]
 
     # ------------------------------------------------------------------ #
     # 公共：文档加载 / 分片 / 统一检索接口
@@ -1228,8 +1286,10 @@ class DocSearchSkill(BaseSkill):
         for i, (doc, score) in enumerate(reranked):
             source = doc.metadata.get("source", "未知")
             page = doc.metadata.get("page", "?")
-            # Milvus 的 distance 越小越相似，转换为 0-100 的相关度分数
-            relevance = max(0, round(100 - score * 50))
+            # 相关度显示：出口距离越小越相似（RRF -fused 或余弦距离 1-sim）。
+            # RRF -fused 为小负数（rank1 ≈ -0.016）→ 100.8% 曾出现「101%」怪值，
+            # 钳位到 [1,99]；余弦距离则线性映射 100-d*50（d=0.2 → 90%）
+            relevance = min(99, max(1, round(100 - score * 50)))
             print(f"      [{i+1}] {os.path.basename(source)} P{page} (相关度:{relevance}%)")
             # 截断文档内容，保留前 350 字符（足够包含协议号+描述+关键字段）
             content_truncated = doc.page_content[:350]
@@ -1994,11 +2054,13 @@ class RAGOrchestrator:
     """
 
     def __init__(self, llm: BaseLLM, vector_db, fast_mode: bool = False,
-                 cache: CacheManager = None, user_role: str = DEFAULT_ROLE):
+                 cache: CacheManager = None, user_role: str = DEFAULT_ROLE,
+                 tenant_id: str = "default"):
         self.llm = llm
         self.vector_db = vector_db
         self.fast_mode = fast_mode
         self.user_role = user_role
+        self.tenant_id = tenant_id   # 检索租户透传（DocSearchSkill 下推隔离用）
         self._base_role = user_role     # P0-2：固定基准角色（不可变），供请求线程缺省回退
         self.user = "anonymous"     # 当前调用用户，用于 token 用量归因
         self.cache = cache or CacheManager()  # 默认自动连接 Redis，连不上则跳过
@@ -2014,7 +2076,8 @@ class RAGOrchestrator:
         # fast_mode=True 时跳过查询重写，减少 LLM 调用
         # user_role 传入 DocSearchSkill，检索时按权限过滤结果
         self.skill_registry.register(
-            DocSearchSkill(llm, vector_db, fast_mode=fast_mode, user_role=user_role)
+            DocSearchSkill(llm, vector_db, fast_mode=fast_mode, user_role=user_role,
+                           tenant_id=tenant_id)
         )
         # 计算器技能
         self.skill_registry.register(CalculatorSkill())

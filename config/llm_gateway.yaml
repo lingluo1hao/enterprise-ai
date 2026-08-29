@@ -85,11 +85,11 @@ models:
     recovery_sec: 20.0
     enabled: true
 
-  # ---- 云端备选：DeepSeek（主模型挂了顶上）--------------------------------
-  # 需要在 .env 里配 DEEPSEEK_API_KEY，然后把 enabled 改成 true
-  deepseek-chat:
+  # ---- 云端主力：DeepSeek（回答/规划优先，本地兜底）------------------------
+  # 需要在 .env 里配 DEEPSEEK_API_KEY（已配），enabled: true
+  deepseek-v4-pro:
     provider: deepseek
-    model: deepseek-chat
+    model: deepseek-v4-pro       # 2026-08-29 应用户要求升级 V4-PRO（原 deepseek-v4-pro 太老）
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
     tier: large
@@ -165,30 +165,32 @@ models:
 #   react     ReActAgent.run                         ReAct 推理
 #     ↑ 以上是"论述题"，直接上大模型
 routing:
-  classify:   [deepseek-chat, local-qwen]  # 决定是否要走 RAG：云端强模型判类型（含
+  classify:   [deepseek-v4-pro, local-qwen]  # 决定是否要走 RAG：云端强模型判类型（含
                                            # 闲聊/OOS 语义），本地 7b 兜底；规则词表
                                            # 是 LLM 整链失败时的最后防线（node_classify）
   grade:      [local-small, local-qwen]
   # ---- 评测 judge：RAG 答案质量打分（faithfulness / relevancy）----
-  # 优先级 deepseek-chat（云端强模型，需 DEEPSEEK_API_KEY + enabled=true）；
+  # 优先级 deepseek-v4-pro（云端强模型，需 DEEPSEEK_API_KEY + enabled=true）；
   # 未启用时自动回落 local-small（本地 1.5b，零成本可离线）。evalkit 走这条链。
-  evalgrade:  [deepseek-chat, local-small, local-qwen]
+  evalgrade:  [deepseek-v4-pro, local-small, local-qwen]
   rewrite:    [local-small, local-qwen]
   compress:   [local-small, local-qwen]
 
-  generate:   [local-qwen-gen, deepseek-chat, qwen-plus]
-  # 难度路由专用链：技术/高风险 query 优先走 deepseek-chat 生成（压幻觉），
-  # 本地 qwen2:7b 作兜底回落。由 langgraph_rag_agent._do_generate 按难度切换 task。
-  generate-hard: [deepseek-chat, local-qwen-gen, qwen-plus]
-  write:      [local-qwen-gen, deepseek-chat, qwen-plus]
-  synthesize: [local-qwen-gen, deepseek-chat, qwen-plus]
-  direct:     [local-qwen-gen, deepseek-chat, qwen-plus]
-  plan:       [local-qwen, deepseek-chat]
-  review:     [local-qwen, deepseek-chat]
-  react:      [local-qwen, deepseek-chat]
+  # 2026-08-29 调整：回答类 + 规划/推理链 DeepSeek 优先（用户要求"优先用
+  # deepseek 回答"；本地 7b 规划曾 39s 输出非法 JSON 降级，DeepSeek 顺带治之）。
+  # grade/rewrite/compress 留本地小模型（便宜、确定性够用）。
+  generate:   [deepseek-v4-pro, local-qwen-gen, qwen-plus]
+  # 难度路由专用链：技术/高风险 query 优先走 deepseek 生成（压幻觉）。
+  generate-hard: [deepseek-v4-pro, local-qwen-gen, qwen-plus]
+  write:      [deepseek-v4-pro, local-qwen-gen, qwen-plus]
+  synthesize: [deepseek-v4-pro, local-qwen-gen, qwen-plus]
+  direct:     [deepseek-v4-pro, local-qwen-gen, qwen-plus]
+  plan:       [deepseek-v4-pro, local-qwen]
+  review:     [deepseek-v4-pro, local-qwen]
+  react:      [deepseek-v4-pro, local-qwen]
 
 # 没有在 routing 里命中的任务走这条链（保证老代码不传 task 时行为不变）
-default_chain: [local-qwen, deepseek-chat, qwen-plus]
+default_chain: [local-qwen, deepseek-v4-pro, qwen-plus]
 
 
 # ----------------------------------------------------------------------------
