@@ -1,0 +1,593 @@
+# docker-compose-dify.yaml
+# =============================================================================
+# Dify 社区版（1.18.0）· 复用项目现有中间件的精简编排
+# =============================================================================
+# 部署位置：虚拟机 /data/dify/docker-compose-dify.yaml
+# 配套文件：仓库里叫 deploy/dify-nginx.conf
+#           放上虚拟机后**必须改名成 /data/dify/nginx.conf**（compose 里挂的就是这个名字）
+#
+#   🔴 这里有个 Docker 的经典坑：bind mount 的宿主机路径不存在时，
+#      docker 不会报错，而是**自动建一个同名空目录**。于是
+#      /data/dify/nginx.conf 变成一个目录挂到 /etc/nginx/nginx.conf，
+#      nginx 起不来看起来像「配置写错了」，其实是文件名没对上。
+#      所以务必显式 cp 成 nginx.conf，别只把 dify-nginx.conf 丢进去。
+# 必填文件：/data/dify/.env            ← 两行：DB_PASSWORD + REDIS_PASSWORD（见下）
+#
+# -----------------------------------------------------------------------------
+# 一、数据源决策：哪些复用、哪些必须自建
+# -----------------------------------------------------------------------------
+#   ✅ 复用项目 Redis（192.168.200.128:6379）
+#        用**独立 db 号**隔离：Dify 缓存 db2、Celery 队列 db3，项目自己用 db0。
+#        Redis 的 db 是逻辑隔离、零内存开销，这是最省的复用方式。
+#        ⚠️ 项目 Redis 有密码。密码**不写进本文件**（避免进 git），
+#           在 /data/dify/.env 里放一行即可，compose 会自动读取插值：
+#              echo 'REDIS_PASSWORD=你的项目redis密码' > /data/dify/.env
+#           或者临时 export：export REDIS_PASSWORD='...'
+#        取值来源：项目根目录 .env 的 REDIS_PASSWORD。
+#
+#   ✅ 复用项目 Milvus（192.168.200.128:19530）
+#        Dify 的 collection 与项目 collection 表名独立。
+#        ⚠️ 耦合代价：清空 Milvus 会连带清掉 Dify 自带知识库的向量。
+#
+#   ⚠️ 关于「用项目 MySQL」—— 结论：本次仍走 PG，但我说过的「Dify 只支持 PG」
+#      这句在 1.18.0 上**不一定成立，需要重新评估**：
+#        · 查官方 1.18.0 的 docker/docker-compose.yaml，里面出现了
+#          `db_mysql: mysql:8.0`（带 profile: mysql）以及 db_postgres 两个候选，
+#          说明新版本已经把「数据库可切换」做进了编排层；
+#        · 但我尝试核对 1.18.0 的 envs/databases/db-mysql.env 时返回 404，
+#          **无法确认 DB_TYPE=mysql 这条路在 1.18.0 是否真的可用**。
+#      → 因此本次仍用 PG（官方默认主路径，风险最低）。
+#      → 等 Dify 跑通、你确认要用 MySQL 省这个容器时，再单独验证一遍：
+#          1) 看 api 容器里是否认 DB_TYPE 环境变量
+#          2) 切 mysql 后跑一次 flask db upgrade，看 alembic 是否报方言错误
+#        PG 代价其实不大：参数压到极限后约 60~100MB。
+#
+#   ❌ 不能去掉 nginx —— 不是因为它多大（5~15MB），而是去掉会坏在暗处：
+#        web:3000 与 api:5001 是两个源，登录 token 存 cookie，跨源时
+#        SameSite=Lax 不发送 cookie → 登录请求成功、下一个请求 401、
+#        页面反复跳回登录页。绕法要 SameSite=None + Secure，而本机是 HTTP
+#        （Secure 要求 HTTPS）→ 死路。官方坚持同源反代就是这个原因。
+#
+# -----------------------------------------------------------------------------
+# 二、容器数：默认 5 个（原方案 9 个）
+# -----------------------------------------------------------------------------
+#   默认启动：db / plugin_daemon / api / web / nginx
+#   可选扩展：
+#     --profile full      追加 worker + sandbox
+#     --profile weaviate  追加 weaviate（配合 VECTOR_STORE=weaviate）
+#
+#   砍掉的四个，代价：
+#     redis    → 复用项目 Redis，代价为零（db 号隔离）
+#     weaviate → 复用项目 Milvus，代价是上面说的耦合
+#     worker   → ① Dify **自带知识库**的文档解析/索引不可用（一直「排队中」）；
+#                ② workflow 应用的异步执行走 Celery，缺 worker 可能是
+#                   「点运行一直转圈」。（这条我没法在本地证伪，
+#                   所以起服务时先带 --profile full 跑通，再考虑砍。）
+#                「外部知识库」检索本身是同步 HTTP、不经 celery，这部分确实
+#                不受影响 —— 本项目架构正是「Dify 编排 + 本项目 /retrieval 当知识库」。
+#                结论：**别默认砍 worker**，先把 --profile full 跑通。
+#     sandbox  → 工作流「代码执行」节点不可用，审批流用不到。
+#     ssrf_proxy（官方那个 ubuntu/squid）→ 刻意不启，省 30~50MB。
+#               它只做一件事：Dify 里「HTTP 请求」节点和外部知识库调用走它转发，
+#               防 SSRF。不启的后果：这些请求直接从 api 容器出去，
+#               **本机实验环境可以接受**（反正内网就你自己）；
+#               要接不受信任的外部 URL 时就得把它加回来，并在 api 里设
+#               SSRF_PROXY_HTTP_URL / SSRF_PROXY_HTTPS_URL 指向它。
+#
+# -----------------------------------------------------------------------------
+# 三、内存预算（量级，务必用 docker stats 实测）
+# -----------------------------------------------------------------------------
+#     postgres        60 ~ 100 MB     （shared_buffers 32MB，参数已压到极限）
+#     plugin_daemon  120 ~ 200 MB
+#     api            500 ~ 900 MB     （gunicorn 2 worker，已显式压制）
+#     web            150 ~ 250 MB     （Next.js）
+#     nginx            5 ~  15 MB
+#     ------------------------------------
+#     合计           约 0.85 ~ 1.45 GB
+#     （Redis / Milvus 不新增：复用项目已有的）
+#
+#    ★ 最容易被忽略的内存杀手：Dify 的 api 是 gunicorn 起的，worker 数**默认跟
+#      CPU 核数走**（常见 cores*2+1）。8 核就是十几个 Flask 进程，内存瞬间爆掉，
+#      而且报错是 oom-killer 杀进程、日志里看不出原因。
+#      本文件已写死 SERVER_WORKER_AMOUNT=2，别删。
+#
+#    ★ 本机还跑着 Ollama（qwen2:7b CPU 推理，常驻 4~6 GB）、Milvus 一套
+#      （1~1.5 GB）、MySQL、项目自己的 Redis。若 free -h 的 available 不够，
+#      先停 Ollama：systemctl stop ollama
+#      （Dify 编排审批流调外部模型 API + 外部知识库，不需要 Ollama 常驻；
+#        但如果你要用 Ollama 当模型供应商，就不能停，只能靠下面的降级项）
+#
+# -----------------------------------------------------------------------------
+# 四、起之前必做三件事
+# -----------------------------------------------------------------------------
+# 1) 看内存：free -h
+#      起 Dify 前建议 available ≥ 1.5 GiB（想带 --profile full 就 ≥ 2.5 GiB）
+#
+# 2) 防火墙放行 8080
+#    本机 firewalld 在 DROP 未开放端口 —— 实测从宿主机探测 80/443/8080 全是
+#    timeout，而 6379/3306/11434 是 OPEN，说明不是没监听，是没放行。
+#      firewall-cmd --add-port=8080/tcp --permanent && firewall-cmd --reload
+#
+# 3) 验镜像 tag（虚拟机无外网，全靠宿主机 Clash 代理拉）
+#      export https_proxy=http://192.168.200.1:7897 http_proxy=http://192.168.200.1:7897
+#      for t in langgenius/dify-api:1.18.0 langgenius/dify-web:1.18.0 \
+#               langgenius/dify-sandbox:0.2.15 \
+#               langgenius/dify-plugin-daemon:0.6.10-local \
+#               postgres:15-alpine nginx:alpine ; do
+#        docker manifest inspect "$t" >/dev/null 2>&1 && echo "OK   $t" || echo "MISS $t"
+#      done
+#    ★ 这几个 tag 已经按官方 1.18.0 的 docker-compose.yaml 对齐过，
+#      但**我没能在本机验通 Docker Hub**（走代理 502、直连 TLS 失败），
+#      所以「tag 真实存在」这件事只有你那边 pull 一次才知道。
+#    ★ 最容易错的两个：
+#      · dify-plugin-daemon 必须带 **-local** 后缀（0.6.10-local，写 0.6.10 拉不到）
+#      · sandbox / plugin-daemon 的版本号与 dify 主版本**不同步**，
+#        别把 1.18.0 的版本号套到它们身上
+#    出现 MISS 先试官方 1.18.0 tag 下的 docker-compose.yaml 里那个值，
+#    硬起只会在 pull 阶段报 manifest unknown。
+#
+# -----------------------------------------------------------------------------
+# 五、端口（避开本机已占的 3306 / 6379 / 19530 / 11434 / 11436 / 8300）
+# -----------------------------------------------------------------------------
+#   8080 → nginx（唯一对外入口）
+#   db / plugin_daemon / api / web 一律不发布端口，只在 dify-network 内互通。
+#
+# -----------------------------------------------------------------------------
+# 六、启动 / 验收
+# -----------------------------------------------------------------------------
+#   mkdir -p /data/dify/{db,storage,plugin_daemon,weaviate,sandbox/dependencies}
+#   cp dify-nginx.conf /data/dify/nginx.conf                       # ← 文件名必须改
+#   # 🔴 两行都必须有：口令不进 git（本文件只留 ${DB_PASSWORD:?...} 占位）
+#   printf 'DB_PASSWORD=你的dify库密码\nREDIS_PASSWORD=你的项目redis密码\n' > /data/dify/.env
+#   chmod 600 /data/dify/.env                                     # ← 只有 root 可读
+#   cd /data/dify
+#   # 挂载点自检：这两条必须是「文件」「目录」，且 nginx.conf 不是目录
+#   test -f /data/dify/nginx.conf && echo "nginx.conf OK" || echo "❌ nginx.conf 不是文件"
+#   test -d /data/dify/storage    && echo "storage OK"    || echo "❌ storage 不是目录"
+#   # 先验语法与插值（不实际启动）
+#   docker compose -f docker-compose-dify.yaml config -q
+#   # 起服务：带 --profile full（worker + sandbox）
+#   #   为什么建议带上：这套审批流是 workflow 应用，Dify 里 workflow 的异步任务
+#   #   走 Celery；缺 worker 时表现为「点了运行一直转圈 / 日志停在 queued」。
+#   #   我无法在本地证明它一定不用 worker，所以先用完整的跑通，
+#   #   等确认整条链路 OK，再试试去掉 worker 看有没有回归。
+#   docker compose -f docker-compose-dify.yaml --profile full up -d
+#   docker compose -f docker-compose-dify.yaml ps
+#   docker compose -f docker-compose-dify.yaml logs -f api          # 首次 migration，1~2 分钟
+#
+#   内存实测（起完看这条，别靠状态猜）：
+#   docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}'
+#
+#   验收：
+#   curl -sS http://127.0.0.1:8080/console/api/setup                    → {"step":"..."}
+#   curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/    → 200
+#   浏览器 http://192.168.200.128:8080 → 出现设置管理员页面
+#
+#   内存还不够时按这个顺序补：
+#     a. systemctl stop ollama            省 4~6 GB，最有效
+#     b. 别开 --profile full
+#     c. api 的 SERVER_WORKER_AMOUNT 从 2 降到 1（再省 200~400MB）
+#     d. 给各服务加 mem_limit（文件内已留注释位置）
+#
+# -----------------------------------------------------------------------------
+# 七、与本项目的对接（起来之后再做）
+# -----------------------------------------------------------------------------
+#   Dify 设置 → 外部知识库 API → 本项目 http://192.168.200.128:8300/retrieval
+#   Dify 模型供应商 → OpenAI-API-compatible → Ollama http://192.168.200.128:11434/v1
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# api 与 worker 共用同一份环境（同镜像，只是 MODE 不同）
+# ---------------------------------------------------------------------------
+x-dify-common: &dify-common
+  image: langgenius/dify-api:1.18.0
+  restart: always
+  volumes:
+    # ★ 致命坑（2026-10-23 实测）：这个目录若由 Docker 自动创建，属主是 root:root 0755，
+    #   而 dify-api 以非 root 用户（uid 1001 dify）运行 → 首次 setup 在
+    #   libs/rsa.py:generate_key_pair() 写 privkeys/<workspace_id>/private.pem 时
+    #   抛 opendal PermissionDenied(os error 13)，被 account/service.py:291 包成
+    #   ValueError("Setup failed: ...")，前端表现为「点设置后一直转圈，最后 500」，
+    #   且 accounts 表始终 0 行。首次部署必须先执行：
+    #     mkdir -p /data/dify/storage
+    #     chown -R 1001:1001 /data/dify/storage
+    #     getenforce | grep -q Enforcing && chcon -Rt container_file_t /data/dify/storage
+    - /data/dify/storage:/app/api/storage
+  # 容器连不上 VM 的 IP 时，可改用 host.docker.internal
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  environment: &dify-env
+    # ---- 基础 ----
+    MODE: api
+    LOG_LEVEL: INFO
+    DEBUG: "false"
+    FLASK_DEBUG: "false"
+    # ★ 关掉匿名遥测（2026-10-23 实测）：Dify 每个请求结束都会 POST
+    #   https://otel.dify.ai/v1/events 上报事件。这在没有直连外网的 NAT 虚拟机里
+    #   会变成「请求本来 0.5 秒就处理完，却要等二三十秒才返回」的元凶之一
+    #   （实测录像：先 connect_tcp 到 192.168.200.1:7897，再 start_tls server_hostname='otel.dify.ai'）。
+    #   关掉后部署链路只剩 marketplace / pip 需要出网，启动和登录不再依赖代理是否通畅。
+    ANONYMIZED_TELEMETRY: "false"
+    # SECRET_KEY 必须**稳定**：它变了会导致登录态、已加密的模型密钥全部失效。
+    #   默认值故意写成 change-me 样式 —— 它是「可跑起来但必须换掉」的占位，不是密钥。
+    #   正式用请在 /data/dify/.env 里写 SECRET_KEY=...（`: -` 是有默认值、没设也不报错，
+    #   因为首次启动就缺它会导致加密字段全废，宁可先用占位跑通）。
+    SECRET_KEY: "${SECRET_KEY:-dify-local-lab-secret-key-change-me-0001}"
+    # ★ 迁移只能由 api 跑。锚点里默认 false，api 节点里显式改 true。
+    #   如果这里写 true，worker（同镜像、同锚点）会一起跑 alembic：
+    #   alembic 的版本表没有分布式锁，两个进程同时 upgrade 会撞成
+    #   「DuplicateTable / relation already exists」，然后 api 反复重启，
+    #   而 nginx 那边只表现为 502 —— 完全看不出是迁移打架。
+    MIGRATION_ENABLED: "false"
+
+    # ★ 外部知识库检索超时（2026-10-24 定位）。Dify 调「外部知识库 API」走
+    #   ssrf_proxy，其 httpx.Timeout 直接取这个值
+    #   （api/core/helper/ssrf_proxy.py:194 → dify_config.SSRF_DEFAULT_TIME_OUT）。
+    #   默认只有 5 秒，而我们的 dify_kb_server 在 VM 的 CPU 上跑
+    #   bge-reranker 精排 20 条候选实测要 8~23 秒（5 个 query 实测：
+    #   8.7 / 12.5 / 14.9 / 18.8 / 23.3 秒）→ 必然超时 → 页面「操作失败」，
+    #   api 日志表现为 6 秒间隔的重复请求 + Reached maximum retries (3)。
+    #   抬到 60 秒后单次检索能完整返回，**召回精度一点都不用牺牲**。
+    #   对比过的三条替代方案全部否决（实测与基准 top5 重合度）：
+    #     砍候选池 20→5 ......... 直接丢答案，否决
+    #     RERANK_MAX_CHARS 截断到 800 ... 仅 4.2/5，且仍要 9~14 秒，否决
+    #     换 DeepSeek 打分 ...... 仅 1.8/5，排序基本重排，否决
+    #   影响面：这是 Dify 所有 ssrf_proxy 出站请求的默认超时，正常请求不受影响，
+    #   只是失败场景会多等一会儿。
+    SSRF_DEFAULT_TIME_OUT: "60"
+
+    # ★★ 真正决定「等多久」的是 read，不是上面的 default（2026-10-24 02:00 实测）：
+    #   api/core/helper/ssrf_proxy.py:194
+    #     httpx.Timeout(
+    #         timeout=SSRF_DEFAULT_TIME_OUT,        # 只是兜底默认值
+    #         connect=SSRF_DEFAULT_CONNECT_TIME_OUT,
+    #         read=SSRF_DEFAULT_READ_TIME_OUT,      # ← 读超时**单独**取这个字段
+    #         write=SSRF_DEFAULT_WRITE_TIME_OUT,
+    #     )
+    #   httpx 四个维度各取各的，只改 default 对读取阶段完全无效。
+    #   实测证据：只把 default 改成 60 后，召回测试从「6 秒断开」变成
+    #   「23.6 秒 / Reached maximum retries (3)」—— 时间变长说明 default 生效了，
+    #   但 read 仍是小值，8~23 秒的检索照样读不完。
+    #   connect/write 是建连与发请求体，耗时毫秒级，保持默认即可，不用动。
+    SSRF_DEFAULT_READ_TIME_OUT: "60"
+
+    # ---- 内存压制（★ 别删，原因见文件头「内存预算」）----
+    # gunicorn worker 数。默认跟 CPU 核数走，8 核会起十几个进程直接 OOM。
+    SERVER_WORKER_AMOUNT: "2"
+    CELERY_WORKER_AMOUNT: "1"
+
+    # ---- 访问地址：同源走 nginx，全部留空（相对路径，换 IP 不用改配置）----
+    CONSOLE_API_URL: ""
+    CONSOLE_WEB_URL: ""
+    SERVICE_API_URL: ""
+    APP_API_URL: ""
+    APP_WEB_URL: ""
+    FILES_URL: ""
+
+    # ---- 数据库：必须是 PostgreSQL（Dify 不支持 MySQL）----
+    # 🔴 口令**不写进本文件**（本仓库会推到公开 GitHub，2026-10-24 已按此口径改造）：
+    #    与 REDIS_PASSWORD 同一种做法 —— 在 /data/dify/.env 里放一行，compose 自动插值。
+    #    `:?` 表示「没设就报错退出」，避免空口令静默连上（空口令比报错危险得多）。
+    DB_USERNAME: postgres
+    DB_PASSWORD: "${DB_PASSWORD:?请在 /data/dify/.env 里设置 DB_PASSWORD}"
+    DB_HOST: db
+    DB_PORT: "5432"
+    DB_DATABASE: dify
+    # 连接池开小：单机 2 个 gunicorn worker，用不了 30 条连接
+    SQLALCHEMY_POOL_SIZE: "8"
+    SQLALCHEMY_POOL_RECYCLE: "3600"
+
+    # ---- Redis：复用项目实例，db 号隔离 ----
+    # db2 = Dify 缓存；db3 = Celery 队列（项目自己用 db0，互不覆盖）
+    REDIS_HOST: 192.168.200.128
+    REDIS_PORT: "6379"
+    REDIS_USERNAME: ""
+    REDIS_PASSWORD: "${REDIS_PASSWORD:?请在 /data/dify/.env 里设置 REDIS_PASSWORD}"
+    REDIS_USE_SSL: "false"
+    REDIS_DB: "2"
+    # ⚠️ 这里把密码拼进 URL，所以 REDIS_PASSWORD **不能含 @ : / ? # 等字符**，
+    #    否则 URL 会被解析成「密码只有前半段」，报 NOAUTH/AUTH failed。
+    #    本项目当前密码是 7 位纯字母数字，安全；换密码时留意这条。
+    CELERY_BROKER_URL: "redis://:${REDIS_PASSWORD:?REDIS_PASSWORD missing}@192.168.200.128:6379/3"
+    BROKER_USE_SSL: "false"
+
+    # ---- CORS ----
+    WEB_API_CORS_ALLOW_ORIGINS: "*"
+    CONSOLE_CORS_ALLOW_ORIGINS: "*"
+
+    # ---- 文件存储 ----
+    STORAGE_TYPE: opendal
+    OPENDAL_SCHEME: fs
+    # 必须绝对路径：相对路径依赖 entrypoint 的 cwd，换镜像版本可能解析到别处，
+    # 表现为「上传成功但知识库读不到文件」这种很难查的问题
+    OPENDAL_FS_ROOT: /app/api/storage
+
+    # ---- 向量库：复用项目 Milvus ----
+    # 想改成独立 weaviate：VECTOR_STORE=weaviate docker compose ... --profile weaviate up -d
+    VECTOR_STORE: ${VECTOR_STORE:-milvus}
+    MILVUS_URI: http://192.168.200.128:19530
+    MILVUS_TOKEN: ""
+    MILVUS_USER: ""
+    MILVUS_PASSWORD: ""
+    MILVUS_DATABASE: default
+    # 仅在 VECTOR_STORE=weaviate 时生效
+    WEAVIATE_ENDPOINT: http://weaviate:8080
+    WEAVIATE_API_KEY: "dify-local-weaviate-key"
+    WEAVIATE_GRPC_ENABLED: "true"
+    WEAVIATE_GRPC_ENDPOINT: weaviate:50051
+
+    # ---- 代码沙箱（默认不启 sandbox；用到代码节点时加 --profile full）----
+    SANDBOX_ENDPOINT: http://sandbox:8194
+    SANDBOX_API_KEY: "dify-local-sandbox-key"
+
+    # ---- 插件守护进程（必需：模型供应商/工具全是插件）----
+    PLUGIN_DAEMON_URL: http://plugin_daemon:5002
+    PLUGIN_DAEMON_KEY: "dify-local-plugin-daemon-key"
+    INNER_API_KEY_FOR_PLUGIN: "dify-local-inner-api-key"
+
+    # ---- 代理：宿主机 Clash（VM 自身无外网）----
+    HTTP_PROXY: http://192.168.200.1:7897
+    HTTPS_PROXY: http://192.168.200.1:7897
+    http_proxy: http://192.168.200.1:7897
+    https_proxy: http://192.168.200.1:7897
+    NO_PROXY: "localhost,127.0.0.1,db,weaviate,sandbox,plugin_daemon,api,worker,web,nginx,192.168.200.128,192.168.200.1"
+    no_proxy: "localhost,127.0.0.1,db,weaviate,sandbox,plugin_daemon,api,worker,web,nginx,192.168.200.128,192.168.200.1"
+  depends_on:
+    db:
+      condition: service_healthy
+
+# ---------------------------------------------------------------------------
+networks:
+  dify-network:
+    driver: bridge
+    name: dify-network
+
+services:
+  # =========================================================================
+  # 1) PostgreSQL —— Dify 元数据（应用/知识库/对话/账号）
+  #    Dify 只认 PG，无法用项目 MySQL 替代（原因见文件头）
+  #    参数压到极限：单机小规模够用，比默认省 40~60MB
+  # =========================================================================
+  db:
+    image: postgres:15-alpine
+    container_name: dify-db
+    restart: always
+    environment:
+      # 与 api/worker 的 DB_PASSWORD 必须同一个值（首次 initdb 用它建库，
+      # 之后改了不会自动同步 —— 改这个等于要重建数据卷）。
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?请在 /data/dify/.env 里设置 DB_PASSWORD}"
+      POSTGRES_DB: dify
+      POSTGRES_USER: postgres
+      LANG: C.UTF-8
+    volumes:
+      - /data/dify/db:/var/lib/postgresql/data
+    # max_connections 必须按「所有客户端连接池之和」倒推，不能拍脑袋压到 30：
+    #   api     2 个 gunicorn worker × SQLALCHEMY_POOL_SIZE(8)  = 16
+    #   worker  1 个 celery worker  × SQLALCHEMY_POOL_SIZE(8)   =  8
+    #   plugin_daemon (Go/pgx 连接池，默认上限约 10)            ≈ 10
+    #   ------------------------------------------------------------
+    #   合计 ≈ 34 条。压到 30 会在跑工作流时炸在
+    #   「FATAL: sorry, too many clients already」，
+    #   而且报错发生在某个节点执行中途，日志里只看到节点失败，极难定位。
+    #   留到 60：PG 每连接约 1~2MB，多 30 条只多 30~60MB，比排查这个坑便宜太多。
+    command: >
+      postgres -c shared_buffers=32MB -c work_mem=2MB
+      -c max_connections=60 -c maintenance_work_mem=16MB
+      -c synchronous_commit=off
+    # mem_limit: 256m        # 需要硬上限时取消注释
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "dify"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - dify-network
+
+  # =========================================================================
+  # 2) Weaviate —— 可选（默认不启，默认走项目 Milvus）
+  #    启动：VECTOR_STORE=weaviate docker compose ... --profile weaviate up -d
+  # =========================================================================
+  weaviate:
+    image: semitechnologies/weaviate:1.39.2
+    container_name: dify-weaviate
+    restart: always
+    profiles: ["weaviate"]
+    environment:
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+      AUTHENTICATION_APIKEY_ENABLED: "true"
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: "dify-local-weaviate-key"
+      AUTHENTICATION_APIKEY_USERS: "hello@dify.ai"
+      AUTHORIZATION_ADMINLIST_ENABLED: "true"
+      AUTHORIZATION_ADMINLIST_USERS: "hello@dify.ai"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      CLUSTER_HOSTNAME: node1
+      DEFAULT_VECTORIZER_MODULE: none
+      ENABLE_MODULES: ""
+    volumes:
+      - /data/dify/weaviate:/var/lib/weaviate
+    # 刻意不配 healthcheck：该镜像不保证带 wget/curl，配了大概率误报 unhealthy
+    # 手动验：docker exec dify-weaviate wget -qO- http://127.0.0.1:8080/v1/.well-known/ready
+    networks:
+      - dify-network
+
+  # =========================================================================
+  # 3) Sandbox —— 可选（默认不启）：工作流「代码执行」节点才需要
+  # =========================================================================
+  sandbox:
+    image: langgenius/dify-sandbox:0.2.15
+    container_name: dify-sandbox
+    restart: always
+    profiles: ["full"]
+    environment:
+      API_KEY: "dify-local-sandbox-key"
+      GIN_MODE: release
+      WORKER_TIMEOUT: "15"
+      ENABLE_NETWORK: "true"
+      HTTP_PROXY: http://192.168.200.1:7897
+      HTTPS_PROXY: http://192.168.200.1:7897
+      http_proxy: http://192.168.200.1:7897
+      https_proxy: http://192.168.200.1:7897
+      NO_PROXY: "localhost,127.0.0.1,db,weaviate,plugin_daemon,api,worker,web"
+    volumes:
+      - /data/dify/sandbox/dependencies:/dependencies
+    networks:
+      - dify-network
+
+  # =========================================================================
+  # 4) Plugin Daemon —— 必需。1.x 的模型供应商/工具全是插件，
+  #    没有它 UI 里「模型供应商」页面不可用，连 Ollama 都配不了
+  # =========================================================================
+  plugin_daemon:
+    # ★ tag 必须带 -local 后缀：官方仓库里 plugin-daemon 发的镜像就是
+    #   X.Y.Z-local 这个形式，写 0.6.10 会 pull 失败（manifest unknown）。
+    #   ★ 另外这个组件的版本号与 dify 主版本**不同步**（dify 1.18.0 配 0.6.10-local），
+    #   两者要按官方 docker-compose.yaml 一一对应，不能各自升到最新。
+    image: langgenius/dify-plugin-daemon:0.6.10-local
+    container_name: dify-plugin-daemon
+    restart: always
+    environment:
+      # Dify 主 api 只能 PG，这里也统一走 PG（plugin_daemon 本身也支持 mysql，
+      # 但既然 PG 已经在了，多接一个库只是多一个故障点）
+      DB_TYPE: postgresql
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: "${DB_PASSWORD:?请在 /data/dify/.env 里设置 DB_PASSWORD}"
+      DB_DATABASE: dify
+      DB_SSL_MODE: disable
+      SERVER_PORT: "5002"
+      SERVER_KEY: "dify-local-plugin-daemon-key"
+      # ★★ 0.6.x 改过变量名，这是容器 crash-loop 的头号原因：
+      #   官方 1.18.0 用的是 DIFY_INNER_API_KEY / DIFY_INNER_API_URL，
+      #   旧名 INNER_API_KEY 在 0.6.x 已经不再被读取。
+      #   只写旧名 → daemon 拿不到 inner api key，也无法回调 api，
+      #   启动自检不过就直接 exit 1，compose 表现就是 Restarting。
+      DIFY_INNER_API_URL: http://api:5001
+      DIFY_INNER_API_KEY: "dify-local-inner-api-key"
+      # 旧名保留一份，兼容将来降级到 0.5.x
+      INNER_API_KEY: "dify-local-inner-api-key"
+      ENDPOINT_URL: http://plugin_daemon:5002
+      # ---- 0.6.x 新增、缺了会用相对路径在工作目录里乱建文件 ----
+      PLUGIN_WORKING_PATH: /app/storage/cwd
+      PLUGIN_REMOTE_INSTALLING_HOST: 0.0.0.0
+      PLUGIN_REMOTE_INSTALLING_PORT: "5003"
+      MAX_PLUGIN_PACKAGE_SIZE: "52428800"
+      # ★ 插件安装时要 pip 装 Python 依赖。本机只有 3.6Mbps，
+      #   走默认 pypi.org 装一个插件能等到天荒地老，换清华源。
+      PIP_MIRROR_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+      # ---- Redis：同样复用项目实例（db2，与 api 缓存共库、key 前缀不同）----
+      REDIS_HOST: 192.168.200.128
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?请在 /data/dify/.env 里设置 REDIS_PASSWORD}"
+      REDIS_DB: "2"
+      REDIS_USE_SSL: "false"
+      PLUGIN_STORAGE_TYPE: local
+      PLUGIN_STORAGE_LOCAL_ROOT: /app/storage
+      # 不联网校验插件签名：这样「本地上传 .difypkg」这条路一定能走通
+      FORCE_VERIFYING_SIGNATURE: "false"
+      # 在线市场：Dify 1.x 起模型供应商（含 Ollama）全是插件，
+      # 关掉市场就只剩「手动下载 .difypkg 再上传」这一条路。
+      # 本机有 Clash 代理（192.168.200.1:7897），先开成 true 走市场；
+      # 若日志里 marketplace 请求一直超时，再改回 false，然后按下面手动装：
+      #   宿主机浏览 https://marketplace.dify.ai → 找 Ollama 插件 → 下载 .difypkg
+      #   → Dify 控制台「插件 → 安装插件 → 本地包上传」
+      MARKETPLACE_ENABLED: "true"
+      HTTP_PROXY: http://192.168.200.1:7897
+      HTTPS_PROXY: http://192.168.200.1:7897
+      http_proxy: http://192.168.200.1:7897
+      https_proxy: http://192.168.200.1:7897
+      NO_PROXY: "localhost,127.0.0.1,db,weaviate,sandbox,plugin_daemon,api,worker,web,192.168.200.128"
+      no_proxy: "localhost,127.0.0.1,db,weaviate,sandbox,plugin_daemon,api,worker,web,192.168.200.128"
+    volumes:
+      - /data/dify/plugin_daemon:/app/storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - dify-network
+
+  # =========================================================================
+  # 5) API —— 核心后端（首次启动跑 flask db upgrade，1~2 分钟）
+  # =========================================================================
+  api:
+    <<: *dify-common
+    container_name: dify-api
+    environment:
+      <<: *dify-env
+      MODE: api
+      # 迁移只在这个进程跑（锚点里是 false，原因见锚点注释）
+      MIGRATION_ENABLED: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      # api 启动即要连 plugin_daemon 注册插件，不能让它在 daemon 之前起来
+      # 抢先握手（表现为启动日志刷 connection refused，插件页空白）
+      plugin_daemon:
+        condition: service_started
+    networks:
+      - dify-network
+
+  # =========================================================================
+  # 6) Worker —— Celery 消费者
+  #    Dify 自带知识库的解析/索引、以及 workflow 的异步任务都靠它。
+  #    起服务时用 --profile full 一并拉起；确认整链路 OK 后再评估能否省掉。
+  #    ⚠️ 它绝不能跑迁移：MIGRATION_ENABLED 已在锚点里设 false
+  # =========================================================================
+  worker:
+    <<: *dify-common
+    container_name: dify-worker
+    profiles: ["full"]
+    environment:
+      <<: *dify-env
+      MODE: worker
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    networks:
+      - dify-network
+
+  # =========================================================================
+  # 7) Web —— Next.js 前端
+  # =========================================================================
+  web:
+    image: langgenius/dify-web:1.18.0
+    container_name: dify-web
+    restart: always
+    environment:
+      CONSOLE_API_URL: ""
+      APP_API_URL: ""
+      NEXT_PUBLIC_API_PREFIX: /console/api
+      NEXT_PUBLIC_PUBLIC_API_PREFIX: /api
+      HTTP_PROXY: http://192.168.200.1:7897
+      HTTPS_PROXY: http://192.168.200.1:7897
+    networks:
+      - dify-network
+
+  # =========================================================================
+  # 8) Nginx —— 唯一对外入口（8080）
+  #    不能砍：它提供「同源」，跨源会让 cookie 不发、登录反复失效
+  # =========================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: dify-nginx
+    restart: always
+    ports:
+      - "8080:80"
+    volumes:
+      - /data/dify/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+      - web
+      - plugin_daemon
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dify-network
