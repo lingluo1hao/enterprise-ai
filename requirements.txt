@@ -14,7 +14,8 @@ gunicorn>=21.0
 Werkzeug>=3.0          # Flask 已间接依赖，显式列出便于安全审计（safe_join 等接口）
 
 # ---------- 向量库 & 缓存 ----------
-pymilvus>=2.5          # 2.5+ 才提供 BM25 稀疏检索 / Function(FunctionType) 接口
+# pymilvus 锁 2.5.x：2.5+ 才有 BM25 Function；3.x 改了 Function API 不兼容
+pymilvus>=2.5,<3.0     # 服务端 v2.5.0，3.x 的 Function API 不兼容
 redis>=5.0
 
 # ---------- LLM / Agent 编排 ----------
