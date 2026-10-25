@@ -113,6 +113,7 @@ class Retriever:
                      rerank        bool  是否开启 cross-encoder 精排
                      top_k         int   线上 RETRIEVE_TOP_K
                      candidate_k   int   RRF 候选池 RETRIEVE_CANDIDATE_K
+                     rerank_max_chars int 送进精排的单条字符上限（默认 3000）
     """
 
     def __init__(self, mode: str = "pipeline", fetch_k: int = DEFAULT_FETCH_K,
@@ -152,6 +153,12 @@ class Retriever:
         if "candidate_k" in ov:
             self._saved["RETRIEVE_CANDIDATE_K"] = L.RETRIEVE_CANDIDATE_K
             L.RETRIEVE_CANDIDATE_K = int(ov["candidate_k"])
+        if "rerank_max_chars" in ov:
+            # ★ 送进精排的单条字符上限（默认 3000）。实测精排耗时≈正比于总字符数，
+            #   所以「截断」是唯一不动候选数就能压延迟的杠杆。
+            #   本键**只影响评测进程**，改完自动还原；写回 .env 才会影响服务。
+            self._saved["RERANK_MAX_CHARS"] = L.RERANK_MAX_CHARS
+            L.RERANK_MAX_CHARS = int(ov["rerank_max_chars"])
 
         # pipeline 模式下，检索深度要顶到 fetch_k，否则算不出真实的 bury
         if self.mode == "pipeline":

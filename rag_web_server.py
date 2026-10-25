@@ -2081,7 +2081,8 @@ def kb_page():
   <div class="nav-right">
     <a href="/" class="nav-link">💬 问答</a>
     <a href="/kb" class="nav-link active">📚 知识库</a>''' + ('''
-    <a href="/admin" class="nav-link">⚙️ 系统管理</a>''' if is_admin else '') + '''
+    <a href="/admin" class="nav-link">⚙️ 系统管理</a>
+    <a href="/dify" class="nav-link">Dify 接入</a>''' if is_admin else '') + '''
     <span class="nav-user" id="who"></span>
     <button class="nav-logout" onclick="doLogout()">🚪 退出</button>
   </div>
@@ -6201,6 +6202,1540 @@ def _init_vector_store_locked():
     while _t.time() < deadline and r.exists(lock_key):
         _t.sleep(1)
     return VectorStoreManager.init_vector_store()
+
+
+# ======================================================================
+# Dify 接入控制台（/dify）
+# ======================================================================
+# 设计取舍（为什么长这样，都是有代价的）：
+#
+# 1) **只认真实出口**。页面上的每个数字只有两个来源：
+#    · 桥服务 `GET /health`（它自己数出来的 requests/records/errors/latency/recent）
+#    · Milvus 的 `count(*)`（每个租户实际有多少 chunk）
+#    取不到就显示「未取到」，绝不拿估算值填空 —— 运维面板一旦开始编数字，
+#    就再也没人信它了。
+#
+# 2) **探活不许用 urllib.request**。它读 `http_proxy` 环境变量：本机开着
+#    Clash(127.0.0.1:7897) 时，访问内网 192.168.x 会走代理并**返回 502**，
+#    看起来像「虚拟机上的服务挂了」。这里一律用 `http.client` 直连。
+#    （2026-10-25 实测：curl 报 11436 HTTP=502，`--noproxy '*'` 才是 000=真连不上）
+#
+# 3) **不引入前端构建链**。服务端拼 HTML + 原生 fetch，与 /kb、/admin 同风格。
+#    要的是「打开就能用」，不是「先 npm i」。
+#
+# 4) **整个控制台仅管理员可见**。请求流水里带原始 query，检索演练能读到
+#    租户正文（kb-jm / kb-yh 是业务文档），这两件事都不该给普通用户看。
+import http.client as _httpc
+import socket as _socket
+import concurrent.futures as _cf
+
+DIFY_BRIDGE = os.getenv("DIFY_BRIDGE_URL", "http://127.0.0.1:8300").rstrip("/")
+DIFY_KEY = os.getenv("DIFY_KB_API_KEY", "")
+# Dify 控制台地址（版本探测 / 租户入口跳转用）；与桥服务地址是两回事，别混
+DIFY_BRIDGE_BASE = os.getenv("DIFY_BASE_URL",
+                             "http://192.168.200.128:8080").rstrip("/")
+# 版本形态缓存（COMMUNITY / ENTERPRISE / UNKNOWN），5 分钟过期
+_DIFY_EDITION = {"ts": 0.0, "v": ""}
+
+# 依赖清单：名字 / 探活方式 / 目标 / 人读说明
+# 端口一律从 .env 同源取值，避免「面板显示 3306、实际连 3307」这种假一致
+_DIFY_DEPS = [
+    ("桥服务", "http", "127.0.0.1", int(os.getenv("DIFY_BRIDGE_PORT", "8300")),
+     "POST /retrieval 与 /ai/pack 的入口"),
+    ("Milvus", "tcp", os.getenv("MILVUS_HOST", "192.168.200.128"),
+     int(os.getenv("MILVUS_PORT", "19530")), "向量库（检索的地基，不可用则整条链断）"),
+    ("Ollama", "http", os.getenv("OLLAMA_BASE_URL", "http://192.168.200.128:11434"),
+     None, "bge-m3 嵌入模型（EMBED_BACKEND=ollama）"),
+    ("精排 reranker", "tcp", os.getenv("RERANK_HOST", "192.168.200.128"),
+     int(os.getenv("RERANK_PORT", "11436")), "bge-reranker-v2-m3（不可达则分数退化为名次）"),
+    ("MySQL", "tcp", os.getenv("MYSQL_HOST", "192.168.200.128"),
+     int(os.getenv("MYSQL_PORT", "3306")), "会话/审计/用户表（不可用退化为内存）"),
+    ("Redis", "tcp", os.getenv("REDIS_HOST", "192.168.200.128"),
+     int(os.getenv("REDIS_PORT", "6379")), "缓存与分布式锁"),
+    ("Dify", "http", os.getenv("DIFY_BASE_URL", "http://192.168.200.128:8080"),
+     None, "编排侧（调我们 /retrieval 的那一端）"),
+]
+
+_DIFY_KB_CACHE = {"ts": 0.0, "data": {}, "err": ""}
+
+
+def _split_url(u: str):
+    """http://h:p/x → (h, p, '/x')。只支持 http，够用且不引第三方。"""
+    t = u.strip()
+    if "://" in t:
+        t = t.split("://", 1)[1]
+    host, _, rest = t.partition("/")
+    prefix = "/" + rest if rest else ""
+    if ":" in host:
+        h, _, p = host.partition(":")
+        return h, int(p), prefix or ""
+    return host, 80, prefix or ""
+
+
+def _hc(url: str, method: str = "GET", payload=None, headers=None,
+        timeout: float = 3.0):
+    """http.client 直连（不经过任何代理）。返回 (status, body_text, ms)。"""
+    host, port, path = _split_url(url)
+    hdrs = {"Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    hdrs.update(headers or {})
+    t0 = _time.time()
+    conn = _httpc.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request(method, path or "/", body=body, headers=hdrs)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, raw.decode("utf-8", "replace"), \
+            (_time.time() - t0) * 1000
+    finally:
+        conn.close()
+
+
+def _probe_tcp(host: str, port: int, timeout: float = 1.2):
+    t0 = _time.time()
+    s = _socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True, (_time.time() - t0) * 1000
+    except Exception:
+        return False, None
+    finally:
+        s.close()
+
+
+def _probe_one(spec):
+    name, kind, host, port, note = spec
+    if kind == "tcp":
+        ok, ms = _probe_tcp(host, port)
+        # ★ 必须用 `ms is not None` 而不是 `if ms`：本机/同网关的 TCP 握手
+        #   经常是 0.0~0.4ms，`if ms` 会把它当成"没有值"显示成「—」。
+        return {"name": name, "kind": "tcp", "target": f"{host}:{port}",
+                "ok": ok, "ms": round(ms, 1) if ms is not None else None,
+                "note": note}
+    # http：拿得到 2xx/3xx 才算通（502/000 都不算）
+    url = host + ("/api/tags" if name == "Ollama" else
+                  "/console/api/setup" if name == "Dify" else "/health")
+    if name == "桥服务":
+        url = f"http://{host}:{port}/health"
+    try:
+        st, _, ms = _hc(url, timeout=2.0)
+        return {"name": name, "kind": "http", "target": url,
+                "ok": 200 <= st < 400, "ms": round(ms, 1), "note": note,
+                "http": st}
+    except Exception as e:
+        return {"name": name, "kind": "http", "target": url, "ok": False,
+                "ms": None, "note": note, "err": type(e).__name__}
+
+
+def _dify_deps_parallel():
+    with _cf.ThreadPoolExecutor(max_workers=len(_DIFY_DEPS)) as ex:
+        return list(ex.map(_probe_one, _DIFY_DEPS))
+
+
+def _dify_bridge_health(timeout: float = 3.0):
+    """取桥服务 /health；失败返回 (None, 错误说明)。"""
+    try:
+        st, body, ms = _hc(DIFY_BRIDGE + "/health", timeout=timeout)
+        if st != 200:
+            return None, f"桥服务返回 HTTP {st}"
+        return json.loads(body), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _kb_counts(tenants, ttl: float = 300.0):
+    """每个租户在 Milvus 里的 chunk 数（带 TTL 缓存）。
+
+    ★ 为什么不放进 /overview：collection.load() 要 7~8 秒，放主接口会把首屏拖死。
+      做成独立接口让前端先渲染骨架、后填这一列。
+    """
+    now = _time.time()
+    if _DIFY_KB_CACHE["data"] and now - _DIFY_KB_CACHE["ts"] < ttl:
+        return _DIFY_KB_CACHE["data"]
+    out, err = {}, ""
+    try:
+        from pymilvus import connections, Collection
+        alias = "dify_console"
+        try:
+            connections.connect(alias=alias, uri=os.getenv(
+                "MILVUS_URI", "http://192.168.200.128:19530"), timeout=6)
+        except Exception:
+            pass  # 已连上会抛「already connected」，忽略即可
+        col = Collection(os.getenv("MILVUS_COLLECTION", "rag_docs"), using=alias)
+        col.load()
+        for t in tenants:
+            if not t:
+                continue
+            try:
+                r = col.query(expr=f'tenant_id == "{t}"',
+                              output_fields=["count(*)"], using=alias)
+                out[t] = int(r[0].get("count(*)", 0)) if r else 0
+            except Exception as e:
+                out[t] = None
+                err = f"{t}: {type(e).__name__}"
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "counts": {}}
+    if out:
+        _DIFY_KB_CACHE.update({"ts": now, "data": out, "err": err})
+    return {"error": err, "counts": out}
+
+
+@app.route("/api/dify/overview")
+def api_dify_overview():
+    """控制台首屏：依赖矩阵 + 桥服务自报的统计。所有数字都来自真实出口。"""
+    denied = _require_admin()
+    if denied:
+        return denied
+    health, herr = _dify_bridge_health()
+    deps = _dify_deps_parallel()
+    payload = {
+        "ts": _time.time(),
+        "clock": _time.strftime("%H:%M:%S"),
+        "bridge_url": DIFY_BRIDGE,
+        "bridge_error": herr,
+        "deps": deps,
+        "bridge": health,
+    }
+    return jsonify(payload)
+
+
+@app.route("/api/dify/kb_counts")
+def api_dify_kb_counts():
+    """各租户的 chunk 数（慢接口，前端单独拉）。"""
+    denied = _require_admin()
+    if denied:
+        return denied
+    health, herr = _dify_bridge_health(timeout=2.0)
+    if not health:
+        return jsonify({"error": herr or "桥服务不可用", "counts": {}}), 200
+    tenants = sorted({kb.get("tenant_id") for kb in
+                      (health.get("knowledge_bases") or []) if kb.get("tenant_id")})
+    return jsonify(_kb_counts(tenants))
+
+
+@app.route("/api/dify/retrieval", methods=["POST"])
+def api_dify_retrieval():
+    """检索演练：服务端代理到桥服务，浏览器不直连 8300（避免暴露密钥）。"""
+    denied = _require_admin()
+    if denied:
+        return denied
+    req = request.get_json(silent=True) or {}
+    kb = (req.get("knowledge_id") or "").strip()
+    query = (req.get("query") or "").strip()
+    if not kb or not query:
+        return jsonify({"error": "knowledge_id 与 query 都必填"}), 400
+    try:
+        top_k = max(1, min(20, int(req.get("top_k") or 5)))
+        threshold = max(0.0, min(1.0, float(req.get("score_threshold") or 0)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "top_k / score_threshold 需为数字"}), 400
+
+    body = {"knowledge_id": kb, "query": query,
+            "retrieval_setting": {"top_k": top_k, "score_threshold": threshold}}
+    hdr = {"Authorization": f"Bearer {DIFY_KEY}"} if DIFY_KEY else {}
+    try:
+        st, text, ms = _hc(DIFY_BRIDGE + "/retrieval", method="POST",
+                           payload=body, headers=hdr, timeout=120.0)
+    except Exception as e:
+        return jsonify({"error": f"桥服务不可达：{type(e).__name__}: {e}"}), 502
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = {"raw": text[:2000]}
+    return jsonify({"http": st, "ms": round(ms, 1), "elapsed_s": round(ms / 1000, 2),
+                    "request": body, "response": data})
+
+
+@app.route("/api/dify/ai_pack", methods=["POST"])
+def api_dify_ai_pack():
+    """审批演练：服务端代理到桥服务 `POST /ai/pack`。
+
+    为什么必须有这个接口：Dify 画的审批流跑的正是 `/ai/pack`，但画布不在我们这边，
+    租户在页面上没法"先看看这条单会怎么走"。这个接口把同一份数据包原样拿回来，
+    让「取数 → 规则 → 路径 → 材料」在控制台上可操作、可核对，再去 Dify 画。
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    req = request.get_json(silent=True) or {}
+    kb = (req.get("knowledge_id") or "").strip()
+    try:
+        po_id = int(req.get("po_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "po_id 必须是整数"}), 400
+    if not kb:
+        return jsonify({"error": "knowledge_id 必填（kb-jm / kb-yh）"}), 400
+
+    body = {"po_id": po_id, "knowledge_id": kb}
+    hdr = {"Authorization": f"Bearer {DIFY_KEY}"} if DIFY_KEY else {}
+    try:
+        st, text, ms = _hc(DIFY_BRIDGE + "/ai/pack", method="POST",
+                           payload=body, headers=hdr, timeout=30.0)
+    except Exception as e:
+        return jsonify({"error": f"桥服务不可达：{type(e).__name__}: {e}"}), 502
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = {"raw": text[:2000]}
+    return jsonify({"http": st, "ms": round(ms, 1),
+                    "elapsed_s": round(ms / 1000, 2),
+                    "request": body, "response": data})
+
+
+@app.route("/api/dify/tenants")
+def api_dify_tenants():
+    """租户 ↔ Dify 映射（供控制台渲染「进入本租户 Dify」入口）。
+
+    只回元信息，**绝不回密码**：密码只以「是否已配」的布尔出现。
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    cfg, err = _load_dify_tenants()
+    if not cfg:
+        return jsonify({"error": err or "未找到 config/dify_tenants.yaml",
+                        "tenants": []})
+    me = g.current_user or {}
+    my_tenant = me.get("tenant_id") or ""
+    is_super = me.get("role") in (ROLE_SUPER_ADMIN,)
+    out = []
+    for t in (cfg.get("tenants") or []):
+        tid = t.get("tenant_id")
+        out.append({
+            "tenant_id": tid,
+            "label": t.get("label") or tid,
+            "workspace": t.get("workspace") or tid,
+            "app_prefix": t.get("app_prefix") or "",
+            "email": t.get("email") or "",
+            "knowledge_ids": t.get("knowledge_ids") or [],
+            "enabled": bool(t.get("enabled", True)),
+            # 密码是否已配（只看布尔，不回值）
+            "password_configured": bool(os.getenv(t.get("password_env") or "", "")),
+            # 当前登录人能不能进这一条
+            "allowed": bool(is_super or tid == my_tenant),
+        })
+    return jsonify({
+        "console_url": cfg.get("console_url") or "",
+        "isolation": cfg.get("isolation") or "app_prefix",
+        # 实际生效的隔离形态：配置要 workspace 但 Dify 是社区版 → 降级成 app_prefix
+        "edition": _dify_edition(),
+        "effective_isolation": _effective_isolation(cfg),
+        "my_tenant": my_tenant,
+        "tenants": out,
+    })
+
+
+def _effective_isolation(cfg) -> str:
+    """配置想要的隔离形态 vs 当前 Dify 实际能给的。
+
+    这条是给页面如实展示用的：社区版只有 1 个 workspace，配了 workspace 也只能降级。
+    """
+    want = (cfg.get("isolation") or "app_prefix")
+    if want != "workspace":
+        return want
+    ed = _dify_edition()
+    return "workspace" if ed.upper() != "COMMUNITY" else "app_prefix"
+
+
+def _load_dify_tenants():
+    """读 config/dify_tenants.yaml。返回 (cfg, err)。"""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "config", "dify_tenants.yaml")
+    if not os.path.isfile(p):
+        return None, "配置文件不存在：config/dify_tenants.yaml"
+    try:
+        import yaml
+        with io.open(p, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}, ""
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+@app.route("/dify/enter/<tenant_id>")
+def dify_enter(tenant_id):
+    """「进入本租户 Dify」。
+
+    决策（2026-10-25）：走 **C · 企业版多 workspace**，**不做免登**（社区版做不到，
+    企业版靠 OIDC，都不在本次范围）。所以这里只做两件事：
+      1) 按登录人的租户做**准入校验**（跨租户 403，这是安全边界，不能省）；
+      2) 把人送到 Dify，并如实说明当前隔离是"工作区"还是"降级成应用前缀"。
+
+    为什么不再试图服务端代登录：实测 Dify 社区版 `POST /console/api/login` 会拒明文
+    口令（`Invalid encrypted data`），且没有公开公钥端点 —— 那段代码留着只会造成
+    "看起来能免登、实际永远失败"的幻觉，已删除。
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    cfg, err = _load_dify_tenants()
+    if not cfg:
+        return Response(err or "配置缺失", status=500, mimetype="text/plain")
+    me = g.current_user or {}
+    my_tenant = me.get("tenant_id") or ""
+    if me.get("role") not in (ROLE_SUPER_ADMIN,) and tenant_id != my_tenant:
+        return Response("只能进入本租户的 Dify", status=403,
+                        mimetype="text/plain")
+    row = next((t for t in (cfg.get("tenants") or [])
+                if t.get("tenant_id") == tenant_id), None)
+    if not row or not row.get("enabled", True):
+        return Response(f"租户 {tenant_id} 未在 dify_tenants.yaml 里启用",
+                        status=404, mimetype="text/plain")
+
+    base = (row.get("console_url") or cfg.get("console_url") or "").rstrip("/")
+    edition = _dify_edition()
+    want_ws = (cfg.get("isolation") or "workspace") == "workspace"
+    ws_on = want_ws and edition.upper() != "COMMUNITY"
+    ws_name = str(row.get("workspace") or tenant_id)
+    prefix = row.get("app_prefix") or (tenant_id + "-")
+
+    if ws_on:
+        note = ("当前 Dify 是 %s，按工作区隔离：登录后你的应用都在工作区 "
+                "<b>%s</b> 里，其他租户的工作区互相不可见。" % (edition, ws_name))
+        chip = "工作区隔离生效"
+        tone = "#067647"
+    elif not want_ws:
+        # 这是**主动选择**，不是降级 —— 别把设计决策说成故障。
+        note = ("当前采用<b>应用名前缀 %s</b> 的命名约定：一个 Dify 实例里按前缀区分租户，"
+                "所有成员仍共享同一个应用列表。企业版多工作区到位后，本页自动切到工作区隔离，"
+                "<b>不需要改代码</b>。" % prefix)
+        chip = "应用前缀隔离（当前生效）"
+        tone = "#185fa5"
+    else:
+        why = ("当前 Dify 是社区版（单工作区），无法按工作区隔离"
+               if edition.upper() == "COMMUNITY"
+               else "配置为 workspace，但 Dify 未返回企业版标识")
+        note = (why + "。现在退化为<b>应用名前缀 %s</b> 的命名约定，"
+                "所有成员仍共享同一个应用列表 —— 升级企业版后本页自动切到工作区隔离，"
+                "<b>不需要改代码</b>。" % prefix)
+        chip = "已降级为应用前缀"
+        tone = "#b54708"
+
+    html = ("<!DOCTYPE html><meta charset='utf-8'>"
+            "<body style='font:14px/1.7 -apple-system,Segoe UI,Microsoft YaHei;"
+            "max-width:680px;margin:56px auto;color:#101828;padding:0 18px'>"
+            "<h3 style='margin:0 0 6px'>进入 " + (row.get("label") or tenant_id) + " 的 Dify</h3>"
+            "<div style='display:inline-block;font-size:12px;padding:2px 10px;border-radius:999px;"
+            "border:1px solid " + tone + "33;color:" + tone + ";background:" + tone + "0f;"
+            "margin-bottom:12px'>" + chip + "</div>"
+            "<p style='color:#667085;line-height:1.8'>" + note + "</p>"
+            "<p style='color:#98a2b3;font-size:12.5px'>不做免登：本系统账号与 Dify 成员账号"
+            "是两套，进入后请用 Dify 里的成员账号登录"
+            "（配置邮箱 <b>" + (row.get("email") or "未填") + "</b>，以 Dify → 设置 → 成员 为准）。</p>"
+            "<p style='margin-top:18px'><a href='" + base + "' "
+            "style='display:inline-block;background:#185fa5;color:#fff;padding:9px 18px;"
+            "border-radius:8px;text-decoration:none'>打开 Dify 控制台</a></p>"
+            "</body>")
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
+def _dify_edition(ttl: float = 300.0) -> str:
+    """取 Dify 版本形态（COMMUNITY / ENTERPRISE / …），缓存 5 分钟。
+
+    为什么必须探测而不是写死：方案定的是"企业版多 workspace"，但当前这套是社区版。
+    代码要能**自动分辨**并如实降级（页面标出"已降级为应用前缀"），
+    升级后不改一行代码就切到工作区隔离。
+    """
+    now = _time.time()
+    if _DIFY_EDITION["v"] and now - _DIFY_EDITION["ts"] < ttl:
+        return _DIFY_EDITION["v"]
+    v = "UNKNOWN"
+    try:
+        st, body, _ = _hc(DIFY_BRIDGE_BASE + "/console/api/system-features",
+                          timeout=3.0)
+        if st == 200:
+            v = str((json.loads(body) or {}).get("deployment_edition") or "UNKNOWN")
+    except Exception:
+        pass
+    _DIFY_EDITION.update({"ts": now, "v": v})
+    return v
+
+
+def _dify_console_login(base, email, password):
+    """已废弃：Dify 社区版拒绝明文口令，服务端代登录不可行（保留签名避免外部引用炸）。
+
+    调用会直接返回空 token —— 上层若还有旧代码引用它，会走"正常登录"而不是报错。
+    """
+    return "", "服务端代登录已废弃（Dify 社区版要求前端加密口令）"
+
+
+
+def _dify_console_login(base, email, password):
+    """用租户账号换 Dify console token。返回 (token, err)。
+
+    ⚠️ 这段是**按 Dify 1.x 的 console 登录接口**写的，不同小版本字段可能变；
+    因此全部容错：拿不到 access_token 就返回空串，让上层降级成「正常登录」，
+    绝不把用户卡在一个白屏跳板上。
+    """
+    try:
+        payload = {"email": email, "password": password,
+                   "language": "zh-Hans", "remember_me": True}
+        st, body, _ = _hc(base + "/console/api/login", method="POST",
+                          payload=payload, timeout=8.0)
+        # 🔴 实测（Dify 1.x COMMUNITY）：明文口令会被拒，返回
+        #    {"code":"authentication_failed","message":"Invalid encrypted data"}
+        #    —— 它要的是**前端 RSA 加密后的密文**，而社区版没有公开公钥端点
+        #    （/console/api/passport/public-key 404）。也就是说：
+        #    **服务端代登录这条路在社区版上走不通**，免登只能靠企业版 SSO。
+        #    这里把 Dify 的原话透出来，让降级页说清楚"为什么没免登"。
+        if st != 200:
+            msg = ""
+            try:
+                j = json.loads(body)
+                msg = (j.get("message") or j.get("code") or "")[:120]
+            except Exception:
+                msg = (body or "")[:120]
+            return "", f"HTTP {st}" + (f" · {msg}" if msg else "")
+        d = json.loads(body)
+        data = d.get("data") if isinstance(d, dict) else None
+        tok = ""
+        if isinstance(data, dict):
+            tok = data.get("access_token") or ""
+        tok = tok or (d.get("access_token") if isinstance(d, dict) else "") or ""
+        return tok, ("" if tok else "响应里没有 access_token")
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}"
+
+
+_DIFY_ENTER_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>正在进入 Dify</title>
+<style>body{font:14px/1.7 -apple-system,"Segoe UI","Microsoft YaHei";color:#101828;
+  display:grid;place-items:center;height:100vh;margin:0;background:#f4f6f9}
+.box{background:#fff;border:1px solid #e5e8ec;border-radius:10px;padding:26px 30px;
+  box-shadow:0 1px 2px rgba(16,24,40,.05);text-align:center;min-width:320px}
+.sp{width:16px;height:16px;border:2px solid #d0d5dd;border-top-color:#185fa5;
+  border-radius:50%;display:inline-block;animation:s .7s linear infinite;vertical-align:-3px}
+@keyframes s{to{transform:rotate(360deg)}} .m{color:#667085;font-size:12.5px;margin-top:8px}</style>
+</head><body><div class="box">
+<div><span class="sp"></span> 正在进入本租户的 Dify（工作区 __WS__）…</div>
+<div class="m">若 3 秒没有跳转，<a href="__DIFY_BASE__">点这里手动进入</a></div>
+</div>
+<script>
+try {
+  localStorage.setItem('console_token', __TOKEN__);
+  localStorage.setItem('token', __TOKEN__);
+} catch (e) {}
+location.replace(__BASE__ + '/apps');
+</script>
+</body></html>"""
+
+
+@app.route("/dify")
+def dify_page():
+    """Dify 接入控制台（管理员）。"""
+    denied = _require_admin()
+    if denied:
+        return denied
+    me = g.current_user
+    ips = []
+    for info in _socket.getaddrinfo(_socket.gethostname(), None, _socket.AF_INET):
+        ip = info[4][0]
+        if ip and not ip.startswith("127.") and ip not in ips:
+            ips.append(ip)
+    host, port, _ = _split_url(DIFY_BRIDGE)
+    if host in ("127.0.0.1", "localhost", "0.0.0.0"):
+        endpoints = [f"http://{ip}:{port}" for ip in ips]
+    else:
+        endpoints = [DIFY_BRIDGE]
+    endpoints = endpoints or [DIFY_BRIDGE]
+    html = _DIFY_PAGE_HTML
+    html = html.replace("__USER__", str(me.get("username", "")))
+    html = html.replace("__ROLE__", str(me.get("role", "")))
+    html = html.replace("__ENDPOINTS__", json.dumps(endpoints, ensure_ascii=False))
+    html = html.replace("__BRIDGE__", DIFY_BRIDGE)
+    resp = Response(html, mimetype="text/html; charset=utf-8")
+    # 🔴 禁止缓存：这一页是「运维实时面板」，浏览器缓存会让用户看到重启前的旧数字，
+    #    且旧版 JS 可能已经不匹配新接口 —— 表现就是「明明服务好了，页面还说过不去」。
+    resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
+_DIFY_PAGE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dify 接入控制台 · 企业级 RAG</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --card:#fff; --line:#e5e8ec; --line2:#eef1f4;
+    --ink:#101828; --ink2:#344054; --mut:#667085; --mut2:#98a2b3;
+    --pri:#185fa5; --pri-w:#eaf2fb; --pri-l:#bcdcf5;
+    --ok:#067647; --ok-w:#e8f6ef; --warn:#b54708; --warn-w:#fdf3e7;
+    --bad:#b42318; --bad-w:#fdecea; --idle:#98a2b3;
+    --r:10px; --r2:8px;
+    --sh:0 1px 2px rgba(16,24,40,.05);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--ink);
+    font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .num{font-variant-numeric:tabular-nums}
+  a{color:var(--pri);text-decoration:none}
+  code,pre,.mono{font-family:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace}
+
+  /* ---------- 顶栏 ---------- */
+  header{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.92);
+    backdrop-filter:saturate(150%) blur(8px);border-bottom:1px solid var(--line)}
+  .hd{max-width:1320px;margin:0 auto;padding:0 22px;height:56px;
+    display:flex;align-items:center;gap:14px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:650;font-size:14px;letter-spacing:.2px}
+  .mark{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,#185fa5,#3d8bd9);
+    display:grid;place-items:center;color:#fff;font-size:11px;font-weight:700;letter-spacing:.4px}
+  .crumb{color:var(--mut);font-size:12.5px}
+  .crumb b{color:var(--ink2);font-weight:600}
+  .spacer{flex:1}
+  .who{color:var(--mut);font-size:12.5px}
+  .who b{color:var(--ink2);font-weight:600}
+  .live{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);
+    border:1px solid var(--line);background:#fff;border-radius:999px;padding:4px 10px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--idle);flex:none}
+  .dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--ok-w)}
+  .dot.warn{background:var(--warn);box-shadow:0 0 0 3px var(--warn-w)}
+  .dot.bad{background:var(--bad);box-shadow:0 0 0 3px var(--bad-w)}
+  .btn{border:1px solid var(--line);background:#fff;color:var(--ink2);border-radius:var(--r2);
+    padding:6px 12px;font-size:12.5px;cursor:pointer;font-weight:550}
+  .btn:hover{border-color:var(--pri-l);color:var(--pri);background:#fbfdff}
+  .btn.pri{background:var(--pri);border-color:var(--pri);color:#fff}
+  .btn.pri:hover{background:#134c86;color:#fff}
+  .btn[disabled]{opacity:.55;cursor:not-allowed}
+
+  /* ---------- 主体 ---------- */
+  main{max-width:1320px;margin:0 auto;padding:18px 22px 64px}
+  .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:18px}
+  .tab{padding:9px 14px;font-size:13px;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent;
+    margin-bottom:-1px;font-weight:550;white-space:nowrap}
+  .tab:hover{color:var(--ink2)}
+  .tab.on{color:var(--pri);border-bottom-color:var(--pri)}
+  .tab .cnt{display:inline-block;min-width:18px;padding:0 5px;margin-left:6px;border-radius:9px;
+    background:var(--pri-w);color:var(--pri);font-size:11px;line-height:16px;text-align:center;font-weight:600}
+  .pane{display:none}
+  .pane.on{display:block}
+  /* 致命状态条：鉴权失败 / 接口报错时用，必须比「服务不可达」更醒目，
+     否则用户会把「登录过期」当成「服务挂了」——这两种故障排查方向完全相反 */
+  .authbar{display:none;margin-bottom:14px;padding:11px 14px;border-radius:var(--r2);
+    background:var(--warn-w);border:1px solid #f5d9b4;color:var(--warn);font-size:12.5px;
+    line-height:1.6}
+  .authbar.bad{background:var(--bad-w);border-color:#f6cdc9;color:var(--bad)}
+  .authbar b{font-weight:650}
+  .authbar a{color:inherit;text-decoration:underline;font-weight:600}
+  .authbar code{background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh)}
+  .card-h{display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--line2)}
+  .card-h h3{margin:0;font-size:13.5px;font-weight:650;letter-spacing:.1px}
+  .card-h .sub{color:var(--mut);font-size:12px;font-weight:400}
+  .card-b{padding:16px}
+
+  /* ---------- KPI ---------- */
+  .kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:14px}
+  @media(max-width:1180px){.kpis{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:620px){.kpis{grid-template-columns:repeat(2,1fr)}}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:13px 14px;box-shadow:var(--sh)}
+  .kpi .lb{font-size:11.5px;color:var(--mut);letter-spacing:.3px;display:flex;align-items:center;gap:6px}
+  .kpi .vl{font-size:23px;font-weight:660;letter-spacing:-.4px;margin-top:6px;line-height:1.15}
+  .kpi .vl small{font-size:12px;font-weight:500;color:var(--mut);margin-left:4px;letter-spacing:0}
+  .kpi .ft{font-size:11.5px;color:var(--mut2);margin-top:3px}
+
+  /* ---------- 表格 ---------- */
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line2);vertical-align:middle}
+  th{font-size:11.5px;color:var(--mut);font-weight:600;letter-spacing:.2px;background:#fbfcfd;position:sticky;top:0}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:#fafbfc}
+  td.r,th.r{text-align:right}
+
+  .chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:2px 8px;border-radius:999px;
+    border:1px solid transparent;font-weight:550;white-space:nowrap}
+  .chip.ok{background:var(--ok-w);color:var(--ok);border-color:#c6e9d6}
+  .chip.warn{background:var(--warn-w);color:var(--warn);border-color:#f5d9b4}
+  .chip.bad{background:var(--bad-w);color:var(--bad);border-color:#f6cdc9}
+  .chip.idle{background:#f2f4f7;color:var(--mut);border-color:var(--line)}
+  .chip.pri{background:var(--pri-w);color:var(--pri);border-color:var(--pri-l)}
+
+  /* ---------- 依赖矩阵 ---------- */
+  .deps{display:grid;grid-template-columns:1fr 1fr;gap:0 22px}
+  @media(max-width:900px){.deps{grid-template-columns:1fr}}
+  .dep{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line2)}
+  .dep:last-child{border-bottom:none}
+  .dep .nm{font-weight:600;font-size:12.5px;min-width:88px}
+  .dep .tg{color:var(--mut);font-size:11.5px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dep .ms{font-size:11.5px;color:var(--mut2);min-width:52px;text-align:right}
+
+  /* ---------- 检索演练 ---------- */
+  .play{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
+  @media(max-width:980px){.play{grid-template-columns:1fr}}
+  .fld{margin-bottom:13px}
+  .fld label{display:block;font-size:12px;color:var(--ink2);font-weight:550;margin-bottom:5px}
+  .fld .hint{font-size:11.5px;color:var(--mut2);margin-top:4px;line-height:1.45}
+  input[type=text],input[type=number],select,textarea{
+    width:100%;padding:8px 10px;border:1px solid #d0d5dd;border-radius:var(--r2);
+    font-size:13px;font-family:inherit;color:var(--ink);background:#fff}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--pri);
+    box-shadow:0 0 0 3px rgba(24,95,165,.12)}
+  textarea{resize:vertical;min-height:72px;line-height:1.5}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+
+  .res{display:flex;flex-direction:column;gap:10px}
+  .hit{border:1px solid var(--line);border-radius:var(--r2);overflow:hidden;background:#fff}
+  .hit .top{display:flex;align-items:center;gap:10px;padding:9px 12px;background:#fbfcfd;border-bottom:1px solid var(--line2)}
+  .hit .rk{width:20px;height:20px;border-radius:6px;background:var(--pri-w);color:var(--pri);
+    display:grid;place-items:center;font-size:11px;font-weight:700;flex:none}
+  .hit .ti{font-weight:600;font-size:12.5px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .hit .sc{font-size:12px;font-weight:650;color:var(--pri);min-width:52px;text-align:right}
+  .hit .bar{height:3px;background:#eef1f4}
+  .hit .bar i{display:block;height:100%;background:linear-gradient(90deg,#3d8bd9,#185fa5)}
+  .hit .bd{padding:10px 12px;font-size:12.5px;color:var(--ink2);white-space:pre-wrap;
+    max-height:132px;overflow:auto;line-height:1.6}
+  .hit .mt{padding:7px 12px;border-top:1px solid var(--line2);color:var(--mut2);font-size:11.5px;
+    display:flex;gap:14px;flex-wrap:wrap}
+  .empty{padding:34px 16px;text-align:center;color:var(--mut2);font-size:12.5px;
+    border:1px dashed #d7dce2;border-radius:var(--r2);background:#fcfdfe}
+  details{margin-top:12px}
+  details summary{cursor:pointer;font-size:12px;color:var(--mut);user-select:none}
+  details summary:hover{color:var(--pri)}
+  pre{background:#0f1520;color:#d8e3f0;padding:13px 14px;border-radius:var(--r2);overflow:auto;
+    font-size:11.5px;line-height:1.6;margin:8px 0 0;max-height:340px}
+  pre .k{color:#7dd3fc}
+  .meta-line{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin-bottom:10px}
+  .meta-line b{color:var(--ink2);font-weight:600}
+
+  /* ---------- 指引 ---------- */
+  .guide{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:980px){.guide{grid-template-columns:1fr}}
+  .ep{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line2);
+    border-radius:var(--r2);background:#fcfdfe;margin-bottom:7px}
+  .ep .u{flex:1;font-size:12.5px}
+  .cp{border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 9px;font-size:11.5px;
+    color:var(--mut);cursor:pointer}
+  .cp:hover{color:var(--pri);border-color:var(--pri-l)}
+  .tag{font-size:11px;padding:1px 7px;border-radius:999px;background:#f2f4f7;color:var(--mut);font-weight:550}
+  .tag.best{background:var(--ok-w);color:var(--ok)}
+  .kv{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line2);font-size:12.5px}
+  .kv:last-child{border-bottom:none}
+  .kv .k{color:var(--mut);min-width:110px}
+  .kv .v{flex:1;color:var(--ink2);word-break:break-all}
+  .err-t td{font-size:12.5px}
+  .note{font-size:11.5px;color:var(--mut);line-height:1.6;margin-top:10px}
+  .spin{width:13px;height:13px;border:2px solid #d0d5dd;border-top-color:var(--pri);
+    border-radius:50%;display:inline-block;animation:sp .7s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style></head><body>
+
+<header><div class="hd">
+  <div class="brand"><span class="mark">RAG</span>Dify 接入控制台</div>
+  <div class="crumb">控制台 · <b>外部知识库桥</b></div>
+  <div class="spacer"></div>
+  <span class="live"><span class="dot" id="liveDot"></span><span id="liveTxt">正在探活</span></span>
+  <button class="btn" id="btnRefresh" onclick="refresh(true)">刷新</button>
+  <span class="who"><b>__USER__</b> · __ROLE__</span>
+</div></header>
+
+<main>
+  <div class="authbar" id="authBar"></div>
+  <div class="tabs">
+    <div class="tab on" data-p="ov">概览</div>
+    <div class="tab" data-p="kb">知识库 <span class="cnt" id="kbCnt">–</span></div>
+    <div class="tab" data-p="pg">检索演练</div>
+    <div class="tab" data-p="ap">审批演练</div>
+    <div class="tab" data-p="lg">请求流水 <span class="cnt" id="lgCnt">–</span></div>
+    <div class="tab" data-p="gd">接入指引</div>
+  </div>
+
+  <!-- ================= 概览 ================= -->
+  <section class="pane on" id="pane-ov">
+    <div class="kpis">
+      <div class="kpi"><div class="lb"><span class="dot" id="k1dot"></span>桥服务</div>
+        <div class="vl" id="k1">–</div><div class="ft" id="k1f">–</div></div>
+      <div class="kpi"><div class="lb">已启用知识库</div>
+        <div class="vl" id="k2">–</div><div class="ft" id="k2f">–</div></div>
+      <div class="kpi"><div class="lb">累计请求</div>
+        <div class="vl num" id="k3">–</div><div class="ft" id="k3f">自进程启动起</div></div>
+      <div class="kpi"><div class="lb">累计命中记录</div>
+        <div class="vl num" id="k4">–</div><div class="ft" id="k4f">records 累加</div></div>
+      <div class="kpi"><div class="lb">错误数</div>
+        <div class="vl num" id="k5">–</div><div class="ft" id="k5f">鉴权 / 后端异常</div></div>
+      <div class="kpi"><div class="lb">检索延迟 p50 / p95</div>
+        <div class="vl num" id="k6">–</div><div class="ft" id="k6f">毫秒 · 样本 0</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-h"><h3>依赖健康矩阵</h3>
+        <span class="sub">服务端直连探活，不经代理；毫秒为一次连接/请求往返</span>
+        <div class="spacer"></div><span class="sub" id="depTs"></span></div>
+      <div class="card-b"><div class="deps" id="deps"><div class="empty">正在探活…</div></div></div>
+    </div>
+
+    <div class="guide">
+      <div class="card">
+        <div class="card-h"><h3>精排（reranker）状态</h3></div>
+        <div class="card-b" id="rerankBox"><div class="empty">正在读取…</div></div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>桥服务限额</h3>
+          <span class="sub">来自 /health 的 limits</span></div>
+        <div class="card-b" id="limitBox"><div class="empty">正在读取…</div></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-h"><h3>最近请求</h3>
+        <span class="sub">桥服务内存环形缓冲的前 5 条；完整 40 条见「请求流水」</span>
+        <div class="spacer"></div><span class="sub" id="ovTs"></span></div>
+      <div class="card-b" style="padding:0">
+        <table><thead><tr>
+          <th>时间</th><th>知识库</th><th>查询</th><th class="r">命中</th>
+          <th class="r">耗时(ms)</th><th>HTTP</th><th>备注</th>
+        </tr></thead><tbody id="ovRecent"></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 知识库 ================= -->
+  <section class="pane" id="pane-kb">
+    <div class="card">
+      <div class="card-h"><h3>外部知识库登记表</h3>
+        <span class="sub">knowledge_id 白名单：未登记 / 已停用一律 2001，不回落默认租户</span>
+        <div class="spacer"></div>
+        <span class="sub" id="kbTs"></span></div>
+      <div class="card-b" style="padding:0">
+        <table><thead><tr>
+          <th>knowledge_id</th><th>标签</th><th>租户</th><th>角色</th>
+          <th>状态</th><th class="r">chunk 数</th><th></th>
+        </tr></thead><tbody id="kbBody"><tr><td colspan="7"><div class="empty">正在读取…</div></td></tr></tbody></table>
+      </div>
+    </div>
+    <div class="note">chunk 数取自 Milvus <code>count(*)</code>（按 tenant_id 过滤，5 分钟缓存）。
+      为 0 说明该租户当前没有入库文档 —— 这时检索会「成功但没结果」，不是接口坏了。</div>
+  </section>
+
+  <!-- ================= 演练 ================= -->
+  <section class="pane" id="pane-pg">
+    <div class="play">
+      <div class="card">
+        <div class="card-h"><h3>发起一次真实检索</h3></div>
+        <div class="card-b">
+          <div class="fld"><label>知识库</label>
+            <select id="pgKb"></select>
+            <div class="hint">只有 enabled 的库会出现在这里。</div></div>
+          <div class="fld"><label>查询</label>
+            <textarea id="pgQ" placeholder="例如：系统支持哪些通信协议">系统支持哪些通信协议</textarea></div>
+          <div class="two">
+            <div class="fld"><label>top_k</label><input type="number" id="pgK" value="5" min="1" max="20">
+              <div class="hint">上限 20</div></div>
+            <div class="fld"><label>score 阈值</label><input type="number" id="pgT" value="0" min="0" max="1" step="0.05">
+              <div class="hint">0 表示不过滤。精排生效时分数实测集中在 <b>0.2~0.4</b>（logits 经 sigmoid），
+                设 0.5 会一条不剩且不报错 —— 阈值按分数量级设。</div></div>
+          </div>
+          <button class="btn pri" id="pgGo" style="width:100%" onclick="runSearch()">发起检索</button>
+          <div class="note">走的正是 Dify 会走的那条路：本页 → 桥服务 <code>POST /retrieval</code> → 混合检索 → 精排。</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>结果</h3><div class="spacer"></div><span class="sub" id="pgMeta"></span></div>
+        <div class="card-b">
+          <div id="pgRes"><div class="empty">左侧填好参数后点「发起检索」。这里会显示每条命中的分数、正文与元数据。</div></div>
+          <details id="pgRawWrap" style="display:none"><summary>原始响应（Dify 协议）</summary>
+            <pre id="pgRaw"></pre></details>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 审批演练 ================= -->
+  <section class="pane" id="pane-ap">
+    <div class="play">
+      <div class="card">
+        <div class="card-h"><h3>跑一张单的审批</h3></div>
+        <div class="card-b">
+          <div class="fld"><label>知识库（= 租户）</label>
+            <select id="apKb"></select>
+            <div class="hint">服务端按 knowledge_id 反查租户，画布改不了这个。</div></div>
+          <div class="fld"><label>采购单 ID</label>
+            <input type="number" id="apPo" value="33">
+            <div class="hint">演示单：jm <code>33</code>(小额,应自动批) / <code>34</code>(大额,应转人工)；yh <code>35</code> / <code>36</code></div></div>
+          <button class="btn pri" id="apGo" style="width:100%" onclick="runPack()">取数字包 + 判路径</button>
+          <div class="note">这就是 Dify 审批流里那个 HTTP 节点拿到的**同一份**数据：
+            <code>POST /ai/pack</code>。这里能看见，画布里才敢画。</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>数据包与判定</h3><div class="spacer"></div><span class="sub" id="apMeta"></span></div>
+        <div class="card-b">
+          <div id="apRes"><div class="empty">左侧选租户、填单号，点「取数字包」。这里会显示金额、风险、建议路径与每站材料。</div></div>
+          <details id="apRawWrap" style="display:none"><summary>原始响应（/ai/pack）</summary>
+            <pre id="apRaw"></pre></details>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 流水 ================= -->
+  <section class="pane" id="pane-lg">
+    <div class="card">
+      <div class="card-h"><h3>最近请求（滑动窗口 40 条）</h3>
+        <span class="sub">桥服务内存环形缓冲；每 8 秒自动刷新</span>
+        <div class="spacer"></div><span class="sub" id="lgTs"></span></div>
+      <div class="card-b" style="padding:0">
+        <table><thead><tr>
+          <th>时间</th><th>知识库</th><th>查询</th><th class="r">top_k</th>
+          <th class="r">命中</th><th class="r">耗时(ms)</th><th>HTTP</th><th>备注</th>
+        </tr></thead><tbody id="lgBody"><tr><td colspan="8"><div class="empty">暂无请求</div></td></tr></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 指引 ================= -->
+  <section class="pane" id="pane-gd">
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-h"><h3>各租户的 Dify 入口</h3>
+        <span class="sub">一个租户一套应用/工作流；这里按租户发入口，不是把地址丢给人自己记</span>
+        <div class="spacer"></div><span class="sub" id="tenantTs"></span></div>
+      <div class="card-b" style="padding:0">
+        <table><thead><tr>
+          <th>租户</th><th>工作区 / 应用前缀</th><th>Dify 账号</th>
+          <th>可用知识库</th><th>免登</th><th></th>
+        </tr></thead><tbody id="tenantBody">
+          <tr><td colspan="6"><div class="empty">正在读取 config/dify_tenants.yaml…</div></td></tr>
+        </tbody></table>
+      </div>
+    </div>
+
+    <div class="guide">
+      <div class="card">
+        <div class="card-h"><h3>在 Dify 里怎么填</h3></div>
+        <div class="card-b">
+          <div class="fld"><label>API Endpoint</label><div id="epList"></div>
+            <div class="hint">Dify 与桥服务不在同一台机器时，用与 Dify 同网段的那个地址；
+              虚拟机（VMware NAT）场景就是 <code>192.168.200.1</code> 那一条。</div></div>
+          <div class="kv"><span class="k">API Key</span>
+            <span class="v">与环境变量 <code>DIFY_KB_API_KEY</code> 完全一致（Dify 里保存时的连通性探测就校验它）</span></div>
+          <div class="kv"><span class="k">知识库 ID</span>
+            <span class="v" id="gKbIds">–</span></div>
+          <div class="note">保存时 Dify 会先发 <code>POST /retrieval</code> 且 <code>knowledge_id</code> 为空串。
+            本服务对这种请求固定回 <b>200 + 空 records</b> —— 回 404 会被 Dify 判成「连不上」，
+            而这跟「知识库不存在」是两件事。</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>错误码</h3><span class="sub">按 Dify 外部知识库规范</span></div>
+        <div class="card-b" style="padding:0">
+          <table class="err-t"><thead><tr><th>code</th><th>HTTP</th><th>含义</th><th>排查</th></tr></thead>
+            <tbody>
+              <tr><td><code>1001</code></td><td>403</td><td>Authorization 头格式错</td><td>必须是 <code>Bearer &lt;key&gt;</code></td></tr>
+              <tr><td><code>1002</code></td><td>403</td><td>密钥不匹配</td><td>与 <code>DIFY_KB_API_KEY</code> 逐字对</td></tr>
+              <tr><td><code>2001</code></td><td>404 / 500</td><td>知识库不存在或后端异常</td><td>查登记表 / 看桥服务日志</td></tr>
+            </tbody></table>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-h"><h3>命令行自检</h3><span class="sub">不经浏览器，直接打桥服务</span>
+        <div class="spacer"></div><button class="cp" onclick="copyTxt(document.getElementById('curlPre').textContent,this)">复制</button></div>
+      <div class="card-b"><pre id="curlPre"></pre></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const ENDPOINTS = __ENDPOINTS__;
+const BRIDGE = "__BRIDGE__";
+let OVERVIEW = null, KBCOUNTS = {}, timer = null;
+
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
+  const id = t.dataset.p;
+  document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === 'pane-' + id));
+  if (id === 'kb' && !Object.keys(KBCOUNTS).length) loadCounts();
+  if (id === 'gd') loadTenants();
+});
+
+function el(tag, cls, txt){ const e = document.createElement(tag);
+  if (cls) e.className = cls; if (txt !== undefined && txt !== null) e.textContent = String(txt);
+  return e; }
+function dotCls(ok, warn){ return ok ? 'ok' : (warn ? 'warn' : 'bad'); }
+
+async function getJSON(url, opt){
+  const r = await fetch(url, Object.assign({credentials:'same-origin'}, opt || {}));
+  let d = null; try { d = await r.json(); } catch(e) { d = {error:'响应不是 JSON'}; }
+  if (!r.ok && d && !d.error) d.error = 'HTTP ' + r.status;
+  return d;
+}
+
+async function refresh(manual){
+  const b = document.getElementById('btnRefresh');
+  if (manual) b.disabled = true;
+  try {
+    OVERVIEW = await getJSON('/api/dify/overview');
+    // ★ 接口层报错（401 登录过期 / 403 无权限 / 500 后端炸）必须单独说清楚。
+    //   之前一律走 renderOverview，把「没有 bridge 字段」画成「桥服务不可达」——
+    //   等于把鉴权问题伪装成服务故障，排查方向会完全跑偏。
+    if (!OVERVIEW || OVERVIEW.error) {
+      fatal(OVERVIEW && OVERVIEW.error ? OVERVIEW.error : '接口返回为空', '401');
+      return;
+    }
+    hideFatal();
+    renderOverview(OVERVIEW);
+  } catch (e) {
+    fatal('前端请求失败：' + (e && e.message ? e.message : e), '500');
+  } finally { if (manual) b.disabled = false; }
+}
+
+function fatal(msg, kind){
+  const bar = document.getElementById('authBar');
+  if (!bar) return;
+  bar.className = 'authbar' + (String(msg).indexOf('未登录') >= 0 ||
+                               String(msg).indexOf('权限') >= 0 ? '' : ' bad');
+  bar.innerHTML = '';
+  const b = el('b', '', '这个页面拿不到数据：');
+  bar.appendChild(b);
+  bar.appendChild(document.createTextNode(String(msg) + ' '));
+  if (String(msg).indexOf('未登录') >= 0 || String(kind) === '401') {
+    const a = el('a', '', '重新登录');
+    a.href = '/login';
+    bar.appendChild(a);
+    bar.appendChild(document.createTextNode(' 后再回到本页。'));
+  } else {
+    bar.appendChild(document.createTextNode('服务端日志或 /health 能看到具体原因。'));
+  }
+  bar.style.display = 'block';
+  document.getElementById('liveDot').className = 'dot bad';
+  document.getElementById('liveTxt').textContent = '数据获取失败';
+}
+
+function hideFatal(){
+  const bar = document.getElementById('authBar');
+  if (bar) bar.style.display = 'none';
+}
+
+function renderOverview(d){
+  const br = d.bridge || {};
+  const st = br.stats || {};
+  const lat = br.latency_ms || {};
+  const okBridge = !!d.bridge;
+  const dot = document.getElementById('liveDot');
+  dot.className = 'dot ' + (okBridge ? 'ok' : 'bad');
+  document.getElementById('liveTxt').textContent = okBridge ? ('链路正常 · ' + d.clock) : '桥服务不可达';
+
+  // KPI 1
+  document.getElementById('k1dot').className = 'dot ' + (okBridge ? 'ok' : 'bad');
+  document.getElementById('k1').textContent = okBridge ? '正常' : '不可达';
+  document.getElementById('k1f').textContent = okBridge
+    ? ('已运行 ' + fmtDur(st.uptime_sec || 0)) : (d.bridge_error || '');
+  // KPI 2
+  const kbs = br.knowledge_bases || [];
+  const on = kbs.filter(k => k.enabled).length;
+  document.getElementById('k2').innerHTML = on + '<small>/ ' + kbs.length + '</small>';
+  document.getElementById('k2f').textContent = '登记 ' + kbs.length + ' 个，停用 ' + (kbs.length - on) + ' 个';
+  // KPI 3-5
+  document.getElementById('k3').textContent = fmtInt(st.requests);
+  document.getElementById('k4').textContent = fmtInt(st.records);
+  document.getElementById('k5').textContent = fmtInt(st.errors);
+  document.getElementById('k5f').textContent = st.last_error ? String(st.last_error).slice(0,46) : '无';
+  // KPI 6
+  if (lat && lat.n) {
+    // 大于 1 秒的延迟取整显示：9387.1 这种小数在 KPI 上只会显得吵
+    const f = v => v >= 1000 ? Math.round(v) : v;
+    document.getElementById('k6').innerHTML = f(lat.p50) + '<small>/ ' + f(lat.p95) + '</small>';
+    const cold = lat.n <= 5 ? '（样本含首次 Milvus 加载，偏高属正常）' : '';
+    document.getElementById('k6f').textContent =
+      '毫秒 · 样本 ' + lat.n + ' 次（min ' + f(lat.min) + ' / max ' + f(lat.max) + '）' + cold;
+  } else {
+    document.getElementById('k6').textContent = '–';
+    document.getElementById('k6f').textContent = '尚无成功检索样本';
+  }
+
+  // 依赖
+  const box = document.getElementById('deps'); box.innerHTML = '';
+  (d.deps || []).forEach(x => {
+    const row = el('div', 'dep');
+    row.appendChild(el('span', 'dot ' + dotCls(x.ok)));
+    row.appendChild(el('span', 'nm', x.name));
+    row.appendChild(el('span', 'tg mono', x.target));
+    row.appendChild(el('span', 'ms num', x.ms == null ? '—' : (x.ms + ' ms')));
+    const c = el('span', 'chip ' + (x.ok ? 'ok' : 'bad'), x.ok ? '可达' : (x.err || '不可达'));
+    row.appendChild(c);
+    box.appendChild(row);
+  });
+  document.getElementById('depTs').textContent = '探活于 ' + d.clock;
+
+  // 精排
+  const rr = br.rerank || {};
+  const rrBox = document.getElementById('rerankBox');
+  rrBox.innerHTML = '';
+  if (!d.bridge) {
+    // 桥服务挂了 → 这两个值「不知道」，不能画成「false / 未设」：
+    // 那会让人以为精排被关掉了，实际是读不到。
+    rrBox.appendChild(el('div', 'empty',
+      '桥服务不可达，精排开关 / 端点 / 超时都由桥服务自报，此刻取不到。' +
+      '先把桥服务拉起来再看这一栏。'));
+  } else {
+    const rrOk = (d.deps || []).find(x => x.name === '精排 reranker');
+    const degraded = rr.enabled && rrOk && !rrOk.ok;
+    rrBox.appendChild(kv('开关 RERANK_ENABLED', rr.enabled ? 'true' : 'false / 未设'));
+    rrBox.appendChild(kv('端点 RERANK_URL', rr.url || '（未设）'));
+    rrBox.appendChild(kv('超时', (rr.timeout_sec || '—') + ' 秒'));
+    rrBox.appendChild(kv('端点可达', rrOk ? (rrOk.ok ? '是' : '否') : '未知'));
+    const v = el('div', '', '');
+    v.style.marginTop = '10px';
+    v.appendChild(el('span', 'chip ' + (degraded ? 'warn' : (rr.enabled ? 'ok' : 'idle')),
+      degraded ? '分数已退化为名次' : (rr.enabled ? '精排生效中' : '未启用精排')));
+    rrBox.appendChild(v);
+    if (degraded) {
+      const n = el('div', 'note', '开关是 true 但端点不可达：检索仍会成功，但 score 变成 0.95/0.90/0.85… 的名次阶梯，' +
+        'Dify 里的 score_threshold 不再代表相关度。先把 reranker 进程拉起来（或把开关设 false）再调阈值。');
+      rrBox.appendChild(n);
+    }
+  }
+
+  // 限额
+  const lm = br.limits || {};
+  const lb = document.getElementById('limitBox'); lb.innerHTML = '';
+  if (!d.bridge) {
+    lb.appendChild(el('div', 'empty', '桥服务不可达，限额由桥服务自报，此刻取不到。'));
+  } else {
+    lb.appendChild(kv('并发上限 max_concurrency', lm.max_concurrency));
+    lb.appendChild(kv('候选池 candidate_k', lm.candidate_k));
+    lb.appendChild(kv('精排截断 rerank_max_chars', lm.rerank_max_chars));
+    lb.appendChild(kv('top_k 上限', lm.max_top_k));
+    lb.appendChild(kv('query 长度上限', lm.max_query_len));
+    lb.appendChild(kv('返回条数上限', lm.max_records));
+    lb.appendChild(kv('向量库已就绪', br.vector_db_ready ? '是' : '否（首次检索时懒加载）'));
+  }
+
+  // 页签计数 & 下拉 & 流水
+  document.getElementById('kbCnt').textContent = kbs.length;
+  const recent = br.recent || [];
+  document.getElementById('lgCnt').textContent = recent.length;
+  renderKb(kbs);
+  renderLogs(recent);
+  renderRecentMini(recent);
+  fillSelect(kbs);
+  fillApSelect(kbs);
+  document.getElementById('gKbIds').textContent = kbs.filter(k => k.enabled).map(k => k.knowledge_id).join('、') || '（无）';
+  renderEndpoints();
+  renderCurl(kbs);
+}
+
+function kv(k, v){
+  const d = el('div', 'kv');
+  d.appendChild(el('span', 'k', k));
+  d.appendChild(el('span', 'v', (v === undefined || v === null || v === '') ? '—' : v));
+  return d;
+}
+function fmtInt(n){ return (n === undefined || n === null) ? '–' : Number(n).toLocaleString('zh-CN'); }
+function fmtDur(s){
+  s = Math.round(s || 0);
+  if (s < 60) return s + ' 秒';
+  if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+  return Math.floor(s / 3600) + ' 时 ' + Math.floor((s % 3600) / 60) + ' 分';
+}
+
+function renderKb(kbs){
+  const tb = document.getElementById('kbBody'); tb.innerHTML = '';
+  if (!kbs.length) { const tr = el('tr'); const td = el('td'); td.colSpan = 7;
+    td.appendChild(el('div', 'empty', '登记表为空')); tr.appendChild(td); tb.appendChild(tr); return; }
+  kbs.forEach(k => {
+    const tr = el('tr');
+    tr.appendChild(tdMono(k.knowledge_id));
+    tr.appendChild(td(k.label));
+    tr.appendChild(tdMono(k.tenant_id));
+    tr.appendChild(td(k.role));
+    const c = el('span', 'chip ' + (k.enabled ? 'ok' : 'idle'), k.enabled ? '启用' : '停用');
+    const tdS = el('td'); tdS.appendChild(c); tr.appendChild(tdS);
+    const cnt = KBCOUNTS[k.tenant_id];
+    const tdN = el('td', 'r num');
+    tdN.textContent = (cnt === undefined || cnt === null) ? '—' : cnt.toLocaleString('zh-CN');
+    tr.appendChild(tdN);
+    const tdA = el('td', 'r');
+    if (k.enabled) {
+      const b = el('button', 'cp', '去演练');
+      b.onclick = () => { goPlay(k.knowledge_id); };
+      tdA.appendChild(b);
+    }
+    tr.appendChild(tdA);
+    tb.appendChild(tr);
+  });
+  document.getElementById('kbTs').textContent = 'chunk 数缓存 5 分钟';
+}
+function td(t){ const e = el('td'); e.textContent = t == null ? '—' : t; return e; }
+function tdMono(t){ const e = el('td'); e.className = 'mono';
+  e.style.fontSize = '12px'; e.textContent = t == null ? '—' : t; return e; }
+
+function renderLogs(rows){
+  const tb = document.getElementById('lgBody'); tb.innerHTML = '';
+  if (!rows.length) { const tr = el('tr'); const td = el('td'); td.colSpan = 8;
+    td.appendChild(el('div', 'empty', '暂无请求 —— 去「检索演练」打一发，或在 Dify 里点一次检索测试')); tr.appendChild(td); tb.appendChild(tr); return; }
+  rows.forEach(r => {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'mono', r.clock));
+    tr.appendChild(el('td', 'mono', r.kb));
+    const q = el('td', '', r.q || '—'); q.style.maxWidth = '280px';
+    q.style.overflow = 'hidden'; q.style.textOverflow = 'ellipsis'; tr.appendChild(q);
+    tr.appendChild(el('td', 'r num', r.top_k));
+    tr.appendChild(el('td', 'r num', r.hit));
+    tr.appendChild(el('td', 'r num', r.ms));
+    const h = el('td'); h.appendChild(el('span', 'chip ' + (r.http === 200 ? 'ok' : 'bad'), r.http));
+    tr.appendChild(h);
+    tr.appendChild(el('td', '', r.note || ''));
+    tb.appendChild(tr);
+  });
+  document.getElementById('lgTs').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12:false});
+}
+
+function noteOf(r){
+  // 备注列兼作「这次 Dify 到底传了什么阈值」的第一现场：
+  // 分数只有 0.27~0.37 时，thr 只要 0.5 就会 0 命中，而这不报错。
+  const n = r.note || '';
+  if (r.thr && r.thr > 0) return n ? (n + ' · thr=' + r.thr) : ('thr=' + r.thr);
+  return n;
+}
+
+function renderRecentMini(rows){
+  const tb = document.getElementById('ovRecent');
+  if (!tb) return;
+  tb.innerHTML = '';
+  if (!rows.length) {
+    const tr = el('tr'); const td = el('td'); td.colSpan = 7;
+    td.appendChild(el('div', 'empty', '还没有请求 —— 去「检索演练」打一发'));
+    tr.appendChild(td); tb.appendChild(tr);
+  } else {
+    rows.slice(0, 5).forEach(r => {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'mono', r.clock));
+      tr.appendChild(el('td', 'mono', r.kb));
+      const q = el('td', '', r.q || '—'); q.style.maxWidth = '360px';
+      q.style.overflow = 'hidden'; q.style.textOverflow = 'ellipsis'; tr.appendChild(q);
+      tr.appendChild(el('td', 'r num', r.hit));
+      tr.appendChild(el('td', 'r num', r.ms));
+      const h = el('td'); h.appendChild(el('span', 'chip ' + (r.http === 200 ? 'ok' : 'bad'), r.http));
+      tr.appendChild(h);
+      tr.appendChild(el('td', '', noteOf(r)));
+      tb.appendChild(tr);
+    });
+  }
+  document.getElementById('ovTs').textContent = '更新于 ' +
+    new Date().toLocaleTimeString('zh-CN', {hour12:false});
+}
+
+async function loadTenants(){
+  const d = await getJSON('/api/dify/tenants');
+  const tb = document.getElementById('tenantBody');
+  if (!tb) return;
+  tb.innerHTML = '';
+  const rows = d.tenants || [];
+  if (!rows.length) {
+    const tr = el('tr'); const td = el('td'); td.colSpan = 6;
+    td.appendChild(el('div', 'empty', d.error || '没有配置租户映射'));
+    tr.appendChild(td); tb.appendChild(tr); return;
+  }
+  rows.forEach(t => {
+    const tr = el('tr');
+    tr.appendChild(el('td', '', t.label));
+    tr.appendChild(el('td', 'mono', d.effective_isolation === 'workspace'
+      ? ('工作区 ' + t.workspace) : ((t.app_prefix || '') + '* 应用')));
+    tr.appendChild(el('td', 'mono', t.email || '—'));
+    tr.appendChild(el('td', 'mono', (t.knowledge_ids || []).join(', ') || '—'));
+    const tdS = el('td');
+    tdS.appendChild(el('span', 'chip ' + (t.password_configured ? 'ok' : 'idle'),
+      t.password_configured ? '已配（可免登）' : '未配密码（需手输）'));
+    tr.appendChild(tdS);
+    const tdA = el('td', 'r');
+    if (t.allowed && t.enabled) {
+      const b = el('button', 'cp', '进入 Dify');
+      b.onclick = () => window.open('/dify/enter/' + encodeURIComponent(t.tenant_id), '_blank');
+      tdA.appendChild(b);
+    } else {
+      tdA.appendChild(el('span', 'chip idle', t.enabled ? '非本租户' : '停用'));
+    }
+    tr.appendChild(tdA);
+    tb.appendChild(tr);
+  });
+  document.getElementById('tenantTs').textContent = '来源 config/dify_tenants.yaml';
+}
+
+function fillSelect(kbs){
+  const s = document.getElementById('pgKb');
+  const cur = s.value;
+  s.innerHTML = '';
+  kbs.filter(k => k.enabled).forEach(k => {
+    const o = el('option', '', k.knowledge_id + ' · ' + (k.tenant_id || ''));
+    o.value = k.knowledge_id; s.appendChild(o);
+  });
+  if (cur) s.value = cur;
+}
+function goPlay(id){
+  document.querySelector('.tab[data-p="pg"]').click();
+  const s = document.getElementById('pgKb'); if (s) s.value = id;
+}
+
+async function loadCounts(){
+  const d = await getJSON('/api/dify/kb_counts');
+  KBCOUNTS = d.counts || {};
+  if (OVERVIEW) renderKb((OVERVIEW.bridge || {}).knowledge_bases || []);
+  if (d.error) console.warn('kb_counts:', d.error);
+}
+
+async function runSearch(){
+  const btn = document.getElementById('pgGo');
+  const kb = document.getElementById('pgKb').value;
+  const q = document.getElementById('pgQ').value.trim();
+  const tk = document.getElementById('pgK').value;
+  const th = document.getElementById('pgT').value;
+  if (!kb || !q) { alert('请选择知识库并填写查询'); return; }
+  btn.disabled = true; btn.textContent = '检索中…';
+  const res = document.getElementById('pgRes');
+  res.innerHTML = ''; const wait = el('div', 'empty');
+  wait.appendChild(el('span', 'spin'));
+  wait.appendChild(document.createTextNode(' 正在穿过混合检索与精排，首次调用要加载 Milvus，可能十几秒…'));
+  res.appendChild(wait);
+  try {
+    const d = await getJSON('/api/dify/retrieval', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({knowledge_id:kb, query:q, top_k:Number(tk), score_threshold:Number(th)})});
+    renderHits(d);
+  } catch(e) {
+    res.innerHTML = ''; res.appendChild(el('div', 'empty', '请求失败：' + e));
+  } finally { btn.disabled = false; btn.textContent = '发起检索'; }
+}
+
+function renderHits(d){
+  const res = document.getElementById('pgRes'); res.innerHTML = '';
+  if (d.error) { res.appendChild(el('div', 'empty', d.error)); return; }
+  const recs = (d.response && d.response.records) || [];
+  const meta = document.getElementById('pgMeta');
+  meta.innerHTML = '';
+  const okc = el('span', 'chip ' + (d.http === 200 ? 'ok' : 'bad'), 'HTTP ' + d.http);
+  meta.appendChild(okc);
+  meta.appendChild(document.createTextNode(' 命中 ' + recs.length + ' 条 · 往返 ' + d.elapsed_s + ' 秒'));
+  if (!recs.length) {
+    res.appendChild(el('div', 'empty',
+      '0 条命中。常见三种原因：该租户确实没入库文档（看「知识库」页 chunk 数）、score 阈值设太高、' +
+      '查询词与文档语料不重叠。'));
+    return;
+  }
+  recs.forEach((r, i) => {
+    const box = el('div', 'hit');
+    const top = el('div', 'top');
+    top.appendChild(el('span', 'rk', i + 1));
+    top.appendChild(el('span', 'ti', r.title || ('记录 ' + (i + 1))));
+    top.appendChild(el('span', 'sc num', Number(r.score || 0).toFixed(4)));
+    box.appendChild(top);
+    const bar = el('div', 'bar'); const fill = el('i');
+    fill.style.width = Math.max(2, Math.min(100, Number(r.score || 0) * 100)) + '%';
+    bar.appendChild(fill); box.appendChild(bar);
+    // 正文去掉首尾空白并把 3 行以上空行压成 1 行：chunk 是从 PDF 切的，
+    // 原样渲染会在卡片里留下一大片看不出所以然的空段。
+    const body = String(r.content || '').replace(/\n{3,}/g, '\n\n').trim();
+    box.appendChild(el('div', 'bd', body));
+    const mt = el('div', 'mt');
+    const m = r.metadata || {};
+    ['file_name','page','chunk_index','tenant_id','knowledge_id','access_level'].forEach(k => {
+      if (m[k] !== undefined && m[k] !== null && m[k] !== '') {
+        const sp = el('span', '', k + ': ' + m[k]);
+        mt.appendChild(sp);
+      }
+    });
+    if (mt.childNodes.length) box.appendChild(mt);
+    res.appendChild(box);
+  });
+  document.getElementById('pgRawWrap').style.display = 'block';
+  document.getElementById('pgRaw').textContent = JSON.stringify(d, null, 2);
+}
+
+function renderEndpoints(){
+  const box = document.getElementById('epList'); box.innerHTML = '';
+  // 标签不是按顺序拍脑袋：VMware NAT 场景下虚拟机只能走 192.168.200.x 这个网关地址，
+  // 而办公网地址（192.168.0.x）在虚拟机里根本不通 —— 所以单独标出来。
+  const tagOf = (u, i) => {
+    if (/^http:\/\/192\.168\.200\./.test(u)) return ['虚拟机用这个', 'best'];
+    if (i === 0) return ['本机默认', ''];
+    return ['备选', ''];
+  };
+  ENDPOINTS.forEach((u, i) => {
+    const row = el('div', 'ep');
+    row.appendChild(el('span', 'u mono', u + '/retrieval'));
+    const [txt, cls] = tagOf(u, i);
+    row.appendChild(el('span', 'tag' + (cls ? ' ' + cls : ''), txt));
+    const b = el('button', 'cp', '复制');
+    b.onclick = () => copyTxt(u + '/retrieval', b);
+    row.appendChild(b);
+    box.appendChild(row);
+  });
+}
+
+function fillApSelect(kbs){
+  const s = document.getElementById('apKb');
+  if (!s) return;
+  const cur = s.value;
+  s.innerHTML = '';
+  kbs.filter(k => k.enabled).forEach(k => {
+    const o = el('option', '', k.knowledge_id + ' · ' + (k.tenant_id || ''));
+    o.value = k.knowledge_id; s.appendChild(o);
+  });
+  if (cur) s.value = cur;
+}
+
+async function runPack(){
+  const btn = document.getElementById('apGo');
+  const kb = document.getElementById('apKb').value;
+  const po = document.getElementById('apPo').value;
+  if (!kb || !po) { alert('请选知识库并填单号'); return; }
+  btn.disabled = true; btn.textContent = '取数中…';
+  const res = document.getElementById('apRes');
+  res.innerHTML = '';
+  const w = el('div', 'empty'); w.appendChild(el('span', 'spin'));
+  w.appendChild(document.createTextNode(' 正在取数、跑规则、排审批路径…'));
+  res.appendChild(w);
+  try {
+    const d = await getJSON('/api/dify/ai_pack', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({knowledge_id: kb, po_id: Number(po)})});
+    renderPack(d);
+  } catch (e) {
+    res.innerHTML = ''; res.appendChild(el('div', 'empty', '请求失败：' + e));
+  } finally { btn.disabled = false; btn.textContent = '取数字包 + 判路径'; }
+}
+
+function renderPack(d){
+  const res = document.getElementById('apRes'); res.innerHTML = '';
+  const meta = document.getElementById('apMeta'); meta.innerHTML = '';
+  if (d.error) { res.appendChild(el('div', 'empty', d.error)); return; }
+  const r = d.response || {};
+  const okc = el('span', 'chip ' + (r.ok ? 'ok' : 'bad'), 'HTTP ' + d.http);
+  meta.appendChild(okc);
+  meta.appendChild(document.createTextNode(' 往返 ' + d.elapsed_s + ' 秒'));
+  if (!r.ok) {
+    res.appendChild(el('div', 'empty', '取数失败：' + (r.error || '未知原因') +
+      '（单号不存在、或不属于该租户）'));
+    document.getElementById('apRawWrap').style.display = 'block';
+    document.getElementById('apRaw').textContent = JSON.stringify(d, null, 2);
+    return;
+  }
+  const m = r.metrics || {}, g = r.gate || {}, rule = r.rule || {}, rt = r.route || {};
+  const auto = g.auto_eligible === true;
+  // 概要条
+  const sum = el('div', 'meta-line');
+  [['金额', m.amount != null ? Number(m.amount).toLocaleString('zh-CN') + ' 元' : '—'],
+   ['风险等级', (rule.risk_level || '—') + ' / ' + (rule.risk_score != null ? rule.risk_score : '—')],
+   ['建议路径', (rt.nodes || []).length + ' 站'],
+   ['能否自动批', auto ? '可以（仅提示）' : '需人工']].forEach(([k, v]) => {
+    const sp = el('span'); sp.appendChild(el('b', '', k + '：')); 
+    sp.appendChild(document.createTextNode(v)); sum.appendChild(sp);
+  });
+  res.appendChild(sum);
+  res.appendChild(el('div', '', ''));
+  res.lastChild.appendChild(el('span', 'chip ' + (auto ? 'ok' : 'warn'),
+    auto ? 'gate.auto_eligible = true' : 'gate.auto_eligible = false'));
+  // missing 警告
+  const miss = r.missing || [];
+  if (miss.length) {
+    const w = el('div', 'note', '信息不足 ' + miss.length + ' 项：' + miss.join('、') +
+      ' —— 这些指标算不出来（不是 0）。LLM 遇到非空 missing 必须给「转人工」，不许下通过结论。');
+    w.style.background = '#fdf3e7'; w.style.border = '1px solid #f5d9b4';
+    w.style.padding = '8px 11px'; w.style.borderRadius = '8px'; w.style.color = '#b54708';
+    res.appendChild(w);
+  }
+  // 指标
+  const keys = Object.keys(m);
+  if (keys.length) {
+    const box = el('div', 'card'); box.style.marginTop = '10px';
+    const hd = el('div', 'card-h'); hd.appendChild(el('h3', '', '指标（' + keys.length + ' 项）'));
+    box.appendChild(hd);
+    const bd = el('div', 'card-b');
+    keys.forEach(k => {
+      const row = el('div', 'kv');
+      row.appendChild(el('span', 'k mono', k));
+      const v = m[k];
+      row.appendChild(el('span', 'v', v === null ? '（算不出）' : String(v)));
+      bd.appendChild(row);
+    });
+    box.appendChild(bd); res.appendChild(box);
+  }
+  // 审批路径
+  const nodes = rt.nodes || [];
+  if (nodes.length) {
+    const box = el('div', 'card'); box.style.marginTop = '10px';
+    const hd = el('div', 'card-h');
+    hd.appendChild(el('h3', '', '审批路径（' + nodes.length + ' 站）'));
+    hd.appendChild(el('span', 'sub', 'Dify 画布里的「迭代节点」就该遍历它'));
+    box.appendChild(hd);
+    const bd = el('div', 'card-b');
+    nodes.forEach((n, i) => {
+      const hit = el('div', 'hit'); hit.style.marginBottom = '8px';
+      const top = el('div', 'top');
+      top.appendChild(el('span', 'rk', i + 1));
+      // 节点自带 title（部门经理 / 供应商准入复核）与 reason（为什么要这一站），
+      // 别只显示"第 N 站"——那样等于把最有信息量的字段丢了。
+      top.appendChild(el('span', 'ti', n.title || n.node_id || ('第 ' + (i + 1) + ' 站')));
+      top.appendChild(el('span', 'sc', n.reason || ('L' + (n.level || ''))));
+      hit.appendChild(top);
+      if (n.duty) {
+        const dm = el('div', 'mt', '职责：' + n.duty);
+        dm.style.padding = '6px 12px';
+        hit.appendChild(dm);
+      }
+      const dt = document.createElement('details');
+      const sm = document.createElement('summary');
+      sm.textContent = '该站材料 ' + String((n.material || '').length) + ' 字';
+      dt.appendChild(sm);
+      const pre = el('pre', '', n.material || '（无）');
+      pre.style.maxHeight = '220px';
+      dt.appendChild(pre);
+      hit.appendChild(dt);
+      bd.appendChild(hit);
+    });
+    box.appendChild(bd); res.appendChild(box);
+  }
+  document.getElementById('apRawWrap').style.display = 'block';
+  document.getElementById('apRaw').textContent = JSON.stringify(d, null, 2);
+}
+
+function renderCurl(kbs){
+  const id = (kbs.find(k => k.enabled) || {}).knowledge_id || 'kb-xxx';
+  const u = (ENDPOINTS[0] || BRIDGE) + '/retrieval';
+  const vm = ENDPOINTS.find(x => /^http:\/\/192\.168\.200\./.test(x)) ||
+             ENDPOINTS[ENDPOINTS.length - 1] || BRIDGE;
+  const txt = [
+    '# 1) 健康自检（在宿主机上跑，走回环最快）',
+    'curl -s http://127.0.0.1:8300/health',
+    '',
+    '# 2) 一次真实检索（与 Dify 走同一条路）',
+    'curl -s -X POST ' + u + ' \\',
+    '  -H "Authorization: Bearer $DIFY_KB_API_KEY" \\',
+    '  -H "Content-Type: application/json" \\',
+    "  -d '{\"knowledge_id\":\"" + id + "\",\"query\":\"系统支持哪些通信协议\"," +
+      "\"retrieval_setting\":{\"top_k\":5,\"score_threshold\":0}}'",
+    '',
+    '# 3) 在虚拟机里验一次宿主机可达性（VMware NAT 只能走这个网关地址）',
+    'curl -s -m 3 ' + vm + '/health'
+  ].join('\n');
+  document.getElementById('curlPre').textContent = txt;
+}
+
+function copyTxt(t, btn){
+  const done = () => { const o = btn.textContent; btn.textContent = '已复制';
+    setTimeout(() => btn.textContent = o, 1200); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(done).catch(() => fallback(t, done));
+  } else fallback(t, done);
+}
+function fallback(t, done){
+  const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta);
+  ta.select(); try { document.execCommand('copy'); done(); } catch(e) {}
+  document.body.removeChild(ta);
+}
+
+refresh(false);
+timer = setInterval(() => { if (!document.hidden) refresh(false); }, 8000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(false); });
+</script>
+</body></html>"""
 
 
 def main():

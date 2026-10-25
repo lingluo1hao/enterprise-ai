@@ -152,6 +152,14 @@ RERANK_URL = os.getenv("RERANK_URL", "http://192.168.200.128:11436/v1/rerank")
 RERANK_TIMEOUT = int(os.getenv("RERANK_TIMEOUT", "20"))
 RERANK_RETRIES = int(os.getenv("RERANK_RETRIES", "2"))          # 5xx 瞬时失败重试次数
 RERANK_RETRY_BACKOFF = float(os.getenv("RERANK_RETRY_BACKOFF", "1.0"))  # 退避基数(秒)
+# ★ 2026-10-25：送进精排的**单条字符上限**，从函数内写死的 3000 提到模块级 + 可由环境变量覆盖。
+#   为什么：实测精排耗时≈正比于送检总字符数（同机 20 条：~30 字→0.9s / ~358 字→7.1s /
+#   ~1704 字→51.7s）。Dify 召回的 parent chunk 就有 1701 字的，一次召回 35 秒就是这么来的。
+#   默认仍 3000（与改造前完全一致，主链路零回归）；要压延迟就调小，做 A/B 用
+#   `evalkit.runner --set rerank_max_chars=400`，或只给 Dify 桥进程设
+#   `RERANK_MAX_CHARS=400`（只影响 Dify 那条链路，主链路不受影响）。
+#   ⚠️ 截断只影响「发给 reranker 打分的内容」，返回时经 idx_map 取回完整原文，不丢上下文。
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "3000"))
 
 # ===== 生成侧难度路由：难的 query 走 deepseek 生成，简单走本地 qwen2:7b =====
 # 依据：tenant 命中硬 tenant 集合（jm/yh 等技术协议库，幻觉高发）或 query 命中
@@ -1874,7 +1882,8 @@ class LangGraphRAGApp:
         queries.insert(0, query.strip())
         return queries
 
-    def _do_retrieve(self, queries: List[str], role: str) -> List:
+    def _do_retrieve(self, queries: List[str], role: str,
+                     keep_score: bool = False) -> List:
         """
         【辅助：向量检索 + RRF 跨 query 融合 + 权限过滤 + 两阶段精排】
 
@@ -1892,6 +1901,12 @@ class LangGraphRAGApp:
         参数：
             queries: 搜索词列表（第 0 项始终为原句）
             role: 用户角色（"admin" 或 "user"，决定可见文档范围）
+            keep_score: 是否把 reranker 的 relevance_score 带出来（默认 False，
+                线上主链路行为完全不变）。仅 Dify 外部知识库桥接用：
+                Dify 的 score 语义是「0~1 越大越相关」，与本方法返回的
+                「距离越小越相关」（hybrid 下是 -fused，量级 1/61≈0.016）
+                完全相反，只能靠 reranker 的真实相关度换算。
+                开启后会在候选 Document.metadata["_rerank_score"] 写入原始分。
         返回：
             [(Document, score), ...] — 融合 + 精排后的文档列表（score 越小越相关）
         """
@@ -1918,7 +1933,8 @@ class LangGraphRAGApp:
         # rerank 在 RETRIEVE_CANDIDATE_K（20）宽池里精排，避免只精排前 5 把正确
         # chunk 挤出（Bad Case #9 同因：gold 排第 6~10 时直接被 rerank 入口 top_n=5 丢）。
         # generate 端再 docs[:5] 收窄到喂 LLM 的窗口（line 1908）。
-        candidate = self._rerank(queries[0] if queries else "", rrf_results, RETRIEVE_CANDIDATE_K)
+        candidate = self._rerank(queries[0] if queries else "", rrf_results,
+                                 RETRIEVE_CANDIDATE_K, keep_score=keep_score)
 
         # ⑤ figure-aware 二次召回：原句（queries[0]）含图关键词时，图页顶到最前
         original_q = queries[0] if queries else ""
@@ -1972,7 +1988,8 @@ class LangGraphRAGApp:
         ranked = sorted(fused, key=lambda h: fused[h], reverse=True)
         return [(docs[h], -fused[h]) for h in ranked[:top_k]]
 
-    def _rerank(self, query: str, docs: List, top_n: int) -> List:
+    def _rerank(self, query: str, docs: List, top_n: int,
+                keep_score: bool = False) -> List:
         """
         两阶段 cross-encoder 精排（改造方案 §4.2）。
 
@@ -1985,6 +2002,11 @@ class LangGraphRAGApp:
             query: 原始问题
             docs: RRF 融合后的候选 [(Document, score), ...]
             top_n: 返回条数
+            keep_score: 是否把 relevance_score 写进 Document.metadata["_rerank_score"]。
+                默认 False = 与改造前逐字节等价（老调用点一个都不用改）。
+                开这个口子是因为 reranker 的真实相关度是**唯一**能换算成
+                Dify 那套「0~1 越大越相关」的量：RRF 的分数是 1/(60+rank) 的
+                累加值，量级 0.016，拿去当 Dify score 等于「全部不相关」。
         返回：
             精排后的 [(Document, score), ...]
         """
@@ -1995,7 +2017,8 @@ class LangGraphRAGApp:
             # 防御性清洗：过滤空串/None，截断超长文档，避免 reranker 报 500。
             # 截断只影响"发给 reranker 打分的内容"，返回时经 idx_map 取回完整原始
             # Document，不丢上下文。
-            RERANK_MAX_CHARS = 3000
+            # ★ 上限用模块常量 RERANK_MAX_CHARS（默认 3000，可由环境变量覆盖），
+            #   不再写死在函数里 —— 否则评测器没法用 --set 做 A/B（见该常量注释）。
             cleaned, idx_map = [], []
             for i, (d, _s) in enumerate(docs):
                 text = (getattr(d, "page_content", None) or "").strip()
@@ -2026,7 +2049,19 @@ class LangGraphRAGApp:
                     resp.raise_for_status()
                     order = sorted(resp.json().get("results", []),
                                    key=lambda x: x["relevance_score"], reverse=True)
-                    reranked = [docs[idx_map[it["index"]]] for it in order[:top_n]]
+                    reranked = []
+                    for it in order[:top_n]:
+                        doc, rrf_score = docs[idx_map[it["index"]]]
+                        if keep_score:
+                            # 只加一个下划线私有键，不改 page_content、不改原有 score。
+                            # 下游 _build_context 只读 source/page 等显式字段，
+                            # 不会把这个键编进 prompt（已核对 _build_context:243-249）。
+                            try:
+                                doc.metadata["_rerank_score"] = float(
+                                    it["relevance_score"])
+                            except Exception:
+                                pass
+                        reranked.append((doc, rrf_score))
                     print(f"  [rerank] {len(docs)} 候选 → 精排 {len(reranked)} 条 (query={query[:30]!r})")
                     return reranked
                 except Exception as e:

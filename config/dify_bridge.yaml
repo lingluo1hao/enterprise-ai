@@ -1,0 +1,178 @@
+# ============================================================================
+# Dify 双向桥配置（出口：Dify 外部知识库 API）
+# ============================================================================
+# 这个文件只服务"出口"这一侧：把本项目的混合检索暴露成 Dify 能吃的
+# 外部知识库接口（POST /retrieval），让 Dify 应用直接检索你带 ACL 的存量文档。
+#
+# 入口另一侧（Dify 应用注册成 llm_gateway 的 provider）在 config/llm_gateway.yaml
+# 里配，不需要动这个文件。
+#
+# 设计要点：
+#   1. knowledge_id 必须白名单。Dify 请求体里的 knowledge_id 会**直接**决定
+#      tenant_id / role / user_id 三个检索参数，而 tenant_id 是要拼进 Milvus
+#      expr 的（advanced_rag_agent.py:874-884 是 f-string 拼接）。如果允许
+#      Dify 传任意字符串，等于把 Milvus 表达式注入的入口开放给外部系统。
+#      → 未登记的 knowledge_id 一律返回 2001（知识库不存在），不做任何透传。
+#   2. 密钥只写环境变量名，不写值。与 llm_gateway.yaml 同一套纪律。
+#   3. top_k 必须钳制。本项目单 query 召回量是 RETRIEVE_CANDIDATE_K=20，
+#      Dify 那边可以填 100，不钳制就是让我们替它跑 100 条的活（还可能把
+#      reranker 打爆）。
+# ============================================================================
+
+server:
+  # 默认只听回环：Dify 若与本服务同机部署用 127.0.0.1 最安全；
+  # 若 Dify 跑在虚拟机/容器里，改成 0.0.0.0 并用防火墙限制来源网段。
+  #
+  # ★ 本项目实况（2026-10-25）：Dify 在虚拟机 192.168.200.128:8080，桥服务在
+  #   Windows 宿主机 → **必须 0.0.0.0**，否则 Dify 从 VM 侧连 192.168.200.1:8300
+  #   会被拒（表现为 Dify 保存外部知识库 API 时报 failed to connect）。
+  #   裸奔风险由 auth.api_key_env 兜住：没带 Bearer / 值不对一律 1002/403。
+  host: "0.0.0.0"
+  port: 8300
+  # 单请求超时（秒）。检索链路含 reranker 调用，正常 200~800ms，
+  # 给 30 秒是为了容忍 reranker 抖动的重试（RERANK_RETRIES=2，每次 20s 超时）。
+  request_timeout: 30
+  # 并发检索上限。reranker 在 VM 上只有 1 个 llama.cpp 进程，Dify 那边
+  # 一开多路会话就会把 20 条候选一股脑打过来；用信号量排队而不是让它
+  # 把 reranker 打到 500（500 会触发 RERANK_RETRIES 退避，反而更慢）。
+  max_concurrency: 4
+
+# 密钥：只写环境变量名
+auth:
+  # 启动前在 .env 里配 DIFY_KB_API_KEY=<随便一串强随机>
+  # 生成方式：python -c "import secrets;print(secrets.token_urlsafe(32))"
+  api_key_env: "DIFY_KB_API_KEY"
+
+limits:
+  # ★ 送 reranker 的候选池宽度 —— **默认必须与主链路一致（20），别调小**。
+  #
+  # 为什么不能为了「跑得快」把它调成 5：
+  #   实测 query「系统支持哪些通信协议」，精排后 top5 来自候选的下标是
+  #   [12, 8, 15, 2, 1] —— 排第 1 和第 3 的答案原本躺在候选池第 12、15 位。
+  #   候选池砍到 5，这两条连 reranker 的门都进不去，精度直接掉。
+  #   降候选 = 降精度，没有折中余地。
+  #
+  # 那 Dify 报「操作失败」怎么办？根因不在这里，在 CPU reranker 太慢
+  # （20 条实测 8.7~22s）+ Dify 外部检索硬超时约 6s。正解是抬 Dify 侧超时，
+  # 或给 reranker 上 GPU；缩候选是假解药。
+  # 只有一种情况可以临时调小：仅为了验证链路是否通，验完立刻改回 20。
+  candidate_k: 20
+  # Dify 请求体 retrieval_setting.top_k 的上限（超过按上限截断，不报错）。
+  # 20 = 本项目单 query 召回深度 RETRIEVE_CANDIDATE_K，再大也拿不到更多真候选。
+  max_top_k: 20
+  # 单条 query 的最大字符数，超长直接 400（正常提问不会过百字，
+  # 给 512 是给带上下文的追问留余量）。
+  max_query_len: 512
+  # 单次返回给 Dify 的 records 上限（防止 Dify 把 top_k 填成 20 而我们
+  # 融合后返回 40 条）。
+  max_records: 20
+  # ★ 送进精排的**单条字符上限**（只对本进程生效，主链路默认 3000 不受影响）。
+  #
+  # 为什么本文件要单独设：实测精排耗时≈正比于送检总字符数（同一台机、20 条候选）
+  #     单条 ~30 字  → 0.90 / 0.96 s
+  #     单条 ~358 字 → 7.1 / 9.2 s
+  #     单条 ~1704 字 → 51.7 s
+  # 而 Dify 召回的 parent chunk 真有 1701 字的，一次外部检索实测 35.07 秒。
+  #
+  # 设 400 的依据是评测 A/B（15 条 retrieval 黄金集，其它参数完全相同）：
+  #     通过率   100%      → 100%
+  #     Recall@5 0.962     → 1.000     ↑
+  #     nDCG@5   0.973     → 0.975     ↑
+  #     MRR      1.000     → 0.962     ↓（单条 jm-008 从第 1 掉到第 2，仍命中）
+  #     整轮耗时 766.1s     → 270.4s    -64.7%
+  # ⇒ 净收益：延迟砍掉三分之二，Recall@5 反而更好。唯一代价是个别 case 名次后移一位。
+  # 复现命令：
+  #   python -m evalkit.runner --suite retrieval --set rerank_max_chars=3000 --no-fail
+  #   python -m evalkit.runner --suite retrieval --set rerank_max_chars=400 --compare last --no-fail
+  # 填 0 = 不覆盖，沿用主链路默认（3000）。
+  rerank_max_chars: 400
+
+# ----------------------------------------------------------------------------
+# 知识库登记表：knowledge_id → 检索身份
+# ----------------------------------------------------------------------------
+# knowledge_id 就是 Dify「外部知识库 API」里要填的那个 ID，两边必须一字不差。
+#
+# 每个条目固定四件事：
+#   tenant_id  检索时下推到 Milvus 的分区键（物理隔离）
+#   role       应用层权限角色（admin 看全部 / user 只看 public）
+#   user_id    归属者，用于「拥有者」维度过滤与审计日志
+#   label      人读备注，只用于 /health 自检输出，不参与检索
+#
+# ⚠️ 一个 knowledge_id 只能绑一个租户。想让 Dify 同时查多个租户？
+#    登记成多个 knowledge_id，在 Dify 里建多个外部知识库，让应用自己选。
+#    这是刻意的：跨租户检索在本项目的安全模型里根本不存在。
+knowledge_bases:
+
+  # ---- JM 租户（有真实数据：Milvus 实测 526 篇 chunk，access_level 全 public）----
+  - knowledge_id: "kb-jm"
+    label: "JM 租户 · 指令表/协议文档"
+    tenant_id: "jm"
+    role: "user"
+    user_id: "dify-svc"
+    enabled: true
+
+  # ---- YH 租户（有真实数据：Milvus 实测 322 篇 chunk）----
+  # 2026-10-25 新增：原登记表只有 default 与 jm，而 default 在库里 0 篇，
+  # 导致 Dify 里两个外部知识库有一个永远查不到东西（表现为「检索成功但没结果」）。
+  - knowledge_id: "kb-yh"
+    label: "YH 租户 · 学生证设备通讯协议"
+    tenant_id: "yh"
+    role: "user"
+    user_id: "dify-svc"
+    enabled: true
+
+  # ---- default 租户（★ 2026-10-25 实测 0 篇，已停用）----
+  # `config/tenants.yaml` 里它写着「存量/公共文档所在租户」，但 Milvus `rag_docs`
+  # 实际统计是 default=0 / jm=526 / yh=322（合计 848）。登记表指向一个空租户，
+  # 只会让调用方看到「200 + 空结果」，把「配置指错」误判成「检索坏了」。
+  # 保留 id 不删：万一 Dify 侧已经注册过这个 ID，返回 2001 比返回空结果更容易定位。
+  - knowledge_id: "kb-default"
+    label: "默认租户 · 当前 0 篇（停用，见注释）"
+    tenant_id: "default"
+    role: "user"
+    user_id: "dify-svc"
+    enabled: false
+
+  # ---- 需要机密级文档时，用这条（role=admin 才看得到 restricted）----
+  # 默认关掉：Dify 侧的"应用"没有真实用户身份，用 admin 相当于给外部系统
+  # 开了全库读权限。要开请在 Dify 那一侧也做访问控制（应用级 API Key 分发）。
+  - knowledge_id: "kb-default-admin"
+    label: "默认租户 · 含机密文档（admin 视角）"
+    tenant_id: "default"
+    role: "admin"
+    user_id: "dify-svc-admin"
+    enabled: false
+
+# ----------------------------------------------------------------------------
+# score 语义（改这里之前先读代码）
+# ----------------------------------------------------------------------------
+# 🔴 2026-10-25 实测补充（精排 bge-reranker-v2-m3 生效后）：
+#   本链路回流给 Dify 的分数**不是 0~1 均匀分布**，而是集中在 **0.2~0.4**：
+#       查询「系统支持哪些通信协议」→ 0.3652 / 0.3447 / 0.2868 / 0.2740 / 0.2694
+#   原因是 cross-encoder 吐的是 logits（本例 -0.55 ~ -1.0），经 sigmoid 压到 0~1 后
+#   天然挤在中间。所以 Dify 侧 **score_threshold 必须按这个量级设**：
+#       · 想不过滤   → 0（推荐先用这个跑通）
+#       · 想只留前 3 → 约 0.30
+#       · 按直觉设 0.5 → **一条都不剩，且不报错**（表现为"检索成功、没有结果"）
+#   注意：阈值**不由本文件决定** —— 它每次都由 Dify 通过
+#   `retrieval_setting.score_threshold` 传进来，本服务只做 `score < threshold` 过滤。
+#
+# Dify 要求 score ∈ [0,1] 且「越大越相关」；本项目内部是「距离越小越相关」
+# （hybrid 下是 -fused，量级 1/61≈0.016，直接当 score 传过去等于全都不相关）。
+#
+# 换算优先级：
+#   1. reranker 的 relevance_score（bge-reranker-v2-m3 真实语义相关度）—— 首选
+#   2. 无 rerank 时退化为「排名归一化」（monotonic 递减，只保证排序正确，
+#      不代表真实相关度，日志会打 warning）
+#
+# 下面的参数只影响第 2 种退化路径。
+score:
+  # 退化路径的起始分与每条递减量：score = base - step * rank_index
+  # 取 0.95/0.05 → rank1=0.95 rank5=0.75 rank10=0.50，便于在 Dify 里
+  # 设 0.5 左右的 score_threshold 做过滤。
+  rank_base: 0.95
+  rank_step: 0.05
+  # 是否把 relevance_score 的原始值（logits）用 sigmoid 压到 [0,1]。
+  # llama.cpp 的 /v1/rerank 不同版本行为不一致：有的已做 sigmoid（输出
+  # 0~1），有的原样吐 logits（-12~8）。脚本会自动判断：值域越界才压。
+  sigmoid_when_out_of_range: true

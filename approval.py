@@ -22,10 +22,23 @@
      3. 拒绝同样须达标等级（防止低权限者恶意否决他人单据）
 
  执行器（executor）注册制：按 action_type 分发，新增高危动作零侵入。
+
+ AI 预审（ai_review）—— 2026-10-22 新增
+ ----
+ 人工审批链解决「谁都别乱动」，但解决不了「一天几十张单、人点同意点到麻木」。
+ `ai_review()` 在人工审批**之前**插一层 AI 预审：取真实数字 → 规则打分
+ → Dify 工作流出结论 → 三分支（自动批 / 转人工 / 建议拒绝）。实现见
+ `ai_approval.py`，设计说明见 `docs/guides/AI_APPROVAL_WORKFLOW.md`。
+
+ 关键边界：AI 自动批准**不是后门**——它调用的是本文件同一个 `decide()`，
+ 用的是 order_acl 里注册的 `ai_approver`（level=2）。采购单 >10 万要求
+ level=3，AI 付不起，改 ai_approval.yaml 的额度上限也绕不过权限链。
+
  人工侧 CLI：
    python approval.py --list
    python approval.py --approve 3 --by 王工 --role dept_manager
    python approval.py --reject 3 --by 李经理 --role dept_manager --note "证据不足"
+   python approval.py --ai-review 3            # 对采购审批单做 AI 预审
 ================================================================================
 """
 
@@ -102,6 +115,24 @@ def load_approval_rules() -> Dict:
     except Exception:
         pass
     return _DEFAULT_RULES
+
+
+def required_level_for(action_type: str, amount: float = None,
+                       rules: Dict = None) -> int:
+    """
+    该动作在当前金额下要求的审批等级（1/2/3）。
+
+    模块级函数而不是只做方法——因为 `dify_kb_server.py` 的 `/ai/pack` 端点
+    也要用同一套算法把「这张单要几级」告诉 Dify 工作流。抽出来的目的是让
+    **等级判定只有一个权威实现**，避免副本各改各的导致 AI 侧和审批侧口径不一。
+    """
+    rs = rules if isinstance(rules, dict) else load_approval_rules()
+    rule = rs.get(action_type) or {}
+    level = int(rule.get("min_approver_level", 2))
+    for ar in rule.get("amount_rules") or []:
+        if amount is not None and float(amount) > float(ar.get("above", 0)):
+            level = max(level, int(ar.get("min_approver_level", level)))
+    return level
 
 
 class ApprovalGate:
@@ -182,12 +213,8 @@ class ApprovalGate:
     # 规则：该动作在当前金额下要求的审批等级
     # ------------------------------------------------------------------
     def required_level(self, action_type: str, amount: float = None) -> int:
-        rule = self.rules.get(action_type) or {}
-        level = int(rule.get("min_approver_level", 2))
-        for ar in rule.get("amount_rules") or []:
-            if amount is not None and float(amount) > float(ar.get("above", 0)):
-                level = max(level, int(ar.get("min_approver_level", level)))
-        return level
+        """转调模块级 required_level_for（唯一权威实现，见其 docstring）。"""
+        return required_level_for(action_type, amount, self.rules)
 
     # ------------------------------------------------------------------
     # 数字员工侧：发起高危操作（只挂起，不执行）
@@ -327,6 +354,57 @@ class ApprovalGate:
     def get(self, request_id) -> Optional[Dict]:
         return self._row(request_id)
 
+    # ------------------------------------------------------------------
+    # AI 预审（物料采购审核）
+    # ------------------------------------------------------------------
+    # AI 预审目前**只覆盖** purchase_order.approve。理由是取数口径必须与业务
+    # 真实字段一一对应，其他动作（关单/报修结算/盘点调整）还没有定义「用哪些
+    # 数字判断是否合理」，硬做就是编指标。这里宁可拒绝，也不假装支持。
+    AI_REVIEW_ACTIONS = ("purchase_order.approve",)
+
+    def ai_review(self, request_id, flow=None, clause_fetcher=None,
+                  dry_run: bool = False, node_id: str = None) -> Dict:
+        """
+        对一张 pending 审批单跑 AI 预审（多站）。
+
+        :param flow: 可选，注入 ai_approval.AIApprovalFlow（测试/复用）
+        :param clause_fetcher: 可选，(query) -> [{title, content}] 制度检索
+        :param dry_run: True 只算不写库、不执行
+        :param node_id: 只出某一站建议（审批人看"我这一站"）；单站结果不会自动批
+        :return: 预审结果行，含：
+                   action        auto_approve / human_review / recommend_reject
+                                 / degraded
+                   stage         路线上卡在哪一站
+                   advices       每站结论（agree / 有条件 / 反对 / 资料不足）
+                   handover      给人工的交接单（结论 + 依据 + 待问问题 + 处置建议）
+        """
+        r = self._row(request_id)
+        if not r:
+            raise ValueError(f"审批单 #{request_id} 不存在")
+        if r["status"] != "pending":
+            raise ValueError(
+                f"审批单 #{request_id} 已处理（status={r['status']}），无需预审")
+        action_type = r.get("action_type")
+        if action_type not in self.AI_REVIEW_ACTIONS:
+            raise ValueError(
+                f"AI 预审暂不支持动作「{action_type}」——"
+                f"该动作还没有定义取数口径（支持：{list(self.AI_REVIEW_ACTIONS)}）。"
+                f"拒绝用编造的指标做审批。")
+        payload = r.get("payload") or {}
+        po_id = payload.get("po_id")
+        if not po_id:
+            raise ValueError(
+                f"审批单 #{request_id} 的 payload 缺 po_id，无法取数（payload={payload}）")
+
+        from ai_approval import AIApprovalFlow
+        flow = flow or AIApprovalFlow(gate=self, verbose=False)
+        return flow.review_po(int(po_id),
+                              tenant_id=r.get("tenant_id") or "default",
+                              request_id=request_id,
+                              clause_fetcher=clause_fetcher,
+                              dry_run=dry_run,
+                              node_id=node_id)
+
 
 # ----------------------------------------------------------------------
 # 业务执行器注册表（7 个高危动作 → 各 Service 的 execute_*）
@@ -407,17 +485,41 @@ def main():
     parser.add_argument("--show", type=int, help="查看某张审批单详情")
     parser.add_argument("--approve", type=int, help="批准并立即执行")
     parser.add_argument("--reject", type=int, help="拒绝（动作不执行）")
+    parser.add_argument("--ai-review", type=int, dest="ai_review",
+                        help="对采购审批单做 AI 预审（物料审核·多站）")
+    parser.add_argument("--ai-advice", type=int, dest="ai_advice",
+                        help="打印该单的 AI 交接单（各站建议 + 待确认问题）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="配合 --ai-review：只算不写库、不自动批")
+    parser.add_argument("--node", default=None,
+                        help="配合 --ai-review：只出某一站的建议"
+                             "（dept_manager/purchase_lead/finance/gm/compliance"
+                             "/supplier_onboard）")
     parser.add_argument("--by", default="admin", help="审批人（写入审计链）")
     parser.add_argument("--role", default="gm", help="审批人业务角色（定审批等级）")
     parser.add_argument("--tenant", default="default")
     parser.add_argument("--note", default="", help="备注 / 拒绝理由")
     args = parser.parse_args()
 
-    if not any([args.list, args.show, args.approve, args.reject]):
+    if not any([args.list, args.show, args.approve, args.reject,
+                args.ai_review, args.ai_advice]):
         parser.print_help()
         return
 
     gate = ApprovalGate(build_default_executors(), verbose=False)
+
+    if args.ai_review:
+        row = gate.ai_review(args.ai_review, dry_run=args.dry_run,
+                             node_id=args.node)
+        out = {k: v for k, v in row.items() if k != "pack"}
+        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+        return
+
+    if args.ai_advice:
+        row = gate.ai_review(args.ai_advice, dry_run=True)
+        from ai_approval import format_handover
+        print(format_handover(row.get("handover") or {}))
+        return
 
     if args.list:
         rows = gate.list_pending(args.tenant)

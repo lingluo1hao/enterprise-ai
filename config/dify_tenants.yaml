@@ -1,0 +1,47 @@
+# ============================================================================
+# 租户 ↔ Dify 映射（目标形态：企业版多 workspace，一租户一工作区）
+# ============================================================================
+# 决策（2026-10-25）：**走 C · 企业版多 workspace**。
+#   理由：我们是做企业智能系统的，租户要能自己画流程，隔离必须是硬的。
+#   **免登不做** —— 社区版做不到，企业版靠 OIDC，都不在本次范围。
+#
+# 设计要点：**现在就按 C 抽象，升级时只改配置、不改代码**
+#   · isolation: workspace 是目标形态；
+#   · 每租户一条 workspace / workspace_id；
+#   · 当前这套 Dify 是 COMMUNITY 版（单 workspace），代码会自动探测版本：
+#       - 企业版：跳 /apps，Dify 按成员的 workspace 落地，隔离生效；
+#       - 社区版：无法真隔离，页面会明确标出「已降级为 app_prefix 命名约定」，
+#                 提示升级后自动生效，不需要改任何代码。
+#
+# 密码不再用于免登（已放弃）。保留字段只为将来接 OIDC 时的账号对照。
+# ============================================================================
+
+# Dify 控制台地址（企业版：同一个实例承载多个 workspace；
+# 若你们将来一租户一实例，可给某个租户单独填 console_url 覆盖）
+console_url: "http://192.168.200.128:8080"
+
+# 目标隔离形态。当前决定（2026-10-25 用户拍板）：**先不隔离，跑通业务**
+#   → app_prefix；等企业版到位再改 workspace（页面会自动跟着变，不改代码）。
+isolation: "app_prefix"
+
+tenants:
+
+  - tenant_id: "jm"
+    label: "JM 租户"
+    # 企业版：成员所属 workspace 名 / ID（升级后在 Dify → 工作区 里能看到）
+    workspace: "jm"
+    workspace_id: ""          # 留空：升级后填 Dify 的 workspace id
+    # 社区版的退路：应用名前缀（当前生效的就是这个）
+    app_prefix: "jm-"
+    email: "jm_admin@local"
+    knowledge_ids: ["kb-jm"]
+    enabled: true
+
+  - tenant_id: "yh"
+    label: "YH 租户"
+    workspace: "yh"
+    workspace_id: ""
+    app_prefix: "yh-"
+    email: "yh_admin@local"
+    knowledge_ids: ["kb-yh"]
+    enabled: true

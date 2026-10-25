@@ -1,0 +1,301 @@
+# ============================================================================
+# AI 自动审批流 · 策略配置（物料采购审核）
+# ============================================================================
+# 这份文件只放「策略」，不放任何密钥（Dify 的 key 走 .env 的 DIFY_APP_API_KEY）。
+#
+# 三层职责划分（改哪个文件先看这里）：
+#   1. 取什么数、怎么算        → ai_approval.py::DataPackBuilder（SQL 写死在代码，
+#                                因为它必须和真实表结构一致，不适合被配置改坏）
+#   2. 算出来的数多严重才报警  → 本文件 thresholds / weights（可热改）
+#   3. 谁能批、批多大额度      → 本文件 limits + config/access_rules.yaml 的
+#                                order_acl.ai_approver（审批等级的唯一权威源）
+#
+# 设计原则（三条，改配置不能违背）：
+#   A. AI 只能在「它自己的审批等级付得起的额度」内自动批。等级的权威源是
+#      access_rules.yaml 的 approval_rules（采购 >10 万须 level=3），本文件
+#      limits.max_auto_amount 是**在等级之上再加一道业务线**，两者取严。
+#   B. 一票否决（hard_block）不可被 AI 推翻。AI 只做「补理由、给建议」，
+#      不做「否决规则的否决」。
+#   C. AI 建议拒绝 ≠ 自动拒绝。误杀一张正常单的成本高于漏放一张异常单，
+#      所以 high 风险也只落到「建议拒绝 + 强制人工复核」。
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# AI 审批员身份
+# ----------------------------------------------------------------------------
+# role 必须在 config/access_rules.yaml 的 order_acl 里注册过、且 level 达标，
+# 否则 ApprovalGate.decide() 会按「未知角色」直接 fail-closed 拒绝。
+ai_approver:
+  role: ai_approver
+  level: 2                    # 与 dept_manager 同级：够批 10 万以内，批不了 10 万以上
+  display_name: AI 审批员（Dify 工作流）
+
+# ----------------------------------------------------------------------------
+# 自动通过的门槛（四个条件全满足才敢自动批，缺一转人工）
+# ----------------------------------------------------------------------------
+limits:
+  max_auto_amount: 50000       # 业务线：即便等级够，超 5 万也一律转人工（钱多的单不赌 AI）
+  min_ai_confidence: 0.80      # AI 自评置信度低于此值 → 转人工
+  require_no_high_finding: true  # 存在任一 high 级 finding → 不得自动批
+  max_top_k: 6                 # 调知识库检索制度条款时取几条
+
+# ----------------------------------------------------------------------------
+# 采购预算（月度）—— 用于 budget_used_pct 指标
+# 按租户覆盖：tenants 下同名 key 优先，没有就用 default。
+# ----------------------------------------------------------------------------
+budget:
+  default:
+    monthly: 800000
+  tenants: {}
+  #  tenants:
+  #    jm:
+  #      monthly: 300000
+
+# ----------------------------------------------------------------------------
+# 指标阈值
+# ----------------------------------------------------------------------------
+# 命名约定：{medium: x, high: y} 表示
+#   value >= x 触发 medium，value >= y 触发 high（数值越大越危险的指标）
+#   value <= x 触发 medium，value <= y 触发 high（数值越小越危险的指标，如 on_time_rate）
+# 具体方向由 ai_approval.py::_THRESHOLD_DIR 决定，改阈值不要改方向。
+#
+# 每个指标右边注释写死「它从哪张表/哪个字段算出来」，这是可回源的凭据。
+thresholds:
+  price_deviation_pct:          # 本单单价 vs 该物料近 90 天已成交加权均价
+    medium: 8.0                 # ← purchase_order_items.unit_price 对比历史同 product_id 均价
+    high: 20.0
+  unit_price_vs_cost_pct:       # 本单单价 vs products.cost_price（参考进价）
+    medium: 10.0                # ← purchase_order_items.unit_price vs products.cost_price
+    high: 25.0
+  qty_ratio:                    # 本单采购量 / 近 30 天该物料领用量
+    medium: 3.0                 # ← purchase_order_items.quantity vs inventory_transactions 出库合计
+    high: 6.0
+  stock_days:                   # 收货后预计可用天数（越大越像囤货）
+    medium: 60.0                # ← (inventory.stock_qty - reserved_qty + 在途) / 日均领用
+    high: 120.0
+  supplier_age_days:            # 供应商首次建档至今（越小越像新供应商，风险高）
+    medium: 90.0                # ← suppliers.created_at（小于阈值触发）
+    high: 30.0
+  supplier_po_90d:              # 该供应商近 90 天已成交订单数（越少越缺履约证据）
+    medium: 3                   # ← purchase_orders 计数（小于阈值触发）
+    high: 1
+  on_time_rate_pct:             # 准时交付率（越低越差，小于阈值触发）
+    medium: 85.0                # ← purchase_orders.expected_date vs updated_at（收货动作落库时间，近似）
+    high: 70.0
+  reject_rate_pct:              # 该供应商历史采购审批被拒率（越高越差）
+    medium: 20.0                # ← approval_requests 里 action_type='purchase_order.approve' 且
+    high: 40.0                  #    status='rejected' 的占比（按 payload 里的 supplier_id 归属）
+  budget_used_pct:              # 本月采购额 / 月预算（含本单）
+    medium: 90.0                # ← purchase_orders 本月 approved/received 金额合计 vs budget
+    high: 100.0
+  split_amount_pct:             # 拆单识别：本单 + 同供应商近 N 天在途单合计，占审批阈值的比例
+    medium: 90.0                # ← purchase_orders 同 supplier_id 近 split_window_days 天
+    high: 100.0                 #    submitted/approved 金额合计 ÷ approval_rules 的 10 万线
+
+# 拆单识别窗口（天）
+split_window_days: 7
+# 审批金额线（与 access_rules.yaml 的 amount_rules.above 保持一致；
+# 改一边必须改另一边，否则拆单判定会失真）
+approval_amount_line: 100000
+
+# ----------------------------------------------------------------------------
+# 风险权重与分级
+# ----------------------------------------------------------------------------
+weights:
+  hard_block: 100
+  high: 40
+  medium: 15
+  low: 3
+
+risk_levels:            # risk_score 落区间 → 等级
+  low: 20               # 0..20   low
+  medium: 60            # 21..60  medium
+                        # >60     high
+
+# ----------------------------------------------------------------------------
+# AI 判定（Dify 工作流）对接约定
+# ----------------------------------------------------------------------------
+dify:
+  enabled: true
+  task: dify_approve        # llm_gateway 的 routing key，指向 config/llm_gateway.yaml 的 dify-flow
+  timeout_sec: 120
+  # AI 必须回严格 JSON；下面这些键缺一即判「AI 输出不合规」→ 整单降级转人工。
+  required_keys: [decision, risk_level, confidence, key_factors]
+  # 合法取值（白名单，防止模型自由发挥出 "maybe" 这种没法执行的值）
+  decision_values: [approve, reject, escalate]
+  risk_values: [low, medium, high]
+
+# 知识库检索：给 AI 找制度条款用的 knowledge_id（由 dify_kb_server.py 提供）
+knowledge_id: kb-default
+
+# ============================================================================
+# 多站审批路线（2026-10-22 加）
+# ============================================================================
+# 上一版只有一个 LLM 节点、一个结论——那不是工厂的审批，那是个"判官"。
+# 真实采购审批是**多站串联**，每一站的人只关心自己那一摊：
+# 部门经理问「这料该不该买」、采购主管问「从这家买、这价对不对」、
+# 财务问「预算还够不够」、总经理问「这钱该不该花」。
+# 让同一段 prompt 给四个岗位出同一段建议，等于没做。
+#
+# 所以拆成两层：
+#   ① routes / insert_rules —— 决定「这张单走哪几站」（按金额 + 历史信号动态生成）
+#   ② nodes                 —— 决定「每一站看什么、说什么」（差异化职责与材料）
+#
+# 节点里的 level 是「这一站要求几级的人来点」的**声明**，它只用来判断
+# 「AI 够不够格自动批」（路线最高 level > ai_approver 的 level → 不可自动批）。
+# 真实审批时谁有资格点，仍由 config/access_rules.yaml 的 order_acl 决定——
+# 两套东西不能混，混了就会出现「配置说 3 级、角色表说 2 级」的自相矛盾。
+# ============================================================================
+
+# ---- ① 基础路线：按金额分段（从上往下匹配，第一个满足 amount <= up_to 的生效）----
+routes:
+  - up_to: 50000
+    nodes: [dept_manager]
+    note: 5 万以内 · 部门经理单站
+  - up_to: 100000
+    nodes: [dept_manager, finance]
+    note: 5~10 万 · 加财务确认预算
+  - up_to: 300000
+    nodes: [dept_manager, purchase_lead, finance, gm]
+    note: 10~30 万 · 采购主管比价 + 财务 + 总经理
+  - up_to: 0                  # 0 = 无上限（兜底段，必须放最后）
+    nodes: [dept_manager, purchase_lead, finance, gm]
+    note: 30 万以上 · 同链，但逐站都要求更高等级确认
+
+# ---- ② 动态插站：命中信号就在指定位置插一个节点（已存在则不重复插）----
+# when 的取值由代码 ai_approval.py::RoutePlanner._signals 计算：
+#   split_bypass   疑似拆单规避审批（本单未超线但与同供应商在途单合计超线）
+#   new_supplier   供应商建档 < 90 天或无历史成交
+#   price_spike    单价偏离历史均价超 high 阈值
+#   budget_tight   本月预算占用 ≥ medium 阈值
+#   late_supplier  供应商准时交付率低于 medium 阈值
+insert_rules:
+  - node: compliance
+    when: split_bypass
+    after: dept_manager
+    because: 疑似拆单规避审批，须合规复核
+  - node: supplier_onboard
+    when: new_supplier
+    after: dept_manager
+    because: 新供应商首单，须准入复核
+  - node: purchase_lead
+    when: price_spike
+    after: dept_manager
+    because: 单价异常偏离历史，须重新比价
+  - node: finance
+    when: budget_tight
+    after: dept_manager
+    because: 本月预算接近用尽
+  - node: purchase_lead
+    when: late_supplier
+    after: dept_manager
+    because: 供应商历史交付不稳，须评估备选
+
+# ---- ③ 节点定义：职责边界 / 只看哪些指标 / 只看哪些历史 / 这一站的话术 ----
+nodes:
+  dept_manager:
+    title: 部门经理
+    level: 2
+    duty: 需求真实性与用量合理性
+    focus_metrics: [qty_ratio, stock_days, safety_shortage_items,
+                    safety_shortage_qty]
+    focus_history: [issued_trend, material_purchases]
+    hint: |
+      你是生产部门负责人。你只回答一个问题：这笔料现在该不该买、买这么多合不合理。
+      判断依据：采购量 ÷ 近 30 天消耗（倍数远大于 1 就要问用在哪）、
+      收货后可用天数（不足 7 天是停机风险，超过 60 天是囤货）、
+      以及当前是否已低于安全库存及其缺口量。
+      倾向：
+        - 倍数很大又说不清用途 → oppose，要求说明对应哪张工单/哪个订单。
+        - 已低于安全库存且可用天数紧张 → agree，这是停机风险，越快越好。
+        - 数据缺失到无法判断用量 → need_info。
+      价格、供应商、付款条件不是你这一站的事，不要评价，越权会让建议失去可信度。
+
+  purchase_lead:
+    title: 采购主管
+    level: 2
+    duty: 供应商选择与成交价格
+    focus_metrics: [price_deviation_pct, unit_price_vs_cost_pct, supplier_po_90d,
+                    on_time_rate_pct, reject_rate_pct]
+    focus_history: [price_trend, supplier_recent_orders, supplier_share_pct]
+    hint: |
+      你是采购主管。你只回答：从这家买对不对、这个价谈到没到位。
+      判断依据：本次单价与自己的历史成交价走势（price_trend 给出每次成交单价）、
+      与主数据参考进价的差、该供应商近期交付与审批被拒情况、
+      以及这家供应商在该物料上的采购额集中度。
+      倾向：
+        - 单价高于自己历史成交价且无涨价理由 → oppose，要求重新议价或换供应商。
+        - 单一供应商占比过高（>70%）→ agree_with_conditions，条件是引入备选供应商。
+        - 供应商有连续拖期或拒批记录 → oppose，要求换供应商。
+      需求真实性和预算不是你这一站的事。
+
+  finance:
+    title: 财务审核
+    level: 2
+    duty: 预算占用与资金时点
+    focus_metrics: [amount, budget_used_pct]
+    focus_history: [quarterly_amount]
+    hint: |
+      你是财务。你只回答：预算还够不够、这笔该不该安排在这个时点。
+      判断依据：本月预算占用率（含本单）、本季度已发生采购额与去年全年对比。
+      倾向：
+        - 预算占用超过 100% → oppose，要求调预算后再批。
+        - 90%~100% → agree_with_conditions，条件里写清批完还剩多少额度。
+        - 充足 → agree，一句话确认剩余额度即可。
+      料该不该买、价格贵不贵不是你这一站的事。
+
+  gm:
+    title: 总经理
+    level: 3
+    duty: 综合风险与经营影响
+    focus_metrics: [amount, split_amount_pct, price_deviation_pct,
+                    supplier_age_days, budget_used_pct]
+    focus_history: [supplier_recent_orders, quarterly_amount, price_trend]
+    hint: |
+      你是总经理。你只回答：这笔钱该不该花、风险兜不兜得住。
+      你看到的已经是前几站的判断，不要重复他们的细节，只给经营层面的取舍。
+      倾向：
+        - 存在拆单规避 → oppose，明确表态。
+        - 新供应商首单且金额大 → agree_with_conditions，条件写分批到货或质保。
+        - 前几站已有 oppose → 不要和稀泥，直接说出你的取舍。
+        - 常规单、无实质风险 → agree，一句话即可，不要为了显得认真而堆废话。
+
+  compliance:
+    title: 合规复核
+    level: 3
+    duty: 审批合规性
+    focus_metrics: [split_amount_pct, amount, split_sibling_amount]
+    focus_history: [supplier_recent_orders]
+    hint: |
+      你是合规岗。你只回答一个问题：这张单有没有在规避审批。
+      判断依据：本单金额与 10 万审批线的距离、同供应商窗口期内其它单据的
+      合计金额与单号（supplier_recent_orders 里给出）。
+      倾向：
+        - 本单未超线但合计超线 → oppose，并点名是哪几张单拼起来的。
+        - 同一供应商短期反复出现临界金额（如 9.x 万）→ oppose，提示模式性规避。
+        - 无从单张单证实质规避 → agree，一句话结案，不要写长篇。
+
+  supplier_onboard:
+    title: 供应商准入复核
+    level: 2
+    duty: 新供应商首单风险
+    focus_metrics: [supplier_age_days, supplier_po_90d, on_time_rate_pct,
+                    reject_rate_pct]
+    focus_history: [supplier_recent_orders]
+    hint: |
+      你是供应商管理岗。你只回答：这家新供应商能不能直接用。
+      倾向：
+        - 建档不足 30 天且无任何历史成交 → oppose，要求先走准入评审或试样。
+        - 有小额成交但无交付记录 → agree_with_conditions，条件写首批验货。
+        - 建档超过 90 天且有正常交付 → agree。
+      价格合理性不是你的职责。
+
+# ---- ④ 路线级裁决门槛 ----
+route_rules:
+  # 每站建议的合法取值（白名单，模型不能自由发挥）
+  advice_values: [agree, agree_with_conditions, oppose, need_info]
+  # 汇总裁决时，所有站的平均置信度必须达到这个值才允许自动批
+  min_avg_confidence: 0.80
+  # 任何一站 oppose 是否直接否决自动批（工厂口径：是）
+  veto_on_any_oppose: true
+

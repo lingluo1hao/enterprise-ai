@@ -128,6 +128,18 @@ class ModelConfig:
     fail_threshold: int = 5                # 连续失败多少次后打开熔断
     recovery_sec: float = 30.0             # 打开后多久进入半开探测
     enabled: bool = True
+    # --- Dify 应用专属（provider: dify）---
+    # 把 Dify 编排好的应用当成「一个模型」接进网关：白拿限流/熔断/计费/降级。
+    # 参数语义见 config/llm_gateway.yaml 里 dify-flow 那块的注释。
+    dify_app_type: str = "chat"            # chat | agent | completion | workflow
+    dify_user: str = "llm-gateway"         # Dify 要求必填的调用方标识（用于其日志/用量）
+    dify_conversation_id: str = ""         # 空 = 每次开新会话（网关无状态调用）
+    dify_auto_generate_name: bool = False
+    dify_app_inputs: Dict[str, Any] = field(default_factory=dict)
+    dify_sys_prompt_mode: str = "prepend"  # prepend | input | ignore
+    dify_sys_input: str = "system_prompt"  # mode=input 时写进哪个变量
+    dify_query_input: str = "query"        # workflow/completion 传 query 的变量名
+    dify_output_key: str = ""              # workflow 取哪个 output 当年文本；空 = 拼接全部字符串
 
     @property
     def api_key(self) -> str:
@@ -701,6 +713,250 @@ class OpenAICompatProvider(BaseProvider):
                     yield piece
 
 
+class DifyProvider(BaseProvider):
+    """
+    Dify 应用后端 —— 把 Dify 编排好的应用当成「一个模型」接进网关。
+
+    【为什么值得这么做】
+
+    网关的价值不在"能调模型"，在**调模型之外那一圈护栏**：令牌桶限流、
+    熔断半开、失败退避重试、fallback 链、按用户计费、整链挂掉时的降级文案。
+    Dify 应用（含它自己的知识库检索 + 多步节点编排 + 工具调用）只要注册成
+    provider，就白拿这一整套，不需要在 Dify 里再实现一遍。
+
+    反过来也成立：Dify 应用里可以再调我们的外部知识库（dify_kb_server.py），
+    于是形成双向桥
+        网关 → Dify 应用（编排/检索增强）→ 我们的知识库 API → 我们的混合检索
+
+    【Dify 的四个应用类型，接口各不相同】
+
+        chat        POST /chat-messages          （含 chatflow）
+        agent       POST /chat-messages          **只支持 streaming**
+        completion  POST /completion-messages
+        workflow    POST /workflows/run
+
+    出参字段也不一样：chat/completion 的正文在 `answer`，
+    workflow 的正文在 `data.outputs.{某个变量}`，所以给了 dify_output_key
+    让配置指定取哪个；不指定就把 outputs 里的字符串值全拼起来。
+
+    【system prompt 怎么传】
+
+    Dify 应用的 system prompt 是在 Dify 界面里配的，网关这边的调用方
+    （langgraph_rag_agent 的 generate/grade/rewrite 节点）也会传自己的
+    system prompt。三个模式：
+
+        prepend  拼在 query 前面（默认）—— 通用，任何应用类型都能用
+        input    写进 inputs 的某个变量（dify_sys_input）—— 应用里显式引用
+        ignore   丢弃网关的 system prompt —— 完全交给 Dify 应用自己控
+
+    默认 prepend 而不是 ignore：网关侧的 system prompt 里带着
+    「只根据给定资料回答，资料没有就说不知道」这类护栏，丢了会直接退化成
+    裸模型，RAG 的拒答能力跟着一起没。
+    """
+
+    def _app_type(self) -> str:
+        return (self.cfg.dify_app_type or "chat").strip().lower()
+
+    def _endpoint(self) -> str:
+        """返回 (path, kind)。kind 决定 body / 出参怎么解析。"""
+        app = self._app_type()
+        if app in ("workflow", "work_flow"):
+            return "/workflows/run", "workflow"
+        if app in ("completion", "text-completion", "text_completion"):
+            return "/completion-messages", "completion"
+        # chat / chatflow / agent 都走 chat-messages
+        return "/chat-messages", "chat"
+
+    def _headers(self) -> Dict[str, str]:
+        h = {"Content-Type": "application/json"}
+        key = self.cfg.api_key
+        if key:
+            h["Authorization"] = f"Bearer {key}"
+        return h
+
+    def _compose_query(self, system_prompt: str, user_prompt: str,
+                       inputs: Dict[str, Any]) -> str:
+        mode = (self.cfg.dify_sys_prompt_mode or "prepend").strip().lower()
+        if mode == "input":
+            if system_prompt:
+                inputs[self.cfg.dify_sys_input or "system_prompt"] = system_prompt
+            return user_prompt
+        if mode == "ignore":
+            return user_prompt
+        if not system_prompt:
+            return user_prompt
+        return f"{system_prompt.strip()}\n\n{user_prompt}"
+
+    def _payload(self, system_prompt: str, user_prompt: str,
+                 stream: bool) -> Tuple[str, bytes]:
+        """返回 (完整 URL, body)。"""
+        path, kind = self._endpoint()
+        # 深拷贝一份：inputs 会被 _compose_query 就地改，不能污染 cfg
+        inputs: Dict[str, Any] = dict(self.cfg.dify_app_inputs or {})
+        query = self._compose_query(system_prompt, user_prompt, inputs)
+
+        body: Dict[str, Any] = {
+            "inputs": inputs,
+            "user": self.cfg.dify_user or "llm-gateway",
+            "response_mode": "streaming" if stream else "blocking",
+        }
+        if kind == "chat":
+            body["query"] = query
+            if self.cfg.dify_conversation_id:
+                body["conversation_id"] = self.cfg.dify_conversation_id
+            if self.cfg.dify_auto_generate_name:
+                body["auto_generate_name"] = True
+        elif kind == "completion":
+            inputs[self.cfg.dify_query_input or "query"] = query
+        else:  # workflow
+            inputs[self.cfg.dify_query_input or "query"] = query
+
+        if self.cfg.max_tokens > 0:
+            # Dify 不认 max_tokens，只能当普通 input 传；应用里若没定义这个变量，
+            # Dify 会忽略而不是报错（它对多余 inputs 是宽容的）。
+            inputs.setdefault("max_tokens", self.cfg.max_tokens)
+
+        url = self.cfg.base_url.rstrip("/") + path
+        return url, json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    # -- 出参解析 -------------------------------------------------------
+    def _workflow_text(self, data: Dict[str, Any]) -> str:
+        outputs = data.get("outputs") or {}
+        if not isinstance(outputs, dict):
+            return str(outputs)
+        key = (self.cfg.dify_output_key or "").strip()
+        if key and key in outputs:
+            return str(outputs[key])
+        parts = [str(v) for v in outputs.values() if isinstance(v, str) and v.strip()]
+        if not parts:
+            raise ProviderError(
+                f"{self.cfg.name} workflow 无文本输出（outputs={list(outputs)}）；"
+                f"请在配置里设 dify_output_key")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _usage_of(meta: Optional[Dict[str, Any]]) -> Tuple[int, int]:
+        """从 metadata.usage 取 (prompt_tokens, completion_tokens)。
+
+        Dify 的 usage 里还有 prompt_unit_price / total_price 等报价字段，
+        但那是 Dify 侧按它自己登记的模型价算的，与我们网关的计费口径不同 ——
+        混用会让"token 用量"和"成本"两套数字互相矛盾，所以只取 token 数。
+        """
+        if not isinstance(meta, dict):
+            return 0, 0
+        usage = meta.get("usage") or meta.get("billing") or {}
+        if not isinstance(usage, dict):
+            return 0, 0
+        return (int(usage.get("prompt_tokens") or 0),
+                int(usage.get("completion_tokens") or 0))
+
+    # -- 非流式 ---------------------------------------------------------
+    def invoke(self, system_prompt: str, user_prompt: str) -> LLMResponse:
+        # Dify 的 agent 应用**不支持** blocking，会直接 400。
+        # 对这类应用只能走流式再把增量拼起来，对上层接口保持不变。
+        if self._app_type() == "agent":
+            start = time.time()
+            buf: List[str] = []
+            for piece in self.stream(system_prompt, user_prompt):
+                buf.append(piece)
+            text = "".join(buf)
+            return LLMResponse(
+                text=text,
+                prompt_tokens=_estimate_tokens(system_prompt + user_prompt),
+                completion_tokens=_estimate_tokens(text),
+                model=self.cfg.model, provider="dify",
+                latency=time.time() - start, finish_reason="stop",
+            )
+
+        url, body = self._payload(system_prompt, user_prompt, False)
+        start = time.time()
+        status, data = self.pool.request("POST", url, self._headers(), body,
+                                         self.cfg.timeout)
+        if status != 200:
+            raise ProviderError(
+                f"{self.cfg.name} HTTP {status}: "
+                f"{data[:300].decode('utf-8', 'ignore')}")
+        try:
+            obj = json.loads(data)
+        except Exception as e:
+            raise ProviderError(f"{self.cfg.name} 响应非法 JSON: {e}")
+
+        _, kind = self._endpoint()
+        if kind == "workflow":
+            payload = obj.get("data") or {}
+            st = str(payload.get("status") or "").lower()
+            if st and st != "succeeded":
+                raise ProviderError(
+                    f"{self.cfg.name} workflow {st}: {payload.get('error')}")
+            text = self._workflow_text(payload)
+            total = int(payload.get("total_tokens") or 0)
+            return LLMResponse(
+                text=text,
+                # workflow 只给总量，拆不出输入/输出；按输出全算，
+                # 这样 TPM 统计不会少扣（宁可高估也不漏计）
+                prompt_tokens=0, completion_tokens=total,
+                model=self.cfg.model, provider="dify",
+                latency=time.time() - start, finish_reason=st or "succeeded",
+            )
+
+        text = str(obj.get("answer") or "")
+        p_tok, c_tok = self._usage_of(obj.get("metadata"))
+        return LLMResponse(
+            text=text,
+            prompt_tokens=p_tok or _estimate_tokens(system_prompt + user_prompt),
+            completion_tokens=c_tok or _estimate_tokens(text),
+            model=self.cfg.model, provider="dify",
+            latency=time.time() - start,
+            finish_reason=str(obj.get("event") or "message"),
+        )
+
+    # -- 流式 -----------------------------------------------------------
+    def stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        url, body = self._payload(system_prompt, user_prompt, True)
+        _, kind = self._endpoint()
+        for line in self.pool.stream_lines("POST", url, self._headers(), body,
+                                           self.cfg.timeout):
+            if not line.startswith(b"data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == b"[DONE]":
+                continue          # Dify 不发 [DONE]，这里只为兼容中间层代理
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            ev = str(obj.get("event") or "")
+            if ev in ("message", "agent_message", "message_replace"):
+                piece = obj.get("answer") or ""
+                if piece:
+                    yield piece
+            elif ev == "text_chunk":
+                piece = (obj.get("data") or {}).get("text") or ""
+                if piece:
+                    yield piece
+            elif ev == "error":
+                raise ProviderError(
+                    f"{self.cfg.name} 流式错误: {obj.get('message') or obj}")
+            elif ev == "message_end":
+                break
+            elif ev in ("workflow_finished", "workflow_failed"):
+                payload = obj.get("data") or {}
+                st = str(payload.get("status") or "").lower()
+                if ev == "workflow_failed" or st == "failed":
+                    raise ProviderError(
+                        f"{self.cfg.name} workflow 失败: {payload.get('error')}")
+                # 有的应用只在最后一步把结果塞进 outputs，前面一个字都不吐，
+                # 这里补一次，否则上层拿到空字符串还以为是模型没说话。
+                try:
+                    tail = self._workflow_text(payload)
+                except ProviderError:
+                    tail = ""
+                if tail:
+                    yield tail
+                break
+            # 其余事件（message_file / node_started / ping …）对文本无用，跳过
+
+
 _PROVIDER_REGISTRY: Dict[str, type] = {
     "ollama": OllamaProvider,
     "openai_compat": OpenAICompatProvider,
@@ -711,6 +967,8 @@ _PROVIDER_REGISTRY: Dict[str, type] = {
     "qwen": OpenAICompatProvider,
     "moonshot": OpenAICompatProvider,
     "vllm": OpenAICompatProvider,
+    # Dify 应用：协议完全自定义（/chat-messages 等），必须单独实现
+    "dify": DifyProvider,
 }
 
 

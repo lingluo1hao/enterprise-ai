@@ -68,6 +68,20 @@ order_acl:
                 warehouse, fault_code, pm_plan, stock]
     scope: tenant
     ops: [create, query, update, request, approve]
+  # AI 审批员 —— 给 AI 自动审批流（ai_approval.py）用的虚拟角色。
+  # 它不是一个真人，但必须**像真人一样**存在这条角色表里，因为
+  # ApprovalGate.decide() 的等级校验读的就是这张表：没有这条记录，
+  # level_of() 返回 0，AI 的任何自动批准都会被 fail-closed 拒绝。
+  # level=2 的含义：AI 只能自动批 approval_rules 里要求 level=2 的动作/金额，
+  # 采购单 >10 万要求 level=3，AI 付不起 → 一律转人工（改 ai_approval.yaml
+  # 的 max_auto_amount 也绕不过去，这是权限链层面的硬约束）。
+  # ops 只给 approve/query：AI 不许建单、不许改单，只能批。
+  ai_approver:
+    name: AI 审批员（Dify 工作流）
+    level: 2
+    resources: [purchase_order, supplier, inventory, product]
+    scope: tenant
+    ops: [query, approve]
   super_admin:
     name: 超级管理员
     level: 3

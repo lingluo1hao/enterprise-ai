@@ -14,6 +14,10 @@
 #   ollama         —— 本地 Ollama，走 /api/chat
 #   openai_compat  —— 任何 OpenAI 兼容接口，走 /chat/completions
 #                     (openai / deepseek / dashscope / moonshot / vllm 都是它的别名)
+#   dify           —— Dify 应用，走 /chat-messages | /completion-messages | /workflows/run
+#                     （把 Dify 编排好的应用当成一个模型接进来：白拿限流/熔断/
+#                       计费/降级；Dify 与我们的知识库之间的双向桥见
+#                       dify_kb_server.py 与 docs/guides/DIFY_BRIDGE_README.md）
 #
 # tier 只是标注（small/large），真正决定路由的是下面的 routing 表。
 # price_* 单位是「美元 / 每百万 token」，本地模型填 0。
@@ -137,6 +141,62 @@ models:
     price_out_per_1m: 0.60
     enabled: false
 
+  # ---- Dify 应用（把 Dify 编排当成一个「模型」）-----------------------------
+  # 默认 enabled: false —— 没装 Dify 的环境完全感知不到它存在，
+  # 且不写进 default_chain，生产链路一个字节都不变。
+  #
+  # 用途：某些任务（带工具的流程、多步节点编排、Dify 侧已有的知识库）
+  # 更适合在 Dify 里编排，但又不该绕过网关的限流/熔断/计费。注册进来即可：
+  #
+  #     gw.chat(system, user, task="dify", user="alice")
+  #
+  # 需要在 .env 里配 DIFY_APP_API_KEY（Dify 应用「访问 API」页面里那个 app- 开头的 key）。
+  # base_url 指向 Dify 的 /v1（不是 /v1/chat-messages，路径由 provider 自己拼）。
+  dify-flow:
+    provider: dify
+    model: dify-flow                  # 仅作日志标识，Dify 侧真正的应用由 key 决定
+    base_url: http://192.168.200.128/v1
+    api_key_env: DIFY_APP_API_KEY
+    tier: large
+    timeout: 120.0
+    rpm: 30
+    tpm: 100000
+    fail_threshold: 3
+    recovery_sec: 60.0
+    price_in_per_1m: 0.0              # 费用已在 Dify 侧产生，网关只统计 token
+    price_out_per_1m: 0.0
+    enabled: false
+
+    # ---- Dify 应用类型，四选一 ----
+    #   chat       对话型应用（含 chatflow）→ POST /chat-messages
+    #   agent      智能体应用 → 同样走 /chat-messages，但**只支持 streaming**
+    #              （provider 会自动用流式再拼成非流式结果给上层）
+    #   completion 文本生成应用 → POST /completion-messages
+    #   workflow   工作流应用 → POST /workflows/run
+    dify_app_type: chat
+
+    # Dify 要求每次调用带一个 user 标识（写进它的日志与会话归属）。
+    # 网关是服务端调用，用固定服务账号即可；要按人区分就改成从上下文传。
+    dify_user: llm-gateway
+
+    # system prompt 怎么给 Dify 应用：prepend（拼在 query 前，默认）|
+    # input（写进 inputs 的某个变量）| ignore（丢弃，完全用 Dify 里配的）
+    # 默认 prepend：网关侧的 system prompt 带着「资料里没有就说不知道」这类
+    # 护栏，丢了会直接退化成裸模型，RAG 的拒答能力跟着一起没。
+    dify_sys_prompt_mode: prepend
+    dify_sys_input: system_prompt
+
+    # 应用定义的输入变量（在工作流的「开始」节点里配的那些）。
+    # 键名必须与 Dify 里一字不差，否则那边会因为缺变量直接报错。
+    dify_app_inputs: {}
+    # 传 query 用的变量名：workflow/completion 用它，chat 走顶层 query 字段。
+    dify_query_input: query
+    # workflow 应用取哪个 output 当正文；留空 = 把 outputs 里所有字符串拼起来。
+    dify_output_key: ""
+    # 空 = 每次网关调用都开一个新会话（网关本身无状态，记住 conversation_id
+    # 会把不同用户的上下文串到一起，这个坑比"少一点记忆"严重得多）。
+    dify_conversation_id: ""
+
 
 # ----------------------------------------------------------------------------
 # 路由表：任务类型 -> 模型链
@@ -173,7 +233,7 @@ routing:
   # 优先级 deepseek-v4-pro（云端强模型，需 DEEPSEEK_API_KEY + enabled=true）；
   # 未启用时自动回落 local-small（本地 1.5b，零成本可离线）。evalkit 走这条链。
   evalgrade:  [deepseek-v4-pro, local-small, local-qwen]
-  rewrite:    [local-small, local-qwen]
+  rewrite: [ deepseek-v4-pro, local-small, local-qwen ]
   compress:   [local-small, local-qwen]
 
   # 2026-08-29 调整：回答类 + 规划/推理链 DeepSeek 优先（用户要求"优先用
@@ -188,6 +248,23 @@ routing:
   plan:       [deepseek-v4-pro, local-qwen]
   review:     [deepseek-v4-pro, local-qwen]
   react:      [deepseek-v4-pro, local-qwen]
+
+  # ---- Dify 编排链（默认整条不可用，不影响任何现有任务）----
+  # 只给显式 task="dify" 的调用用。dify-flow 的 enabled 为 false 时，
+  # chain_for() 会把它过滤掉，自动落到 local-qwen —— 也就是「Dify 没装
+  # 或挂了，业务照跑」，而不是抛异常。这正是网关降级该有的样子。
+  dify:       [dify-flow, local-qwen]
+
+  # ---- AI 审批链（ai_approval.py::NodeAdvisor，task="dify_approve"）----
+  # ⚠️ 这条必须显式写，不能靠 default_chain 兜底，两个原因：
+  #   ① default_chain 里含 deepseek-v4-pro（云端）——采购单据的供应商、单价、
+  #      预算数据会被发到外部模型，直接违反工厂「数据不出内网」的硬约束；
+  #   ② 没有这条路由时 dify-flow 根本不在候选链上，**装了 Dify 也不会被调用**，
+  #      整条工作流变成死代码。
+  # 没有 Dify 的环境里 dify-flow 的 enabled=false 会被 chain_for() 过滤掉，
+  # 只剩 local-qwen（本地 Ollama）；本地也不可用时整条链失败 → 各站 ok=False
+  # → 裁决 degraded → 转人工。这是预期行为，不是故障。
+  dify_approve: [dify-flow, local-qwen]
 
 # 没有在 routing 里命中的任务走这条链（保证老代码不传 task 时行为不变）
 default_chain: [local-qwen, deepseek-v4-pro, qwen-plus]
