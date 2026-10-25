@@ -40,3 +40,72 @@ assets/figures/
 
 # agentworkflow 诊断运行产物（证据链 json，可重建）
 agentworkflow/runs/
+
+# ---------------------------------------------------------------------------
+# 密钥 / 凭据 / 运行时备份（含真实口令，绝不入库）
+# ---------------------------------------------------------------------------
+dify_kb_key.txt
+*.key
+*.key.txt
+*.bak
+*.bak.*
+.env.bak*
+deploy/dify.txt
+
+# ---------------------------------------------------------------------------
+# 视频产线：中间产物 + 成片（大二进制，脚本可重生成）
+# ---------------------------------------------------------------------------
+build/
+tmp/
+logs/
+docs/juejin/*.mp4
+docs/reports/*.mp4
+assets/**/*.mp4
+
+# ---------------------------------------------------------------------------
+# 一次性探针 / 调试 / 对比碎文件（根目录下划线开头临时物）
+# ---------------------------------------------------------------------------
+/_*.json
+/_*.png
+/_*.html
+/_*.py
+/_*.md
+/_*.out
+*.out
+batt_tmp.xml)
+deploy/*.out
+
+# 散落在仓库根的旧诊断图 / 产线冒烟测试图（未被任何文档引用）
+/arch.png
+/flow.png
+/judgment.png
+scripts/_*.png
+scripts/_*.svg
+
+# ---------------------------------------------------------------------------
+# 「从零到一搭大模型」课程线：讲义 / 封面 / 文案 / 成片 —— 不入本仓库
+# （本仓是企业级 RAG Agent 系统，课程物料单独存放，不随代码提交）
+# ---------------------------------------------------------------------------
+docs/ai_course/
+docs/juejin/
+docs/from_zero_images/
+docs/guides/AI_FROM_ZERO_TO_ONE.md
+
+# 课程产线脚本（只服务于上面的课程物料，随课程一并排除）
+scripts/gen_ch[0-9][0-9]*.py
+scripts/gen_chapter_entrance_card.py
+scripts/gen_voiceover*.py
+scripts/gen_video*.py
+scripts/gen_*cover*.py
+scripts/gen_series_*.py
+scripts/gen_course_images.py
+scripts/gen_from_zero_images.py
+scripts/loudnorm_ch*.py
+scripts/render_ch*.js
+scripts/ch[0-9][0-9]_*.py
+scripts/dump_ch*.py
+scripts/audit_ch*.py
+scripts/check_ch*.py
+scripts/probe_ch*.py
+scripts/*_cardlib.py
+scripts/swap_title_on_image.py
