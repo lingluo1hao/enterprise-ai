@@ -374,8 +374,17 @@ class PromptManager:
         """
         按名称获取提示词。
 
+        ★ 沙箱覆盖优先（2026-10-25，RSI 改造）：`_PROMPT_OVERRIDES` 非空时直接返回
+        覆盖内容。用于自改进沙箱在**评测进程内**试跑提示词变体 —— 不写库、不影响
+        线上请求、进程退出即失效，与 evalkit `--set` 的「只影响评测进程」同一模式。
+        默认空 dict，因此本改动对主链路零回归。
+
         优先从 MySQL 读取，如果 DB 不可用或不存在，回退到 DEFAULT_PROMPTS。
         """
+        ov = _PROMPT_OVERRIDES.get(name)
+        if ov is not None:
+            return dict(ov)
+
         if self.available:
             try:
                 conn = self._get_conn()
@@ -971,6 +980,34 @@ class AuthManager:
 
 _prompt_manager: Optional[PromptManager] = None
 _auth_manager: Optional[AuthManager] = None
+
+
+# ★ 自改进沙箱用的提示词进程内覆盖（2026-10-25，RSI 改造）
+# 只在评测/沙箱进程里由 improvement.sandbox 设置；线上进程恒为空。
+# 键：提示词 name；值：与 get_prompt 返回结构一致的 dict。
+_PROMPT_OVERRIDES: Dict[str, Dict] = {}
+
+
+def set_prompt_override(name: str, system: str, user_template: str = "") -> None:
+    """设置一条沙箱覆盖（仅当前进程有效）。"""
+    _PROMPT_OVERRIDES[name] = {
+        "name": name, "display_name": name, "description": "sandbox override",
+        "category": "general", "system": system,
+        "user_template": user_template or "", "version": -1,
+    }
+
+
+def clear_prompt_overrides(name: str = "") -> None:
+    """清除覆盖。不传 name 则全清（沙箱跑完必做）。"""
+    if name:
+        _PROMPT_OVERRIDES.pop(name, None)
+    else:
+        _PROMPT_OVERRIDES.clear()
+
+
+def active_prompt_overrides() -> Dict[str, Dict]:
+    """当前生效的覆盖（审计/回滚用）。"""
+    return dict(_PROMPT_OVERRIDES)
 
 
 def get_prompt_manager() -> PromptManager:
